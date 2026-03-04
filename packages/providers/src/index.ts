@@ -2,24 +2,50 @@ import { AppError, assertNever } from "@pulsarbot/core";
 import {
   ProviderKindSchema,
   type ProviderKind,
+  type LooseJsonValue,
   type ProviderProfile,
 } from "@pulsarbot/shared";
 
 export interface ProviderMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  toolCalls?: ProviderToolCall[];
+  toolCallId?: string;
 }
+
+export interface ProviderToolCall {
+  id: string;
+  toolId: string;
+  input: Record<string, LooseJsonValue>;
+}
+
+export interface ProviderToolDefinition {
+  id: string;
+  description: string;
+  inputSchema: Record<string, LooseJsonValue>;
+}
+
+export type ProviderToolChoice =
+  | "auto"
+  | "none"
+  | {
+      type: "tool";
+      toolId: string;
+    };
 
 export interface ProviderInvocationInput {
   model?: string;
   messages: ProviderMessage[];
   maxOutputTokens?: number;
   jsonMode?: boolean;
+  tools?: ProviderToolDefinition[];
+  toolChoice?: ProviderToolChoice;
 }
 
 export interface ProviderInvocationResult {
   text: string;
   raw: unknown;
+  toolCalls?: ProviderToolCall[];
 }
 
 export interface ProviderRequestPreview {
@@ -119,10 +145,221 @@ function mergeFormHeaders(
 }
 
 function messageToOpenAiShape(message: ProviderMessage) {
+  if (message.role === "assistant" && message.toolCalls?.length) {
+    return {
+      role: "assistant",
+      content: message.content ?? "",
+      tool_calls: message.toolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        type: "function",
+        function: {
+          name: toolCall.toolId,
+          arguments: JSON.stringify(toolCall.input ?? {}),
+        },
+      })),
+    };
+  }
+  if (message.role === "tool") {
+    return {
+      role: "tool",
+      content: message.content,
+      tool_call_id: message.toolCallId ?? "",
+    };
+  }
   return {
     role: message.role,
     content: message.content,
   };
+}
+
+function parseToolInput(value: unknown): Record<string, LooseJsonValue> {
+  if (!value) {
+    return {};
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, LooseJsonValue>;
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, LooseJsonValue>;
+  }
+  return {};
+}
+
+function normalizeOpenAiToolChoice(
+  value: ProviderToolChoice | undefined,
+): "auto" | "none" | { type: "function"; function: { name: string } } | undefined {
+  if (!value || value === "auto" || value === "none") {
+    return value;
+  }
+  return {
+    type: "function",
+    function: {
+      name: value.toolId,
+    },
+  };
+}
+
+function normalizeAnthropicToolChoice(
+  value: ProviderToolChoice | undefined,
+): { type: "auto" | "any" | "tool"; name?: string } | undefined {
+  if (!value || value === "auto") {
+    return { type: "auto" };
+  }
+  if (value === "none") {
+    return undefined;
+  }
+  return {
+    type: "tool",
+    name: value.toolId,
+  };
+}
+
+function openAiToolDefinitions(input: ProviderInvocationInput) {
+  if (!input.tools?.length) {
+    return undefined;
+  }
+  return input.tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.id,
+      description: tool.description,
+      parameters: tool.inputSchema,
+    },
+  }));
+}
+
+function anthropicToolDefinitions(input: ProviderInvocationInput) {
+  if (!input.tools?.length) {
+    return undefined;
+  }
+  return input.tools.map((tool) => ({
+    name: tool.id,
+    description: tool.description,
+    input_schema: tool.inputSchema,
+  }));
+}
+
+function responsesToolDefinitions(input: ProviderInvocationInput) {
+  if (!input.tools?.length) {
+    return undefined;
+  }
+  return input.tools.map((tool) => ({
+    type: "function",
+    name: tool.id,
+    description: tool.description,
+    parameters: tool.inputSchema,
+  }));
+}
+
+function normalizeOpenRouterResponsesToolChoice(
+  value: ProviderToolChoice | undefined,
+): "auto" | "none" | { type: "function"; name: string } | undefined {
+  if (!value || value === "auto" || value === "none") {
+    return value;
+  }
+  return {
+    type: "function",
+    name: value.toolId,
+  };
+}
+
+function normalizeBailianResponsesToolChoice(
+  value: ProviderToolChoice | undefined,
+):
+  | "auto"
+  | "none"
+  | {
+      type: "allowed_tools";
+      mode: "required";
+      tools: Array<{ type: "function"; name: string }>;
+    }
+  | undefined {
+  if (!value || value === "auto" || value === "none") {
+    return value;
+  }
+  return {
+    type: "allowed_tools",
+    mode: "required",
+    tools: [
+      {
+        type: "function",
+        name: value.toolId,
+      },
+    ],
+  };
+}
+
+function messageToResponsesShape(message: ProviderMessage): Array<Record<string, unknown>> {
+  if (message.role === "system") {
+    return [];
+  }
+  if (message.role === "tool") {
+    if (!message.toolCallId) {
+      return message.content.trim()
+        ? [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: message.content }],
+            },
+          ]
+        : [];
+    }
+    return [
+      {
+        type: "function_call_output",
+        call_id: message.toolCallId,
+        output: message.content,
+      },
+    ];
+  }
+
+  const items: Array<Record<string, unknown>> = [];
+  if (message.content.trim()) {
+    items.push({
+      type: "message",
+      role: message.role,
+      content: [
+        {
+          type: message.role === "assistant" ? "output_text" : "input_text",
+          text: message.content,
+        },
+      ],
+    });
+  }
+  if (message.role === "assistant" && message.toolCalls?.length) {
+    items.push(
+      ...message.toolCalls.map((toolCall, index) => ({
+        type: "function_call",
+        id: `fc_${toolCall.id || index + 1}`,
+        call_id: toolCall.id,
+        name: toolCall.toolId,
+        arguments: JSON.stringify(toolCall.input ?? {}),
+      })),
+    );
+  }
+
+  return items;
+}
+
+function responsesSystemInstructions(messages: ProviderMessage[]): string {
+  return messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function responsesInputMessages(messages: ProviderMessage[]): Array<Record<string, unknown>> {
+  return messages.flatMap((message) => messageToResponsesShape(message));
 }
 
 function parseTextFromUnknown(payload: unknown): string {
@@ -224,6 +461,150 @@ export function parseProviderTextPayload(payload: unknown): string {
   return "";
 }
 
+function parseOpenAiChatToolCalls(payload: Record<string, unknown>): ProviderToolCall[] {
+  const choice = Array.isArray(payload.choices)
+    ? payload.choices[0] as Record<string, unknown> | undefined
+    : undefined;
+  const message = choice?.message;
+  if (!message || typeof message !== "object") {
+    return [];
+  }
+  const toolCalls = (message as Record<string, unknown>).tool_calls;
+  if (!Array.isArray(toolCalls)) {
+    return [];
+  }
+  return toolCalls.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    const fn = record.function;
+    if (!fn || typeof fn !== "object") {
+      return [];
+    }
+    const fnRecord = fn as Record<string, unknown>;
+    const toolId = typeof fnRecord.name === "string" ? fnRecord.name : "";
+    if (!toolId) {
+      return [];
+    }
+    const id = typeof record.id === "string" && record.id
+      ? record.id
+      : `call_${index + 1}`;
+    return [{
+      id,
+      toolId,
+      input: parseToolInput(fnRecord.arguments),
+    }];
+  });
+}
+
+function parseOpenAiChatText(payload: Record<string, unknown>): string {
+  const choice = Array.isArray(payload.choices)
+    ? payload.choices[0] as Record<string, unknown> | undefined
+    : undefined;
+  const message = choice?.message;
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+  const content = (message as Record<string, unknown>).content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .flatMap((item) => {
+        if (!item || typeof item !== "object") {
+          return [];
+        }
+        const text = (item as Record<string, unknown>).text;
+        return typeof text === "string" ? [text] : [];
+      })
+      .join("\n\n")
+      .trim();
+  }
+  return "";
+}
+
+function parseResponsesToolCalls(payload: Record<string, unknown>): ProviderToolCall[] {
+  const output = payload.output;
+  if (!Array.isArray(output)) {
+    return [];
+  }
+
+  return output.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    if (record.type !== "function_call") {
+      return [];
+    }
+    const toolId = typeof record.name === "string" ? record.name : "";
+    if (!toolId) {
+      return [];
+    }
+    const callId =
+      (typeof record.call_id === "string" && record.call_id) ||
+      (typeof record.id === "string" && record.id) ||
+      `call_${index + 1}`;
+    return [
+      {
+        id: callId,
+        toolId,
+        input: parseToolInput(record.arguments),
+      },
+    ];
+  });
+}
+
+function parseAnthropicToolCalls(payload: Record<string, unknown>): ProviderToolCall[] {
+  const content = payload.content;
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  return content.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    if (record.type !== "tool_use") {
+      return [];
+    }
+    const toolId = typeof record.name === "string" ? record.name : "";
+    if (!toolId) {
+      return [];
+    }
+    const id = typeof record.id === "string" && record.id
+      ? record.id
+      : `tool_use_${index + 1}`;
+    return [{
+      id,
+      toolId,
+      input: parseToolInput(record.input),
+    }];
+  });
+}
+
+function parseAnthropicText(payload: Record<string, unknown>): string {
+  const content = payload.content;
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .flatMap((item) => {
+      if (!item || typeof item !== "object") {
+        return [];
+      }
+      const record = item as Record<string, unknown>;
+      if (record.type !== "text" || typeof record.text !== "string") {
+        return [];
+      }
+      return [record.text];
+    })
+    .join("\n\n")
+    .trim();
+}
+
 function buildSamplingOptions(profile: ProviderProfile) {
   return {
     temperature: profile.temperature,
@@ -243,6 +624,13 @@ function buildReasoningEffort(profile: ProviderProfile) {
     return undefined;
   }
   return { effort: profile.reasoningLevel };
+}
+
+function buildChatReasoningEffort(profile: ProviderProfile) {
+  if (!profile.reasoningEnabled || profile.reasoningLevel === "off") {
+    return undefined;
+  }
+  return profile.reasoningLevel;
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -518,6 +906,7 @@ function streamDeltaForProvider(
     case "openai_compatible_responses":
       return extractOpenAiResponsesDelta(payload);
     case "openrouter":
+      return extractOpenAiChatDelta(payload) || extractOpenAiResponsesDelta(payload);
     case "openai_compatible_chat":
       return extractOpenAiChatDelta(payload);
     case "anthropic":
@@ -1035,10 +1424,87 @@ function buildBailianMediaRequest(
   }
 }
 
+function messageToAnthropicShape(
+  message: ProviderMessage,
+): { role: "user" | "assistant"; content: string | Array<Record<string, unknown>> } | null {
+  if (message.role === "system") {
+    return null;
+  }
+  if (message.role === "user") {
+    return {
+      role: "user",
+      content: message.content,
+    };
+  }
+  if (message.role === "tool") {
+    return {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: message.toolCallId ?? "",
+          content: message.content,
+        },
+      ],
+    };
+  }
+
+  const blocks: Array<Record<string, unknown>> = [];
+  if (message.content.trim()) {
+    blocks.push({
+      type: "text",
+      text: message.content,
+    });
+  }
+  if (message.toolCalls?.length) {
+    blocks.push(
+      ...message.toolCalls.map((toolCall) => ({
+        type: "tool_use",
+        id: toolCall.id,
+        name: toolCall.toolId,
+        input: toolCall.input,
+      })),
+    );
+  }
+
+  if (blocks.length === 0) {
+    return {
+      role: "assistant",
+      content: "",
+    };
+  }
+
+  return {
+    role: "assistant",
+    content: blocks.length === 1 && blocks[0]?.type === "text"
+      ? String(blocks[0].text ?? "")
+      : blocks,
+  };
+}
+
 export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
   openai: {
     kind: "openai",
     buildRequest(profile, apiKey, input) {
+      if (input.tools?.length && profile.toolCallingEnabled) {
+        return {
+          url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/chat/completions`,
+          headers: mergeJsonHeaders(profile, {
+            Authorization: `Bearer ${apiKey}`,
+          }),
+          body: {
+            model: input.model ?? profile.defaultModel,
+            messages: input.messages.map(messageToOpenAiShape),
+            tools: openAiToolDefinitions(input),
+            tool_choice: normalizeOpenAiToolChoice(input.toolChoice),
+            reasoning_effort: buildChatReasoningEffort(profile),
+            max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+            stream: false,
+            ...buildSamplingOptions(profile),
+            ...profile.extraBody,
+          },
+        };
+      }
       return {
         url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/responses`,
         headers: mergeJsonHeaders(profile, {
@@ -1061,6 +1527,23 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        if (Array.isArray(record.choices)) {
+          return {
+            text: parseOpenAiChatText(record) || parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseOpenAiChatToolCalls(record),
+          };
+        }
+        if (Array.isArray(record.output)) {
+          return {
+            text: parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseResponsesToolCalls(record),
+          };
+        }
+      }
       return buildMediaResponse(payload);
     },
   },
@@ -1080,11 +1563,20 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
             .map((message) => message.content)
             .join("\n\n"),
           messages: input.messages
-            .filter((message) => message.role !== "system")
-            .map((message) => ({
-              role: message.role === "tool" ? "user" : message.role,
-              content: message.content,
-            })),
+            .map(messageToAnthropicShape)
+            .filter((
+              message,
+            ): message is { role: "user" | "assistant"; content: string | Array<Record<string, unknown>> } =>
+              Boolean(message)
+            ),
+          tools:
+            input.tools?.length && profile.toolCallingEnabled
+              ? anthropicToolDefinitions(input)
+              : undefined,
+          tool_choice:
+            input.tools?.length && profile.toolCallingEnabled
+              ? normalizeAnthropicToolChoice(input.toolChoice)
+              : undefined,
           max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
           thinking:
             profile.reasoningEnabled && profile.reasoningLevel !== "off"
@@ -1104,6 +1596,14 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        return {
+          text: parseAnthropicText(record) || parseProviderTextPayload(record),
+          raw: payload,
+          toolCalls: parseAnthropicToolCalls(record),
+        };
+      }
       return buildMediaResponse(payload);
     },
   },
@@ -1158,6 +1658,28 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
   openrouter: {
     kind: "openrouter",
     buildRequest(profile, apiKey, input) {
+      if (input.tools?.length && profile.toolCallingEnabled) {
+        return {
+          url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/responses`,
+          headers: mergeJsonHeaders(profile, {
+            Authorization: `Bearer ${apiKey}`,
+          }),
+          body: {
+            model: input.model ?? profile.defaultModel,
+            instructions: responsesSystemInstructions(input.messages) || undefined,
+            input: responsesInputMessages(input.messages),
+            tools: responsesToolDefinitions(input),
+            tool_choice: normalizeOpenRouterResponsesToolChoice(input.toolChoice),
+            max_output_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+            reasoning: buildReasoningEffort(profile),
+            text: wantsJsonMode(profile, input)
+              ? { format: { type: "json_object" } }
+              : undefined,
+            ...buildSamplingOptions(profile),
+            ...profile.extraBody,
+          },
+        };
+      }
       return {
         url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/chat/completions`,
         headers: mergeJsonHeaders(profile, {
@@ -1170,6 +1692,7 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
           response_format: wantsJsonMode(profile, input)
             ? { type: "json_object" }
             : undefined,
+          reasoning: buildReasoningEffort(profile),
           stream: false,
           ...buildSamplingOptions(profile),
           ...profile.extraBody,
@@ -1177,38 +1700,61 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        if (Array.isArray(record.output)) {
+          return {
+            text: parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseResponsesToolCalls(record),
+          };
+        }
+      }
       return buildMediaResponse(payload);
     },
   },
   bailian: {
     kind: "bailian",
     buildRequest(profile, apiKey, input) {
+      const compatibleBaseUrl = dashscopeCompatibleBaseUrl(profile);
       return {
-        url: profile.apiBaseUrl || defaultBaseUrl(profile.kind),
+        url: `${compatibleBaseUrl}/responses`,
         headers: mergeJsonHeaders(profile, {
           Authorization: `Bearer ${apiKey}`,
         }),
         body: {
           model: input.model ?? profile.defaultModel,
-          input: {
-            messages: input.messages.map((message) => ({
-              role: message.role,
-              content: message.content,
-            })),
-          },
-          parameters: {
-            result_format: "message",
-            incremental_output: false,
-            ...buildSamplingOptions(profile),
-            ...(profile.reasoningEnabled
-              ? { reasoning_type: profile.reasoningLevel }
-              : {}),
-          },
+          instructions: responsesSystemInstructions(input.messages) || undefined,
+          input: responsesInputMessages(input.messages),
+          tools:
+            input.tools?.length && profile.toolCallingEnabled
+              ? responsesToolDefinitions(input)
+              : undefined,
+          tool_choice:
+            input.tools?.length && profile.toolCallingEnabled
+              ? normalizeBailianResponsesToolChoice(input.toolChoice)
+              : undefined,
+          enable_thinking: profile.reasoningEnabled && profile.reasoningLevel !== "off",
+          max_output_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+          text: wantsJsonMode(profile, input)
+            ? { format: { type: "json_object" } }
+            : undefined,
+          ...buildSamplingOptions(profile),
           ...profile.extraBody,
         },
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        if (Array.isArray(record.output)) {
+          return {
+            text: parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseResponsesToolCalls(record),
+          };
+        }
+      }
       return buildMediaResponse(payload);
     },
   },

@@ -45,6 +45,8 @@ pulsarbot/
 - 常用可选变量：
   - `PORT`，默认 `3000`
   - `DATA_DIR`，默认 `/data`
+  - `BODY_LIMIT_BYTES`，默认 `10485760`（10MB）
+  - `CORS_ORIGIN`，默认未限制（建议生产配置白名单）
   - `NODE_ENV`，默认 `development`
 
 ## 快速开始

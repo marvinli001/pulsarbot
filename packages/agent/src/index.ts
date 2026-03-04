@@ -10,7 +10,9 @@ import {
   invokeProviderStream,
   supportsProviderTextStreaming,
   type ProviderInvocationInput,
+  type ProviderMessage,
   type ProviderInvocationResult,
+  type ProviderToolDefinition,
 } from "@pulsarbot/providers";
 import {
   PlannerActionSchema,
@@ -145,6 +147,33 @@ function toolSourceFor(
   return "builtin";
 }
 
+function supportsNativeToolCalling(provider: ProviderProfile): boolean {
+  if (!provider.toolCallingEnabled) {
+    return false;
+  }
+  return provider.kind === "openai" ||
+    provider.kind === "anthropic" ||
+    provider.kind === "openrouter" ||
+    provider.kind === "bailian";
+}
+
+function toProviderHistoryMessages(history: MessageRecord[]): ProviderMessage[] {
+  return history.map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
+}
+
+function toProviderToolDefinitions(
+  descriptors: ToolDescriptor[],
+): ProviderToolDefinition[] {
+  return descriptors.map((tool) => ({
+    id: tool.id,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
+}
+
 export class AgentRuntime {
   private readonly plugins: BuiltinPluginRegistry;
   private readonly mcp: McpSupervisor;
@@ -268,9 +297,114 @@ export class AgentRuntime {
     const toolRuns: AgentTurnResult["toolRuns"] = [];
     const toolMessages: Array<{ role: "tool"; content: string }> = [];
     let stepsUsed = 0;
+    const useNativeToolCalling = supportsNativeToolCalling(primaryProvider);
+    const nativeToolDefinitions = toProviderToolDefinitions(toolDescriptors);
+    const nativePlanningMessages: ProviderMessage[] = useNativeToolCalling
+      ? [
+          {
+            role: "system",
+            content: `${promptContext}
+
+You are operating inside a Telegram-native agent loop.
+You may call tools when needed.
+When enough information is available, respond directly with the user-facing answer.`,
+          },
+          ...toProviderHistoryMessages(history),
+          {
+            role: "user",
+            content: input.userMessage,
+          },
+        ]
+      : [];
 
     for (let step = 0; step < input.profile.maxPlanningSteps; step += 1) {
       stepsUsed = step + 1;
+      if (useNativeToolCalling) {
+        const providerResult = await this.withOperationTimeout(
+          () =>
+            providerInvoker({
+              profile: primaryProvider,
+              apiKey: primaryApiKey,
+              input: {
+                messages: nativePlanningMessages,
+                tools: nativeToolDefinitions,
+                toolChoice:
+                  toolRuns.length >= input.profile.maxToolCalls ? "none" : "auto",
+              },
+            }),
+          this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+          "AGENT_PROVIDER_TIMEOUT",
+          "Planner model timed out",
+        );
+
+        const providerToolCalls = providerResult.toolCalls ?? [];
+        if (providerToolCalls.length === 0) {
+          const directReply = providerResult.text.trim();
+          if (directReply) {
+            return {
+              reply: directReply,
+              turnId,
+              stepCount: stepsUsed,
+              toolRuns,
+              compacted,
+              summary,
+            };
+          }
+          break;
+        }
+
+        nativePlanningMessages.push({
+          role: "assistant",
+          content: providerResult.text,
+          toolCalls: providerToolCalls,
+        });
+
+        for (const toolCall of providerToolCalls) {
+          if (toolRuns.length >= input.profile.maxToolCalls) {
+            break;
+          }
+          const output = await this.withOperationTimeout(
+            () =>
+              this.executeTool({
+                action: {
+                  type: "call_tool",
+                  toolId: toolCall.toolId,
+                  input: toolCall.input,
+                },
+                input,
+                memory,
+                mcpServers,
+                builtinToolIds,
+                memoryToolIds,
+              }),
+            this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+            "AGENT_TOOL_TIMEOUT",
+            `Tool ${toolCall.toolId} timed out`,
+          );
+          const source = toolSourceFor(toolCall.toolId, builtinToolIds, memoryToolIds);
+          const toolOutputText =
+            typeof output === "string" ? output : JSON.stringify(output, null, 2);
+          toolRuns.push({
+            id: createId("tool"),
+            toolId: toolCall.toolId,
+            input: toolCall.input,
+            output,
+            source,
+          });
+          toolMessages.push({
+            role: "tool",
+            content: toolOutputText,
+          });
+          nativePlanningMessages.push({
+            role: "tool",
+            toolCallId: toolCall.id,
+            content: toolOutputText,
+          });
+          scratchpad.push(`Tool ${toolCall.toolId} output:\n${toolOutputText}`);
+        }
+        continue;
+      }
+
       const planningMessages = [
         {
           role: "system" as const,
@@ -414,6 +548,39 @@ Rules:
       scratchpad.push(
         `Tool ${action.toolId} output:\n${typeof output === "string" ? output : JSON.stringify(output, null, 2)}`,
       );
+    }
+
+    if (useNativeToolCalling) {
+      try {
+        const finalProviderReply = await this.withOperationTimeout(
+          () =>
+            providerInvoker({
+              profile: primaryProvider,
+              apiKey: primaryApiKey,
+              input: {
+                messages: nativePlanningMessages,
+                tools: nativeToolDefinitions,
+                toolChoice: "none",
+              },
+            }),
+          this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+          "AGENT_PROVIDER_TIMEOUT",
+          "Final response generation timed out",
+        );
+        const text = finalProviderReply.text.trim();
+        if (text) {
+          return {
+            reply: text,
+            turnId,
+            stepCount: stepsUsed || input.profile.maxPlanningSteps,
+            toolRuns,
+            compacted,
+            summary,
+          };
+        }
+      } catch {
+        // Fall through to legacy final-response path.
+      }
     }
 
     const finalMessages = [

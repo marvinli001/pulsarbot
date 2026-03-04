@@ -20,12 +20,15 @@ import {
   JsonPanel,
   MutationBadge,
   useProfiles,
+  useProviders,
+  SelectField,
   useWorkspaceData,
 } from "../shared.js";
 
 export function WorkspacePanel() {
   const workspace = useWorkspaceData();
   const profiles = useProfiles();
+  const providers = useProviders();
   const queryClient = useQueryClient();
   const [form, setForm] = useState({
     label: "",
@@ -75,6 +78,45 @@ export function WorkspacePanel() {
     onClick: () => mutation.mutate(),
   });
 
+  const providerOptions = [
+    { value: "", label: "Not set" },
+    ...((providers.data ?? [])
+      .map((item) => {
+        const id = typeof item.id === "string" ? item.id : "";
+        if (!id) {
+          return null;
+        }
+        const label = typeof item.label === "string" && item.label
+          ? item.label
+          : id;
+        const kind = typeof item.kind === "string" ? item.kind : "provider";
+        return {
+          value: id,
+          label: `${label} (${kind})`,
+        };
+      })
+      .filter((item): item is { value: string; label: string } => Boolean(item))),
+  ];
+
+  const agentProfileOptions = [
+    { value: "", label: "Not set" },
+    ...((profiles.data ?? [])
+      .map((item) => {
+        const id = typeof item.id === "string" ? item.id : "";
+        if (!id) {
+          return null;
+        }
+        const label = typeof item.label === "string" && item.label
+          ? item.label
+          : id;
+        return {
+          value: id,
+          label,
+        };
+      })
+      .filter((item): item is { value: string; label: string } => Boolean(item))),
+  ];
+
   return (
     <div className="grid gap-6 xl:grid-cols-[1fr,0.95fr]">
       <Panel
@@ -97,36 +139,45 @@ export function WorkspacePanel() {
               setForm((current) => ({ ...current, timezone: event.target.value }))
             }
           />
-          <Input
-            placeholder="Primary provider profile ID"
-            value={form.primaryModelProfileId}
-            onChange={(event) =>
-              setForm((current) => ({
-                ...current,
-                primaryModelProfileId: event.target.value,
-              }))
-            }
-          />
-          <Input
-            placeholder="Background provider profile ID"
-            value={form.backgroundModelProfileId}
-            onChange={(event) =>
-              setForm((current) => ({
-                ...current,
-                backgroundModelProfileId: event.target.value,
-              }))
-            }
-          />
-          <Input
-            placeholder="Active agent profile ID"
-            value={form.activeAgentProfileId}
-            onChange={(event) =>
-              setForm((current) => ({
-                ...current,
-                activeAgentProfileId: event.target.value,
-              }))
-            }
-          />
+          <div className="grid gap-2">
+            <p className="text-sm font-medium text-slate-900">Primary Provider Profile</p>
+            <SelectField
+              value={form.primaryModelProfileId}
+              onChange={(next) =>
+                setForm((current) => ({
+                  ...current,
+                  primaryModelProfileId: next,
+                }))
+              }
+              options={providerOptions}
+            />
+          </div>
+          <div className="grid gap-2">
+            <p className="text-sm font-medium text-slate-900">Background Provider Profile</p>
+            <SelectField
+              value={form.backgroundModelProfileId}
+              onChange={(next) =>
+                setForm((current) => ({
+                  ...current,
+                  backgroundModelProfileId: next,
+                }))
+              }
+              options={providerOptions}
+            />
+          </div>
+          <div className="grid gap-2">
+            <p className="text-sm font-medium text-slate-900">Active Agent Profile</p>
+            <SelectField
+              value={form.activeAgentProfileId}
+              onChange={(next) =>
+                setForm((current) => ({
+                  ...current,
+                  activeAgentProfileId: next,
+                }))
+              }
+              options={agentProfileOptions}
+            />
+          </div>
           <div>
             <Button type="button" onClick={() => mutation.mutate()}>
               Save Workspace
@@ -145,8 +196,13 @@ export function WorkspacePanel() {
             value={workspace.data?.workspace ?? {}}
           />
           <JsonPanel
-            title="Available Profiles"
-            subtitle="可填写到 activeAgentProfileId 的 profile 清单。"
+            title="Provider Profiles"
+            subtitle="可填写到 primary/background 字段的 provider profile 清单。"
+            value={providers.data ?? []}
+          />
+          <JsonPanel
+            title="Agent Profiles"
+            subtitle="可填写到 activeAgentProfileId 的 agent profile 清单。"
             value={profiles.data ?? []}
           />
         </div>

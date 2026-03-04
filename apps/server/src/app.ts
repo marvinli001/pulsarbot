@@ -48,13 +48,14 @@ import {
   SearchSettingsSchema,
   WorkspaceExportBundleSchema,
   WorkspaceSchema,
-    type AgentProfile,
-    type CloudflareCredentials,
-    type ConversationTurn,
-    type DocumentArtifact,
-    type DocumentMetadata,
-    type InstallRecord,
-    type LooseJsonValue,
+  type AgentProfile,
+  type CloudflareCredentials,
+  type ConversationTurn,
+  type DocumentArtifact,
+  type DocumentMetadata,
+  type InstallRecord,
+  type LooseJsonValue,
+  type McpServerConfig,
   type MemoryDocument,
   type ProviderTestCapability,
   type ProviderProfile,
@@ -1374,6 +1375,31 @@ async function extractPdfText(rawBody: Uint8Array): Promise<string> {
   return result.text?.trim() ?? "";
 }
 
+async function extractDocxTextViaPython(tempPath: string): Promise<string> {
+  const script = [
+    "import sys, zipfile, xml.etree.ElementTree as ET",
+    "ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}",
+    "path = sys.argv[1]",
+    "with zipfile.ZipFile(path) as zf:",
+    "    xml = zf.read('word/document.xml')",
+    "root = ET.fromstring(xml)",
+    "paragraphs = []",
+    "for p in root.findall('.//w:p', ns):",
+    "    parts = []",
+    "    for t in p.findall('.//w:t', ns):",
+    "        if t.text:",
+    "            parts.append(t.text)",
+    "    text = ''.join(parts).strip()",
+    "    if text:",
+    "        paragraphs.append(text)",
+    "print('\\n'.join(paragraphs))",
+  ].join("\n");
+  const { stdout } = await execFile("python3", ["-c", script, tempPath], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout.trim();
+}
+
 async function extractDocxText(args: {
   rawBody: Uint8Array;
   dataDir: string;
@@ -1399,15 +1425,19 @@ async function extractDocxText(args: {
 
   try {
     await writeFile(tempPath, args.rawBody);
-    const { stdout } = await execFile("/usr/bin/textutil", [
-      "-convert",
-      "txt",
-      "-stdout",
-      tempPath,
-    ], {
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return stdout.trim();
+    if (process.platform === "darwin") {
+      const { stdout } = await execFile("/usr/bin/textutil", [
+        "-convert",
+        "txt",
+        "-stdout",
+        tempPath,
+      ], {
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return stdout.trim();
+    }
+
+    return await extractDocxTextViaPython(tempPath);
   } catch (error) {
     logger.warn({ error }, "DOCX extraction failed");
     return "";
@@ -1488,6 +1518,10 @@ export async function createApp(
   options: CreateAppOptions = {},
 ): Promise<ReturnType<typeof Fastify>> {
   const env = options.env ?? loadEnv();
+  const allowedCorsOrigins = (env.CORS_ORIGIN ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
   const mcpSupervisor = options.mcpSupervisor ?? createMcpSupervisor({
     logDir: path.resolve(env.DATA_DIR, "mcp-logs"),
   });
@@ -1500,13 +1534,22 @@ export async function createApp(
 
   const app = Fastify({
     loggerInstance: logger,
+    bodyLimit: env.BODY_LIMIT_BYTES,
   });
   const activeTurns = new Set<string>();
   const jwtSecret = getJwtSecret(state.env.PULSARBOT_ACCESS_TOKEN);
 
   await app.register(sensible);
   await app.register(cors, {
-    origin: true,
+    origin: allowedCorsOrigins.length === 0
+      ? true
+      : (origin, callback) => {
+          if (!origin || allowedCorsOrigins.includes(origin)) {
+            callback(null, true);
+            return;
+          }
+          callback(null, false);
+        },
     credentials: true,
   });
   await app.register(cookie);

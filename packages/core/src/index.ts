@@ -6,6 +6,8 @@ export const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().positive().default(3000),
   DATA_DIR: z.string().default("/data"),
+  BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(10 * 1024 * 1024),
+  CORS_ORIGIN: z.string().optional(),
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
   PULSARBOT_ACCESS_TOKEN: z.string().min(1, "PULSARBOT_ACCESS_TOKEN is required"),
 });

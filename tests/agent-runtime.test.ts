@@ -40,7 +40,7 @@ function createRuntime(searchSettings = createSearchSettings()): ResolvedRuntime
   };
 }
 
-function createProviderProfile(): ProviderProfile {
+function createProviderProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
   return {
     id: "provider_1",
     kind: "openai",
@@ -68,6 +68,7 @@ function createProviderProfile(): ProviderProfile {
     enabled: true,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -202,7 +203,7 @@ describe("AgentRuntime", () => {
       content: "Earlier context",
       createdAt: "2026-01-01T00:00:02.000Z",
     };
-    const planningCalls: ProviderInvocationInput["messages"][] = [];
+    const modelCalls: ProviderInvocationInput["messages"][] = [];
     const provider = createProviderProfile();
     const runtime = new AgentRuntime(
       {
@@ -220,8 +221,15 @@ describe("AgentRuntime", () => {
             void args.profile;
             void args.apiKey;
             const system = args.input.messages[0]?.content ?? "";
-            if (system.includes("Return strict JSON")) {
-              planningCalls.push(args.input.messages);
+            if (system.includes("Summarize the conversation")) {
+              return {
+                text: "summary",
+                raw: {},
+              };
+            }
+
+            modelCalls.push(args.input.messages);
+            if (args.input.jsonMode) {
               return {
                 text: JSON.stringify({
                   type: "final_response",
@@ -231,10 +239,7 @@ describe("AgentRuntime", () => {
               };
             }
 
-            return {
-              text: "done",
-              raw: {},
-            };
+            return { text: "done", raw: {} };
           },
         ),
       },
@@ -287,9 +292,193 @@ describe("AgentRuntime", () => {
       },
     });
 
-    const flattened = planningCalls[0]?.map((message) => message.content).join("\n") ?? "";
+    const flattened = modelCalls[0]?.map((message) => message.content).join("\n") ?? "";
     expect(flattened).toContain("recent user message");
     expect(flattened).not.toContain("old user message");
     expect(flattened).not.toContain("old assistant answer");
+  });
+
+  it("executes native tool calls and feeds tool results back to the provider", async () => {
+    const memory = createMemoryStore();
+    memory.listToolDescriptors = vi.fn(() => [
+      {
+        id: "memory_search",
+        title: "Memory Search",
+        description: "Search saved memory.",
+        inputSchema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+        permissionScopes: [],
+        source: "builtin",
+      },
+    ]);
+    memory.executeTool = vi.fn(async () => ({ hits: ["result-1"] }));
+    const provider = createProviderProfile();
+    const providerCalls: ProviderInvocationInput[] = [];
+    const invokeProvider = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderInvocationInput;
+      }): Promise<ProviderInvocationResult> => {
+        void args.profile;
+        void args.apiKey;
+        providerCalls.push(args.input);
+        if (providerCalls.length === 1) {
+          return {
+            text: "",
+            raw: {},
+            toolCalls: [
+              {
+                id: "call_1",
+                toolId: "memory_search",
+                input: { query: "alpha" },
+              },
+            ],
+          };
+        }
+        return {
+          text: "final answer",
+          raw: {},
+        };
+      },
+    );
+
+    const runtime = new AgentRuntime(
+      {
+        resolveProviderProfile: async () => provider,
+        resolveApiKey: async () => "sk-test",
+        listEnabledMcpServers: async () => [],
+        listConversationSummaries: async () => [],
+        createMemoryStore: async () => memory,
+        invokeProvider,
+      },
+      "/tmp",
+    );
+
+    const result = await runtime.runTurn({
+      profile: createAgentProfile(),
+      userMessage: "Find memory",
+      history: [],
+      context: {
+        workspaceId: "main",
+        conversationId: "conversation_1",
+        nowIso: "2026-01-01T00:00:00.000Z",
+        timezone: "UTC",
+        profileId: "agent_1",
+        runtime: createRuntime(),
+        searchSettings: createSearchSettings(),
+      },
+    });
+
+    expect(result.reply).toBe("final answer");
+    expect(result.toolRuns).toHaveLength(1);
+    expect(result.toolRuns[0]).toMatchObject({
+      toolId: "memory_search",
+      input: { query: "alpha" },
+    });
+    expect(memory.executeTool).toHaveBeenCalledWith("memory_search", { query: "alpha" });
+    expect(providerCalls).toHaveLength(2);
+    expect(providerCalls[1]?.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "assistant",
+          toolCalls: [
+            expect.objectContaining({
+              id: "call_1",
+              toolId: "memory_search",
+              input: { query: "alpha" },
+            }),
+          ],
+        }),
+        expect.objectContaining({
+          role: "tool",
+          toolCallId: "call_1",
+        }),
+      ]),
+    );
+  });
+
+  it("enables native tool-calling path for openrouter and bailian providers", async () => {
+    for (const kind of ["openrouter", "bailian"] as const) {
+      const memory = createMemoryStore();
+      memory.listToolDescriptors = vi.fn(() => [
+        {
+          id: "memory_search",
+          title: "Memory Search",
+          description: "Search saved memory.",
+          inputSchema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+          permissionScopes: [],
+          source: "builtin",
+        },
+      ]);
+      const provider = createProviderProfile({
+        kind,
+        apiBaseUrl:
+          kind === "openrouter"
+            ? "https://openrouter.ai/api/v1"
+            : "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+      });
+      const invokeProvider = vi.fn(
+        async (args: {
+          profile: ProviderProfile;
+          apiKey: string;
+          input: ProviderInvocationInput;
+        }): Promise<ProviderInvocationResult> => {
+          void args.profile;
+          void args.apiKey;
+          return {
+            text: "done",
+            raw: {},
+          };
+        },
+      );
+      const runtime = new AgentRuntime(
+        {
+          resolveProviderProfile: async () => provider,
+          resolveApiKey: async () => "sk-test",
+          listEnabledMcpServers: async () => [],
+          listConversationSummaries: async () => [],
+          createMemoryStore: async () => memory,
+          invokeProvider,
+        },
+        "/tmp",
+      );
+
+      await runtime.runTurn({
+        profile: createAgentProfile(),
+        userMessage: "Hello",
+        history: [],
+        context: {
+          workspaceId: "main",
+          conversationId: `conversation_${kind}`,
+          nowIso: "2026-01-01T00:00:00.000Z",
+          timezone: "UTC",
+          profileId: "agent_1",
+          runtime: createRuntime(),
+          searchSettings: createSearchSettings(),
+        },
+      });
+
+      const firstCallInput = invokeProvider.mock.calls[0]?.[0]?.input as
+        | ProviderInvocationInput
+        | undefined;
+      expect(firstCallInput?.jsonMode).toBeUndefined();
+      expect(firstCallInput?.tools?.length ?? 0).toBeGreaterThan(0);
+      expect(firstCallInput?.tools).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "memory_search",
+          }),
+        ]),
+      );
+      expect(firstCallInput?.toolChoice).toBe("auto");
+    }
   });
 });

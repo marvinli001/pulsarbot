@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createProviderMediaRequestPreview,
   createProviderRequestPreview,
+  getProviderAdapter,
   supportsProviderCapability,
 } from "../packages/providers/src/index.js";
 import type { ProviderProfile } from "../packages/shared/src/index.js";
@@ -71,6 +72,173 @@ describe("provider request preview", () => {
     expect(preview.body.thinking).toBeTruthy();
   });
 
+  it("builds an OpenAI chat-completions payload for native tool calling", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("openai"),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: { type: "tool", toolId: "search_web" },
+      },
+    });
+
+    expect(preview.url).toContain("/chat/completions");
+    expect(preview.body.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "search_web",
+          description: "Search the web",
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+        },
+      },
+    ]);
+    expect(preview.body.tool_choice).toEqual({
+      type: "function",
+      function: { name: "search_web" },
+    });
+  });
+
+  it("builds an Anthropic payload for native tool calling", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("anthropic"),
+      apiKey: "anthropic-key",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: "auto",
+      },
+    });
+
+    expect(preview.url).toContain("/messages");
+    expect(preview.body.tools).toEqual([
+      {
+        name: "search_web",
+        description: "Search the web",
+        input_schema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
+    ]);
+    expect(preview.body.tool_choice).toEqual({ type: "auto" });
+  });
+
+  it("builds an OpenRouter responses payload for native tool calling and reasoning", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("openrouter", {
+        reasoningEnabled: true,
+        reasoningLevel: "high",
+      }),
+      apiKey: "openrouter-key",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: { type: "tool", toolId: "search_web" },
+      },
+    });
+
+    expect(preview.url).toContain("/responses");
+    expect(preview.body.reasoning).toEqual({ effort: "high" });
+    expect(preview.body.tools).toEqual([
+      {
+        type: "function",
+        name: "search_web",
+        description: "Search the web",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
+    ]);
+    expect(preview.body.tool_choice).toEqual({
+      type: "function",
+      name: "search_web",
+    });
+  });
+
+  it("builds a Bailian responses payload for native tool calling and thinking", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("bailian", {
+        reasoningEnabled: true,
+        reasoningLevel: "medium",
+      }),
+      apiKey: "bailian-key",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: { type: "tool", toolId: "search_web" },
+      },
+    });
+
+    expect(preview.url).toContain("/compatible-mode/v1/responses");
+    expect(preview.body.enable_thinking).toBe(true);
+    expect(preview.body.tools).toEqual([
+      {
+        type: "function",
+        name: "search_web",
+        description: "Search the web",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
+    ]);
+    expect(preview.body.tool_choice).toEqual({
+      type: "allowed_tools",
+      mode: "required",
+      tools: [{ type: "function", name: "search_web" }],
+    });
+  });
+
   it("covers the configured provider kinds", () => {
     const cases = [
       {
@@ -99,12 +267,12 @@ describe("provider request preview", () => {
       {
         kind: "bailian" as const,
         apiKey: "bailian-key",
-        urlPart: "/generation",
+        urlPart: "/compatible-mode/v1/responses",
         header: "Authorization",
         assert(preview: ReturnType<typeof createProviderRequestPreview>) {
           expect(preview.body.model).toBe("test-model");
           expect(preview.body.input).toBeTruthy();
-          expect(preview.body.parameters).toBeTruthy();
+          expect(preview.body.enable_thinking).toBe(true);
         },
       },
       {
@@ -147,6 +315,131 @@ describe("provider request preview", () => {
       }
       testCase.assert(preview);
     }
+  });
+});
+
+describe("provider response parsing", () => {
+  it("parses OpenAI chat-completions tool calls", () => {
+    const adapter = getProviderAdapter("openai");
+    const result = adapter.parseResponse({
+      id: "chatcmpl-1",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "Let me call a tool.",
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: {
+                  name: "search_web",
+                  arguments: "{\"query\":\"tokyo weather\"}",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(result.text).toContain("Let me call a tool.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "call_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
+  });
+
+  it("parses Anthropic tool_use blocks", () => {
+    const adapter = getProviderAdapter("anthropic");
+    const result = adapter.parseResponse({
+      id: "msg_1",
+      type: "message",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "search_web",
+          input: { query: "tokyo weather" },
+        },
+        {
+          type: "text",
+          text: "I'll use the search result next.",
+        },
+      ],
+    });
+
+    expect(result.text).toContain("I'll use the search result next.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "toolu_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
+  });
+
+  it("parses OpenRouter responses function_call blocks", () => {
+    const adapter = getProviderAdapter("openrouter");
+    const result = adapter.parseResponse({
+      id: "resp_or_1",
+      output: [
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_1",
+          name: "search_web",
+          arguments: "{\"query\":\"tokyo weather\"}",
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Using tool now." }],
+        },
+      ],
+    });
+
+    expect(result.text).toContain("Using tool now.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "call_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
+  });
+
+  it("parses Bailian responses function_call blocks", () => {
+    const adapter = getProviderAdapter("bailian");
+    const result = adapter.parseResponse({
+      id: "resp_bl_1",
+      output: [
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_1",
+          name: "search_web",
+          arguments: "{\"query\":\"tokyo weather\"}",
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Using tool now." }],
+        },
+      ],
+    });
+
+    expect(result.text).toContain("Using tool now.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "call_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
   });
 });
 

@@ -26,6 +26,7 @@ import {
   WorkspaceSchema,
   type AdminIdentity,
   type AgentProfile,
+  type AuthSession,
   type AuditEvent,
   type BootstrapState,
   type ConversationRecord,

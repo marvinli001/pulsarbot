@@ -159,38 +159,55 @@ const fakeProviderInvoker = vi.fn(
     const messages = args.input.messages;
     const system = messages.find((message) => message.role === "system")?.content ?? "";
     const user = messages.find((message) => message.role === "user")?.content ?? "";
+    const hasToolResult = messages.some((message) => message.role === "tool");
+    const rememberText = user.replace(/^.*remember this[:：]?\s*/i, "").trim() || user;
 
-    if (system.includes("Return strict JSON")) {
-      if (/remember this/i.test(user)) {
+    if (hasToolResult) {
+      return {
+        text: "已记录。",
+        raw: {},
+      };
+    }
+
+    if (/remember this/i.test(user)) {
+      if (args.input.tools?.length && !args.input.jsonMode) {
         return {
-          text: JSON.stringify({
-            finalResponse: "已记录。",
-            toolCalls: [
-              {
-                toolId: "memory_append_daily",
-                input: {
-                  text:
-                    user.replace(/^.*remember this[:：]?\s*/i, "").trim() || user,
-                },
-              },
-            ],
-          }),
+          text: "",
           raw: {},
+          toolCalls: [
+            {
+              id: "call_memory_append_daily",
+              toolId: "memory_append_daily",
+              input: {
+                text: rememberText,
+              },
+            },
+          ],
         };
       }
 
       return {
         text: JSON.stringify({
-          finalResponse: `Echo: ${user}`,
-          toolCalls: [],
+          finalResponse: "已记录。",
+          toolCalls: [
+            {
+              toolId: "memory_append_daily",
+              input: {
+                text: rememberText,
+              },
+            },
+          ],
         }),
         raw: {},
       };
     }
 
-    if (messages.some((message) => message.role === "tool")) {
+    if (system.includes("Return strict JSON")) {
       return {
-        text: "已记录。",
+        text: JSON.stringify({
+          finalResponse: `Echo: ${user}`,
+          toolCalls: [],
+        }),
         raw: {},
       };
     }
@@ -896,6 +913,7 @@ describe("server flows", () => {
         const messages = args.input.messages;
         const system = messages.find((message) => message.role === "system")?.content ?? "";
         const user = messages.find((message) => message.role === "user")?.content ?? "";
+        const hasToolResult = messages.some((message) => message.role === "tool");
 
         if (system.includes("Return strict JSON")) {
           await new Promise((resolve) => setTimeout(resolve, 150));
@@ -906,6 +924,10 @@ describe("server flows", () => {
             }),
             raw: {},
           };
+        }
+
+        if (!hasToolResult) {
+          await new Promise((resolve) => setTimeout(resolve, 150));
         }
 
         return {

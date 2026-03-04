@@ -34,6 +34,8 @@ export DATA_DIR="./data"
 | `PULSARBOT_ACCESS_TOKEN` | 必需 | 管理台访问口令，也用于部分高敏接口二次确认 |
 | `PORT` | 可选 | 服务监听端口，默认 `3000` |
 | `DATA_DIR` | 可选 | 本地数据目录，默认 `/data`，建议本地设为 `./data` |
+| `BODY_LIMIT_BYTES` | 可选 | HTTP 请求体大小限制（字节），默认 `10485760`（10MB） |
+| `CORS_ORIGIN` | 可选 | 逗号分隔的允许来源白名单；不设置时默认放开 |
 | `NODE_ENV` | 可选 | `development` / `test` / `production` |
 
 ## 4. 构建项目
