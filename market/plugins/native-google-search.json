@@ -1,0 +1,13 @@
+{
+  "id": "native-google-search",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "title": "Google Search",
+  "description": "Best-effort Google HTML search integration without extra API keys.",
+  "tags": ["search", "google"],
+  "configSchema": {},
+  "permissions": ["network:search"],
+  "dependencies": [],
+  "runtimeKind": "internal",
+  "entrypoint": "@pulsarbot/plugins/google_search"
+}

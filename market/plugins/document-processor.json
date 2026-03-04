@@ -1,0 +1,13 @@
+{
+  "id": "document-processor",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "title": "Document Processor",
+  "description": "Clean and segment pasted text for document workflows.",
+  "tags": ["document"],
+  "configSchema": {},
+  "permissions": ["document:read"],
+  "dependencies": [],
+  "runtimeKind": "internal",
+  "entrypoint": "@pulsarbot/plugins/document_extract_text"
+}

@@ -1,0 +1,16 @@
+{
+  "id": "mcp-bridge",
+  "version": "0.1.0",
+  "kind": "skill",
+  "title": "MCP Bridge",
+  "description": "Makes configured MCP servers available to the agent runtime.",
+  "tags": ["mcp", "bridge"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "promptFragments": [
+    "MCP-backed tools are external integrations and may have network or process latency."
+  ],
+  "toolBindings": [],
+  "enabledByDefault": false
+}

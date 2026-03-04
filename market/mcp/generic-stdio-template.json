@@ -1,0 +1,14 @@
+{
+  "id": "generic-stdio-template",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "Generic stdio Template",
+  "description": "Template entry for custom stdio MCP servers.",
+  "tags": ["template", "stdio"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "stdio",
+  "command": "uvx",
+  "args": ["your-mcp-server"]
+}

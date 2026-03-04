@@ -1,0 +1,13 @@
+{
+  "id": "modelscope",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "ModelScope",
+  "description": "Preset MCP metadata entry for ModelScope.",
+  "tags": ["modelscope"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "streamable_http",
+  "url": "https://example.com/modelscope/mcp"
+}

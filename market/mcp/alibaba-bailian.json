@@ -1,0 +1,13 @@
+{
+  "id": "alibaba-bailian",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "Alibaba Bailian",
+  "description": "Preset MCP metadata entry for Alibaba Bailian integrations.",
+  "tags": ["alibaba", "bailian"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "streamable_http",
+  "url": "https://example.com/alibaba-bailian/mcp"
+}

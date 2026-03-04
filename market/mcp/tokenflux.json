@@ -1,0 +1,13 @@
+{
+  "id": "tokenflux",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "TokenFlux",
+  "description": "Preset MCP metadata entry for TokenFlux.",
+  "tags": ["tokenflux"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "streamable_http",
+  "url": "https://example.com/tokenflux/mcp"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "time-context",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "title": "Time Context",
+  "description": "Injects exact current date-time context for every agent turn.",
+  "tags": ["time"],
+  "configSchema": {},
+  "permissions": [],
+  "dependencies": [],
+  "runtimeKind": "internal",
+  "entrypoint": "@pulsarbot/plugins/get_current_time"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "export-import",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "title": "Export / Import",
+  "description": "Supports workspace configuration portability and backups.",
+  "tags": ["backup", "migration"],
+  "configSchema": {},
+  "permissions": ["workspace:export", "workspace:import"],
+  "dependencies": [],
+  "runtimeKind": "internal",
+  "entrypoint": "@pulsarbot/plugins/export_import"
+}

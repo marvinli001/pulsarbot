@@ -1,0 +1,13 @@
+{
+  "id": "generic-streamable-http-template",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "Generic Streamable HTTP Template",
+  "description": "Template entry for custom Streamable HTTP MCP servers.",
+  "tags": ["template", "http"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "streamable_http",
+  "url": "https://example.com/mcp"
+}

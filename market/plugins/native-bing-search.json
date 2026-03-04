@@ -1,0 +1,13 @@
+{
+  "id": "native-bing-search",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "title": "Bing Search",
+  "description": "Best-effort Bing HTML search integration without extra API keys.",
+  "tags": ["search", "bing"],
+  "configSchema": {},
+  "permissions": ["network:search"],
+  "dependencies": [],
+  "runtimeKind": "internal",
+  "entrypoint": "@pulsarbot/plugins/bing_search"
+}

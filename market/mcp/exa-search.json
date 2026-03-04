@@ -1,0 +1,17 @@
+{
+  "id": "exa-search",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "Exa Search",
+  "description": "Exa-powered MCP search integration.",
+  "tags": ["search", "exa"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "stdio",
+  "command": "uvx",
+  "args": ["exa-mcp"],
+  "envTemplate": {
+    "EXA_API_KEY": ""
+  }
+}

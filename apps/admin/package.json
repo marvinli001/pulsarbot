@@ -1,0 +1,26 @@
+{
+  "name": "@pulsarbot/admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pulsarbot/shared": "workspace:*",
+    "@pulsarbot/ui-kit": "workspace:*",
+    "@tanstack/react-query": "^5.66.9",
+    "@tanstack/react-router": "^1.114.24",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.483.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4"
+  }
+}

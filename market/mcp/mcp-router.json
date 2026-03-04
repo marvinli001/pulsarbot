@@ -1,0 +1,13 @@
+{
+  "id": "mcp-router",
+  "version": "0.1.0",
+  "kind": "mcp",
+  "title": "MCP Router",
+  "description": "Preset entry for MCP Router compatible backends.",
+  "tags": ["router", "mcp"],
+  "configSchema": {},
+  "permissions": ["mcp:invoke"],
+  "dependencies": [],
+  "transport": "streamable_http",
+  "url": "https://example.com/mcp-router"
+}

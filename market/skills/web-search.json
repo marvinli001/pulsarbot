@@ -1,0 +1,16 @@
+{
+  "id": "web-search",
+  "version": "0.1.0",
+  "kind": "skill",
+  "title": "Web Search",
+  "description": "Adds Google and Bing best-effort search guidance.",
+  "tags": ["search", "web"],
+  "configSchema": {},
+  "permissions": ["network:search"],
+  "dependencies": ["native-google-search", "native-bing-search"],
+  "promptFragments": [
+    "Use web search before making claims about fast-changing topics."
+  ],
+  "toolBindings": ["google_search", "bing_search"],
+  "enabledByDefault": false
+}

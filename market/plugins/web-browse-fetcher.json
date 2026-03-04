@@ -1,0 +1,13 @@
+{
+  "id": "web-browse-fetcher",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "title": "Web Browse Fetcher",
+  "description": "Fetch pages and extract readable content with readability + cheerio fallback.",
+  "tags": ["browse", "web"],
+  "configSchema": {},
+  "permissions": ["network:browse"],
+  "dependencies": [],
+  "runtimeKind": "internal",
+  "entrypoint": "@pulsarbot/plugins/web_browse"
+}

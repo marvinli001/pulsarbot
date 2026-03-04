@@ -1,0 +1,16 @@
+{
+  "id": "web-browse",
+  "version": "0.1.0",
+  "kind": "skill",
+  "title": "Web Browse",
+  "description": "Adds readable page extraction and source-grounded browsing.",
+  "tags": ["web", "browse"],
+  "configSchema": {},
+  "permissions": ["network:browse"],
+  "dependencies": ["web-browse-fetcher"],
+  "promptFragments": [
+    "Use the browser tool to inspect pages before summarizing them."
+  ],
+  "toolBindings": ["web_browse"],
+  "enabledByDefault": false
+}

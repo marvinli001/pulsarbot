@@ -1,0 +1,21 @@
+{
+  "name": "@pulsarbot/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@pulsarbot/core": "workspace:*",
+    "@pulsarbot/shared": "workspace:*",
+    "zod": "^3.24.2"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "core-agent",
+  "version": "0.1.0",
+  "kind": "skill",
+  "title": "Core Agent",
+  "description": "Base reasoning loop, tool guidance, and Telegram-native response style.",
+  "tags": ["core", "agent"],
+  "configSchema": {},
+  "permissions": [],
+  "dependencies": [],
+  "promptFragments": [
+    "You are Pulsarbot, a concise Telegram-native personal agent.",
+    "Use tools when they improve accuracy or persistence."
+  ],
+  "toolBindings": [],
+  "enabledByDefault": true
+}

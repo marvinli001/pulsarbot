@@ -1,0 +1,24 @@
+{
+  "name": "@pulsarbot/memory",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1001.0",
+    "@aws-sdk/lib-storage": "^3.1001.0",
+    "@pulsarbot/cloudflare": "workspace:*",
+    "@pulsarbot/core": "workspace:*",
+    "@pulsarbot/shared": "workspace:*",
+    "@pulsarbot/storage": "workspace:*",
+    "zod": "^3.24.2"
+  }
+}

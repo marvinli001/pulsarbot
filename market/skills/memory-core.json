@@ -1,0 +1,22 @@
+{
+  "id": "memory-core",
+  "version": "0.1.0",
+  "kind": "skill",
+  "title": "Memory Core",
+  "description": "OpenClaw-style Markdown memory rules for long-term and daily notes.",
+  "tags": ["memory", "markdown"],
+  "configSchema": {},
+  "permissions": ["memory:read", "memory:write"],
+  "dependencies": [],
+  "promptFragments": [
+    "Persist durable facts to MEMORY.md and append operational notes to daily memory.",
+    "If the user says remember this, use memory tools rather than relying on conversation context."
+  ],
+  "toolBindings": [
+    "memory_search",
+    "memory_append_daily",
+    "memory_upsert_longterm",
+    "memory_refresh_before_compact"
+  ],
+  "enabledByDefault": false
+}

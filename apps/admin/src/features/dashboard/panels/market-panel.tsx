@@ -1,0 +1,115 @@
+import {
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
+import {
+  Badge,
+  Button,
+  Panel,
+} from "@pulsarbot/ui-kit";
+import { apiFetch } from "../../../lib/api.js";
+import { notificationOccurred } from "../../../lib/telegram.js";
+import {
+  MutationBadge,
+  useMarket,
+} from "../shared.js";
+
+export function MarketPanel({ kind }: { kind: "skills" | "plugins" | "mcp" }) {
+  const market = useMarket(kind);
+  const queryClient = useQueryClient();
+
+  const actionMutation = useMutation({
+    mutationFn: async ({
+      action,
+      id,
+    }: {
+      action: "install" | "uninstall" | "enable" | "disable";
+      id: string;
+    }) =>
+      apiFetch(`/api/market/${kind}/${id}/${action}`, {
+        method: "POST",
+      }),
+    onSuccess: async () => {
+      notificationOccurred("success");
+      await queryClient.invalidateQueries({ queryKey: ["market", kind] });
+      await queryClient.invalidateQueries({ queryKey: ["profiles"] });
+    },
+    onError: () => notificationOccurred("error"),
+  });
+
+  const installs = market.data?.installs ?? [];
+
+  return (
+    <Panel
+      title={kind === "mcp" ? "MCP Market" : `${kind[0]?.toUpperCase() ?? ""}${kind.slice(1)} Market`}
+      subtitle="仓库内官方 manifest 池，支持 install / uninstall / enable / disable。"
+      actions={<MutationBadge mutation={actionMutation} successLabel="Market Updated" />}
+    >
+      <div className="space-y-3">
+        {market.data?.manifests.map((manifest) => {
+          const manifestId = String(manifest.id);
+          const install = installs.find((item) => item.manifestId === manifestId);
+          const installed = Boolean(install);
+          const enabled = Boolean(install?.enabled);
+
+          return (
+            <div key={manifestId} className="rounded-2xl border border-slate-200 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="space-y-2">
+                  <div>
+                    <p className="font-medium text-slate-900">{String(manifest.title)}</p>
+                    <p className="text-sm text-slate-500">{String(manifest.description)}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2 text-xs text-slate-500">
+                    <Badge tone={installed ? "success" : "warning"}>
+                      {installed ? "Installed" : "Not Installed"}
+                    </Badge>
+                    <Badge tone={enabled ? "success" : "neutral"}>
+                      {enabled ? "Enabled" : "Disabled"}
+                    </Badge>
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Dependencies: {Array.isArray(manifest.dependencies) ? manifest.dependencies.join(", ") || "None" : "None"}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {!installed ? (
+                    <Button
+                      type="button"
+                      onClick={() => actionMutation.mutate({ action: "install", id: manifestId })}
+                    >
+                      Install
+                    </Button>
+                  ) : null}
+                  {installed ? (
+                    <Button
+                      type="button"
+                      tone={enabled ? "secondary" : "primary"}
+                      onClick={() =>
+                        actionMutation.mutate({
+                          action: enabled ? "disable" : "enable",
+                          id: manifestId,
+                        })
+                      }
+                    >
+                      {enabled ? "Disable" : "Enable"}
+                    </Button>
+                  ) : null}
+                  {installed ? (
+                    <Button
+                      type="button"
+                      tone="ghost"
+                      onClick={() => actionMutation.mutate({ action: "uninstall", id: manifestId })}
+                    >
+                      Uninstall
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}

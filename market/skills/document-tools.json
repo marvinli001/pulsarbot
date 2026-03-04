@@ -1,0 +1,16 @@
+{
+  "id": "document-tools",
+  "version": "0.1.0",
+  "kind": "skill",
+  "title": "Document Tools",
+  "description": "Normalize and chunk pasted text for downstream reasoning.",
+  "tags": ["document", "text"],
+  "configSchema": {},
+  "permissions": ["document:read"],
+  "dependencies": ["document-processor"],
+  "promptFragments": [
+    "Use document tools to normalize unstructured pasted text before analysis."
+  ],
+  "toolBindings": ["document_extract_text"],
+  "enabledByDefault": false
+}
