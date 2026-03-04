@@ -64,6 +64,30 @@
 1. 导入后在 staged changes 丢弃 `@pulsarbot/admin`（一次性操作）；
 2. 先创建空 Railway 项目，再手动只创建一个服务并连接这个 GitHub 仓库（从源头避免双服务）。
 
+### 3.2.2 用代码配置 watch path（让 admin/ui 改动也触发 server 部署）
+
+当前仓库已在 `infra/railway/railway.json` 加入 `build.watchPatterns`，包含：
+
+- `/apps/server/**`
+- `/apps/admin/**`
+- `/packages/**`
+- `/market/**`
+- `/infra/docker/**`
+- `/infra/railway/**`
+- `/package.json`
+- `/pnpm-lock.yaml`
+- `/pnpm-workspace.yaml`
+- `/turbo.json`
+- `/tsconfig.base.json`
+
+这意味着你改 Mini App UI（`apps/admin/**`）或共享包（`packages/**`）时，`@pulsarbot/server` 也会触发 build/deploy。
+
+如果仍看到 `No deployment needed - watched paths not modified`，通常是服务没有读取到这个配置文件。请在 Railway 服务里确认：
+
+1. 已启用 Config as Code；
+2. 配置文件路径是 `infra/railway/railway.json`（不是默认空值）；
+3. 保存后手动点一次 `Deploy latest commit` 让新规则生效。
+
 ### 3.3 `@pulsarbot/server` 环境变量
 
 至少配置：
