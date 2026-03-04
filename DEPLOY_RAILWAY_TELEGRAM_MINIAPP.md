@@ -229,6 +229,18 @@ curl -sS "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 2. `@pulsarbot/server` 是否成功构建并在线
 3. 是否误把流量打到了 `@pulsarbot/admin` 服务
 
+如果日志里出现这两条：
+
+- `"root" path ".../apps/admin/dist" must exist`
+- `Route GET:/miniapp/ not found`
+
+说明服务端启动时没有找到前端构建产物，常见原因是：
+
+1. 使用了旧镜像（未包含最新修复）；
+2. 构建阶段没有执行 `@pulsarbot/admin` 的 build。
+
+当前仓库已在 `@pulsarbot/server` 构建脚本中显式加入 `pnpm --filter @pulsarbot/admin build`，更新后重新部署即可。
+
 ### 8.3 浏览器访问 Mini App 提示 `initData is required outside development`
 
 这是预期行为：生产环境要求 Telegram `initData`。请从 Telegram 客户端进入 Mini App。

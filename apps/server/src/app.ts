@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -1563,12 +1563,23 @@ export async function createApp(
 
   app.decorateRequest("authUser", null);
 
-  const adminDist = path.resolve(process.cwd(), "apps/admin/dist");
-  await app.register(fastifyStatic, {
-    root: adminDist,
-    prefix: "/miniapp/",
-    index: ["index.html"],
-  });
+  const adminDist = path.resolve(repoRootDir, "apps/admin/dist");
+  try {
+    await access(adminDist);
+    await app.register(fastifyStatic, {
+      root: adminDist,
+      prefix: "/miniapp/",
+      index: ["index.html"],
+    });
+    app.get("/miniapp", async (_request, reply) => {
+      await reply.redirect("/miniapp/");
+    });
+  } catch {
+    logger.warn(
+      { adminDist },
+      "Admin miniapp dist not found. Build @pulsarbot/admin before starting the server.",
+    );
+  }
 
   const requireSessionGuard = async (
     request: FastifyRequest,
