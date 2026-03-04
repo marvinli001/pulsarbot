@@ -17,7 +17,7 @@ export function AppShell({
 }: PropsWithChildren<{ sidebar: ReactNode }>) {
   return (
     <div
-      className="min-h-screen text-slate-900"
+      className="min-h-screen w-full overflow-x-hidden text-slate-900"
       style={{
         minHeight: "var(--app-viewport-stable-height, 100dvh)",
         background: "var(--app-shell-bg)",
@@ -25,7 +25,7 @@ export function AppShell({
       }}
     >
       <div
-        className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-6 p-4 pb-28 md:p-6 md:pb-28 xl:flex-row xl:pb-6"
+        className="mx-auto flex min-h-screen w-full min-w-0 max-w-[1440px] flex-col gap-6 overflow-x-hidden p-4 pb-28 md:p-6 md:pb-28 xl:flex-row xl:pb-6"
         style={{
           minHeight: "var(--app-viewport-stable-height, 100dvh)",
           paddingTop: "calc(1rem + var(--app-safe-area-top))",
@@ -34,9 +34,9 @@ export function AppShell({
           paddingLeft: "calc(1rem + var(--app-safe-area-left))",
         }}
       >
-        <div className="xl:hidden">{sidebar}</div>
+        <div className="min-w-0 xl:hidden">{sidebar}</div>
         <aside
-          className="hidden w-80 shrink-0 rounded-[28px] border p-4 shadow-[0_30px_80px_rgba(15,23,42,0.08)] backdrop-blur xl:block"
+          className="hidden min-w-0 w-80 shrink-0 rounded-[28px] border p-4 shadow-[0_30px_80px_rgba(15,23,42,0.08)] backdrop-blur xl:block"
           style={{
             background: "color-mix(in srgb, var(--app-surface) 82%, transparent)",
             borderColor: "var(--app-border)",
@@ -45,7 +45,7 @@ export function AppShell({
           {sidebar}
         </aside>
         <main
-          className="flex-1 rounded-[32px] border p-4 shadow-[0_30px_80px_rgba(15,23,42,0.1)] backdrop-blur md:p-6"
+          className="min-w-0 w-full flex-1 rounded-[24px] border p-4 shadow-[0_30px_80px_rgba(15,23,42,0.1)] backdrop-blur md:rounded-[32px] md:p-6"
           style={{
             background: "color-mix(in srgb, var(--app-surface) 88%, transparent)",
             borderColor: "var(--app-border)",
@@ -70,23 +70,23 @@ export function Panel({
 }>) {
   return (
     <section
-      className="rounded-[24px] border p-5 shadow-sm"
+      className="min-w-0 rounded-[24px] border p-5 shadow-sm"
       style={{
         background: "var(--app-surface)",
         borderColor: "var(--app-border)",
       }}
     >
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
+      <div className="mb-4 flex min-w-0 items-start justify-between gap-4">
+        <div className="min-w-0">
           <h2
-            className="font-['IBM_Plex_Sans',sans-serif] text-lg font-semibold tracking-tight text-slate-950"
+            className="break-words font-['IBM_Plex_Sans',sans-serif] text-lg font-semibold tracking-tight text-slate-950"
             style={{ color: "var(--tg-section-header-text-color)" }}
           >
             {title}
           </h2>
           {subtitle ? (
             <p
-              className="mt-1 text-sm text-slate-500"
+              className="mt-1 break-words text-sm text-slate-500"
               style={{ color: "var(--app-muted-text)" }}
             >
               {subtitle}

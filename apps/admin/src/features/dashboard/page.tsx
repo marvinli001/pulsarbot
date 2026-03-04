@@ -82,23 +82,23 @@ function Page() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="min-w-0 space-y-4 md:space-y-6">
       <header
-        className="rounded-[24px] px-6 py-5"
+        className="overflow-hidden rounded-[20px] px-4 py-4 sm:rounded-[24px] sm:px-6 sm:py-5"
         style={{
           background: "var(--app-header-bg)",
           color: "var(--app-header-text)",
         }}
       >
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
+        <div className="flex min-w-0 flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
             <p
               className="text-xs uppercase tracking-[0.24em]"
               style={{ color: "var(--app-subtle-text)" }}
             >
               Telegram Mini App
             </p>
-            <h2 className="mt-2 font-['Space_Grotesk',sans-serif] text-3xl font-semibold">
+            <h2 className="mt-2 break-words font-['Space_Grotesk',sans-serif] text-2xl font-semibold leading-tight sm:text-3xl">
               Pulsarbot Control Center
             </h2>
             <p className="mt-2 text-sm" style={{ color: "var(--app-subtle-text)" }}>
@@ -111,13 +111,13 @@ function Page() {
             </p>
           </div>
           <div
-            className="rounded-full px-4 py-2 text-sm"
+            className="max-w-full rounded-2xl px-3 py-2 text-xs sm:rounded-full sm:px-4 sm:text-sm"
             style={{
               background: "color-mix(in srgb, var(--app-header-text) 10%, transparent)",
               color: "var(--app-header-text)",
             }}
           >
-            <Settings2 className="mr-2 inline h-4 w-4" />
+            <Settings2 className="mr-2 inline h-4 w-4 shrink-0" />
             {activeSection === "overview"
               ? "Railway single-service deployment"
               : navigation.find((item) => item.id === activeSection)?.label}

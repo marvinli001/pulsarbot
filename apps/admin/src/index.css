@@ -51,7 +51,10 @@
 html,
 body,
 #root {
+  width: 100%;
+  max-width: 100%;
   min-height: var(--app-viewport-stable-height);
+  overflow-x: hidden;
 }
 
 body {
