@@ -681,17 +681,14 @@ describe("provider media request preview", () => {
       },
     });
 
-    const audioBody = audioPreview?.body as Record<string, any>;
+    const audioBody = audioPreview?.body as FormData;
     const imageBody = imagePreview?.body as Record<string, any>;
     const documentBody = documentPreview?.body as Record<string, any>;
 
-    expect(audioPreview?.url).toContain("/compatible-mode/v1/chat/completions");
-    expect(audioBody.messages[0].content[1]).toMatchObject({
-      type: "input_audio",
-    });
-    expect(audioBody.messages[0].content[1].input_audio).toMatchObject({
-      format: "mp3",
-    });
+    expect(audioPreview?.url).toContain("/compatible-mode/v1/audio/transcriptions");
+    expect(audioBody.get("model")).toBe("qwen3-asr-flash");
+    expect(audioBody.get("response_format")).toBe("json");
+    expect(audioBody.get("prompt")).toBe("Transcribe this.");
 
     expect(imagePreview?.url).toContain("/multimodal-generation/generation");
     expect(imageBody.input.messages[0].content[0].image).toContain("data:image/png;base64,");

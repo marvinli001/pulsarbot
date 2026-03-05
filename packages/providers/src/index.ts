@@ -1537,34 +1537,21 @@ function buildBailianMediaRequest(
         },
       };
     case "audio":
+      // qwen3-asr-flash is served by ASR task; use transcription endpoint.
+      const form = new FormData();
+      form.set("file", toBlob(input.rawBody, input.mimeType), input.fileName ?? "audio");
+      form.set("model", resolveTaskModel(profile, "audio"));
+      form.set("response_format", "json");
+      if (input.prompt) {
+        form.set("prompt", input.prompt);
+      }
+      appendLooseRecordToFormData(form, profile.extraBody);
       return {
-        url: `${compatibleBaseUrl}/chat/completions`,
-        headers: mergeJsonHeaders(profile, {
+        url: `${compatibleBaseUrl}/audio/transcriptions`,
+        headers: mergeFormHeaders(profile, {
           Authorization: `Bearer ${apiKey}`,
         }),
-        body: {
-          model: resolveTaskModel(profile, "audio"),
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: input.prompt,
-                },
-                {
-                  type: "input_audio",
-                  input_audio: {
-                    data: dataUrlForBytes(input.rawBody, input.mimeType),
-                    format: inferAudioFormat(input.mimeType, input.fileName),
-                  },
-                },
-              ],
-            },
-          ],
-          stream: false,
-          ...profile.extraBody,
-        },
+        body: form,
       };
     case "document":
       if (!providerSupportsDocumentInput({

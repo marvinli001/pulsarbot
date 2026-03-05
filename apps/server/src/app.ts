@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { deflateSync } from "node:zlib";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import jwt from "@fastify/jwt";
@@ -1346,12 +1347,62 @@ const providerTestCapabilities = [
 ] as const satisfies ProviderTestCapability[];
 
 function createProviderTestImageBytes(): Uint8Array {
-  return Uint8Array.from(
-    Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+nK9sAAAAASUVORK5CYII=",
-      "base64",
-    ),
-  );
+  const width = 16;
+  const height = 16;
+  const rowLength = 1 + width * 4;
+  const raw = Buffer.alloc(rowLength * height);
+
+  for (let y = 0; y < height; y += 1) {
+    const rowOffset = y * rowLength;
+    raw[rowOffset] = 0; // PNG filter type: None
+    for (let x = 0; x < width; x += 1) {
+      const pixelOffset = rowOffset + 1 + x * 4;
+      raw[pixelOffset] = 24;
+      raw[pixelOffset + 1] = 93;
+      raw[pixelOffset + 2] = 214;
+      raw[pixelOffset + 3] = 255;
+    }
+  }
+
+  const crc32 = (input: Uint8Array): number => {
+    let crc = 0xffffffff;
+    for (const byte of input) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit += 1) {
+        const mask = -(crc & 1);
+        crc = (crc >>> 1) ^ (0xedb88320 & mask);
+      }
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+
+  const chunk = (type: string, data: Uint8Array): Buffer => {
+    const typeBytes = Buffer.from(type, "ascii");
+    const dataBytes = Buffer.from(data);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(dataBytes.length, 0);
+    const checksum = Buffer.alloc(4);
+    checksum.writeUInt32BE(crc32(Buffer.concat([typeBytes, dataBytes])), 0);
+    return Buffer.concat([length, typeBytes, dataBytes, checksum]);
+  };
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // color type RGBA
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+
+  const png = Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", new Uint8Array()),
+  ]);
+
+  return Uint8Array.from(png);
 }
 
 function escapePdfText(value: string): string {
