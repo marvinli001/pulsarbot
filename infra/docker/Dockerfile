@@ -1,8 +1,11 @@
 FROM node:22-bookworm-slim AS base
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates curl \
-  && pip3 install --no-cache-dir uv \
+  && apt-get install -y --no-install-recommends python3 ca-certificates curl \
+  && curl -LsSf https://astral.sh/uv/install.sh -o /tmp/install-uv.sh \
+  && sh /tmp/install-uv.sh \
+  && rm /tmp/install-uv.sh \
+  && ln -s /root/.local/bin/uv /usr/local/bin/uv \
   && rm -rf /var/lib/apt/lists/*
 
 ENV PNPM_HOME="/pnpm"
