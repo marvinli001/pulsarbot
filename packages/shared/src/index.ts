@@ -239,7 +239,7 @@ export const McpServerConfigSchema = z.object({
   lastHealthStatus: z.enum(["unknown", "ok", "error"]).default("unknown"),
   lastHealthCheckedAt: z.string().nullable().default(null),
   enabled: z.boolean().default(false),
-  source: z.enum(["official", "custom"]).default("custom"),
+  source: z.enum(["official", "custom", "bailian_market"]).default("custom"),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
 });
@@ -648,7 +648,7 @@ export const ResolvedMcpServerSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
   transport: McpTransportSchema,
-  source: z.enum(["official", "custom"]),
+  source: z.enum(["official", "custom", "bailian_market"]),
   manifestId: z.string().nullable().default(null),
 });
 

@@ -154,7 +154,7 @@ export function McpServersPanel() {
                 <div>
                   <p className="font-medium">{String(server.label)}</p>
                   <p className="text-sm text-slate-500">
-                    {String(server.transport)} · {String(server.lastHealthStatus ?? "unknown")}
+                    {String(server.transport)} · {String(server.lastHealthStatus ?? "unknown")} · {String(server.source ?? "custom")}
                   </p>
                   <p className="mt-2 text-xs text-slate-500">
                     id={String(server.id ?? "")}
@@ -201,7 +201,7 @@ export function McpServersPanel() {
             <TextArea value={form.envRefsJson} onChange={(event) => setForm((current) => ({ ...current, envRefsJson: event.target.value }))} />
             <TextArea value={form.headersJson} onChange={(event) => setForm((current) => ({ ...current, headersJson: event.target.value }))} />
             <Input value={form.restartPolicy} onChange={(event) => setForm((current) => ({ ...current, restartPolicy: event.target.value }))} placeholder="never | on-failure | always" />
-            <Input value={form.source} onChange={(event) => setForm((current) => ({ ...current, source: event.target.value }))} placeholder="official | custom" />
+            <Input value={form.source} onChange={(event) => setForm((current) => ({ ...current, source: event.target.value }))} placeholder="official | custom | bailian_market" />
             <CheckboxField label="Enabled" checked={form.enabled} onChange={(next) => setForm((current) => ({ ...current, enabled: next }))} />
             <div className="flex flex-wrap gap-3">
               <Button type="button" onClick={() => saveMutation.mutate()}>

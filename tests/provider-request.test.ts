@@ -58,6 +58,20 @@ describe("provider request preview", () => {
     expect(preview.body.model).toBe("test-model");
   });
 
+  it("normalizes OpenAI GPT-5 model aliases", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("openai", {
+        defaultModel: "gpt5.2",
+      }),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Hello" }],
+      },
+    });
+
+    expect(preview.body.model).toBe("gpt-5.2");
+  });
+
   it("builds an Anthropic payload with thinking enabled", () => {
     const preview = createProviderRequestPreview({
       profile: profile("anthropic"),
@@ -72,7 +86,7 @@ describe("provider request preview", () => {
     expect(preview.body.thinking).toBeTruthy();
   });
 
-  it("builds an OpenAI chat-completions payload for native tool calling", () => {
+  it("builds an OpenAI responses payload for native tool calling", () => {
     const preview = createProviderRequestPreview({
       profile: profile("openai"),
       apiKey: "sk-test",
@@ -93,24 +107,62 @@ describe("provider request preview", () => {
       },
     });
 
-    expect(preview.url).toContain("/chat/completions");
+    expect(preview.url).toContain("/responses");
     expect(preview.body.tools).toEqual([
       {
         type: "function",
-        function: {
-          name: "search_web",
-          description: "Search the web",
-          parameters: {
-            type: "object",
-            properties: { query: { type: "string" } },
-            required: ["query"],
-          },
+        name: "search_web",
+        description: "Search the web",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
         },
       },
     ]);
     expect(preview.body.tool_choice).toEqual({
       type: "function",
-      function: { name: "search_web" },
+      name: "search_web",
+    });
+  });
+
+  it("builds an OpenAI-compatible responses payload for native tool calling", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("openai_compatible_responses"),
+      apiKey: "compatible-responses-key",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: { type: "tool", toolId: "search_web" },
+      },
+    });
+
+    expect(preview.url).toContain("/responses");
+    expect(preview.body.tools).toEqual([
+      {
+        type: "function",
+        name: "search_web",
+        description: "Search the web",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
+    ]);
+    expect(preview.body.tool_choice).toEqual({
+      type: "function",
+      name: "search_web",
     });
   });
 
@@ -434,6 +486,70 @@ describe("provider response parsing", () => {
     ]);
   });
 
+  it("parses OpenAI-compatible chat tool calls", () => {
+    const adapter = getProviderAdapter("openai_compatible_chat");
+    const result = adapter.parseResponse({
+      id: "chatcmpl-1",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "Using compatible chat tool calling.",
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: {
+                  name: "search_web",
+                  arguments: "{\"query\":\"tokyo weather\"}",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(result.text).toContain("Using compatible chat tool calling.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "call_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
+  });
+
+  it("parses OpenAI-compatible responses tool calls", () => {
+    const adapter = getProviderAdapter("openai_compatible_responses");
+    const result = adapter.parseResponse({
+      id: "resp_1",
+      output: [
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_1",
+          name: "search_web",
+          arguments: "{\"query\":\"tokyo weather\"}",
+        },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Using tool now." }],
+        },
+      ],
+    });
+
+    expect(result.text).toContain("Using tool now.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "call_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
+  });
+
   it("parses Anthropic tool_use blocks", () => {
     const adapter = getProviderAdapter("anthropic");
     const result = adapter.parseResponse({
@@ -681,14 +797,25 @@ describe("provider media request preview", () => {
       },
     });
 
-    const audioBody = audioPreview?.body as FormData;
+    const audioBody = audioPreview?.body as Record<string, any>;
     const imageBody = imagePreview?.body as Record<string, any>;
     const documentBody = documentPreview?.body as Record<string, any>;
 
-    expect(audioPreview?.url).toContain("/compatible-mode/v1/audio/transcriptions");
-    expect(audioBody.get("model")).toBe("qwen3-asr-flash");
-    expect(audioBody.get("response_format")).toBe("json");
-    expect(audioBody.get("prompt")).toBe("Transcribe this.");
+    expect(audioPreview?.url).toContain("/compatible-mode/v1/chat/completions");
+    expect(audioBody.model).toBe("qwen3-asr-flash");
+    expect(audioBody.messages[0].content[0]).toMatchObject({
+      type: "text",
+      text: "Transcribe this.",
+    });
+    expect(audioBody.messages[0].content[1]).toMatchObject({
+      type: "input_audio",
+      input_audio: {
+        format: "mp3",
+      },
+    });
+    expect(audioBody.messages[0].content[1].input_audio.data).toContain(
+      "data:audio/mpeg;base64,",
+    );
 
     expect(imagePreview?.url).toContain("/multimodal-generation/generation");
     expect(imageBody.input.messages[0].content[0].image).toContain("data:image/png;base64,");

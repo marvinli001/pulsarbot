@@ -219,8 +219,8 @@ export const providerKindTemplates: Record<
   openai: {
     label: "OpenAI Provider",
     apiBaseUrl: "https://api.openai.com/v1",
-    defaultModel: "gpt-4.1-mini",
-    visionModel: "gpt-4.1-mini",
+    defaultModel: "gpt-5",
+    visionModel: "gpt-5",
     audioModel: "gpt-4o-mini-transcribe",
     documentModel: "",
     visionEnabled: true,

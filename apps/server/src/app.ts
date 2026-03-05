@@ -146,6 +146,132 @@ function toLooseJsonRecord(
   return JSON.parse(JSON.stringify(value)) as Record<string, LooseJsonValue>;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function firstStringField(
+  record: Record<string, unknown>,
+  keys: string[],
+): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function toBooleanLike(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (value === 1) {
+      return true;
+    }
+    if (value === 0) {
+      return false;
+    }
+    return null;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "enabled", "active", "activated", "yes"].includes(normalized)) {
+      return true;
+    }
+    if (["0", "false", "disabled", "inactive", "deactivated", "no"].includes(normalized)) {
+      return false;
+    }
+  }
+  return null;
+}
+
+function collectBailianMcpRecords(
+  value: unknown,
+  output: Record<string, unknown>[],
+  seen = new Set<unknown>(),
+) {
+  if (seen.has(value)) {
+    return;
+  }
+  if (value && typeof value === "object") {
+    seen.add(value);
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectBailianMcpRecords(item, output, seen);
+    }
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) {
+    return;
+  }
+
+  const hasServerIdentity = Boolean(
+    firstStringField(record, [
+      "serverCode",
+      "server_code",
+      "serverId",
+      "server_id",
+    ]),
+  );
+  const hasStreamableUrl = Boolean(
+    firstStringField(record, [
+      "url",
+      "sseUrl",
+      "sse_url",
+      "streamableHttpUrl",
+      "streamable_http_url",
+      "endpoint",
+    ]),
+  );
+  const hasDisplayName = Boolean(firstStringField(record, ["serverName", "name", "title"]));
+  const hasCodeWithName = typeof record.code === "string" &&
+    Boolean(record.code.trim()) &&
+    hasDisplayName;
+  const hasCandidateShape = hasServerIdentity || hasStreamableUrl || hasCodeWithName;
+  if (hasCandidateShape) {
+    output.push(record);
+  }
+
+  for (const nested of Object.values(record)) {
+    if (nested && typeof nested === "object") {
+      collectBailianMcpRecords(nested, output, seen);
+    }
+  }
+}
+
+function bailianServerCodeFromUrl(url: string): string | null {
+  const match = /\/api\/v1\/mcps\/([^/?#]+)\/sse/i.exec(url);
+  if (!match?.[1]) {
+    return null;
+  }
+  return decodeURIComponent(match[1]);
+}
+
+function bailianServerId(serverCode: string): string {
+  const normalized = safePathSegment(serverCode).toLowerCase();
+  return `mcp_bailian_${normalized}`;
+}
+
+function resolveBailianOrigin(apiBaseUrl: string): string {
+  const fallback = "https://dashscope.aliyuncs.com";
+  if (!apiBaseUrl) {
+    return fallback;
+  }
+  try {
+    return new URL(apiBaseUrl).origin;
+  } catch {
+    return fallback;
+  }
+}
+
 function isoAfter(ms: number): string {
   return new Date(Date.now() + ms).toISOString();
 }
@@ -388,6 +514,9 @@ class RuntimeState {
   public readonly agent: AgentRuntime;
 
   private pendingCloudflare: CloudflareCredentials | null = null;
+  private bailianMcpSyncPromise: Promise<void> | null = null;
+  private bailianMcpLastSyncAtMs = 0;
+  private readonly bailianMcpSyncIntervalMs = 120_000;
 
   public constructor(
     public readonly env = loadEnv(),
@@ -471,7 +600,258 @@ class RuntimeState {
     });
   }
 
+  private async fetchBailianMcpMarketServers(args: {
+    profile: ProviderProfile;
+    apiKey: string;
+  }): Promise<McpServerConfig[]> {
+    const fallbackBaseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+    const origin = resolveBailianOrigin(args.profile.apiBaseUrl || fallbackBaseUrl);
+    const endpointCandidates = [
+      `${origin}/api/v1/mcps?activated=true`,
+      `${origin}/api/v1/mcps`,
+    ];
+
+    for (const endpoint of endpointCandidates) {
+      let response: Response;
+      try {
+        response = await fetch(endpoint, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${args.apiKey}`,
+            Accept: "application/json",
+          },
+          signal: AbortSignal.timeout(10_000),
+        });
+      } catch (error) {
+        logger.warn(
+          {
+            endpoint,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to fetch Bailian MCP market endpoint",
+        );
+        continue;
+      }
+
+      if (!response.ok) {
+        continue;
+      }
+
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = await response.text();
+      }
+
+      const candidateRecords: Record<string, unknown>[] = [];
+      collectBailianMcpRecords(payload, candidateRecords);
+      const entries = new Map<
+        string,
+        {
+          serverCode: string;
+          label: string;
+          description: string;
+          url: string;
+          activated: boolean | null;
+        }
+      >();
+      let activationSignals = 0;
+
+      for (const record of candidateRecords) {
+        const explicitUrl = firstStringField(record, [
+          "url",
+          "sseUrl",
+          "sse_url",
+          "streamableHttpUrl",
+          "streamable_http_url",
+          "endpoint",
+        ]);
+        const serverCode =
+          firstStringField(record, [
+            "serverCode",
+            "server_code",
+            "serverId",
+            "server_id",
+          ]) ??
+          (typeof record.code === "string" && firstStringField(record, ["serverName", "name", "title"])
+            ? record.code.trim()
+            : null) ??
+          (explicitUrl ? bailianServerCodeFromUrl(explicitUrl) : null);
+        if (!serverCode) {
+          continue;
+        }
+
+        const activated = toBooleanLike(
+          record.activated ??
+            record.isActivated ??
+            record.active ??
+            record.enabled ??
+            record.isEnabled,
+        );
+        if (activated !== null) {
+          activationSignals += 1;
+        }
+
+        const label = firstStringField(record, [
+          "serverName",
+          "server_name",
+          "name",
+          "title",
+        ]) ?? serverCode;
+        const description = firstStringField(record, [
+          "description",
+          "desc",
+          "summary",
+        ]) ?? "Synced from Alibaba Bailian MCP Market.";
+        const resolvedUrl = explicitUrl?.startsWith("/")
+          ? new URL(explicitUrl, origin).toString()
+          : explicitUrl ?? `${origin}/api/v1/mcps/${encodeURIComponent(serverCode)}/sse`;
+
+        entries.set(serverCode, {
+          serverCode,
+          label,
+          description,
+          url: resolvedUrl,
+          activated,
+        });
+      }
+
+      let parsedEntries = [...entries.values()];
+      if (activationSignals > 0) {
+        parsedEntries = parsedEntries.filter((entry) => entry.activated === true);
+      }
+      if (parsedEntries.length === 0) {
+        continue;
+      }
+
+      const timestamp = nowIso();
+      return parsedEntries.map((entry) =>
+        McpServerConfigSchema.parse({
+          id: bailianServerId(entry.serverCode),
+          label: entry.label,
+          description: `${entry.description}\n\nSynced from Alibaba Bailian MCP Market.`,
+          manifestId: null,
+          transport: "streamable_http",
+          url: entry.url,
+          envRefs: {},
+          headers: {
+            Authorization: args.profile.apiKeyRef,
+          },
+          restartPolicy: "on-failure",
+          toolCache: {},
+          lastHealthStatus: "unknown",
+          lastHealthCheckedAt: null,
+          enabled: true,
+          source: "bailian_market",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        })
+      );
+    }
+
+    return [];
+  }
+
+  private async syncBailianMcpServersFromProvider(): Promise<void> {
+    const providerProfiles = await this.repository.listProviderProfiles();
+    const bailianProvider = providerProfiles.find((provider) =>
+      provider.kind === "bailian" && provider.enabled
+    );
+    if (!bailianProvider) {
+      return;
+    }
+
+    let apiKey: string;
+    try {
+      apiKey = await this.resolveApiKey(bailianProvider.apiKeyRef);
+    } catch {
+      return;
+    }
+
+    const syncedServers = await this.fetchBailianMcpMarketServers({
+      profile: bailianProvider,
+      apiKey,
+    });
+    if (syncedServers.length === 0) {
+      return;
+    }
+
+    const existingServers = await this.repository.listMcpServers();
+    const existingById = new Map(existingServers.map((server) => [server.id, server]));
+    const syncedIds = new Set<string>();
+    const timestamp = nowIso();
+
+    for (const server of syncedServers) {
+      syncedIds.add(server.id);
+      const existing = existingById.get(server.id);
+      await this.repository.saveMcpServer(
+        McpServerConfigSchema.parse({
+          ...server,
+          enabled: existing?.enabled ?? server.enabled,
+          restartPolicy: existing?.restartPolicy ?? server.restartPolicy,
+          toolCache: existing?.toolCache ?? server.toolCache,
+          lastHealthStatus: existing?.lastHealthStatus ?? server.lastHealthStatus,
+          lastHealthCheckedAt:
+            existing?.lastHealthCheckedAt ?? server.lastHealthCheckedAt,
+          createdAt: existing?.createdAt ?? server.createdAt,
+          updatedAt: timestamp,
+        }),
+      );
+    }
+
+    for (const existing of existingServers) {
+      if (existing.source !== "bailian_market" || syncedIds.has(existing.id)) {
+        continue;
+      }
+      if (!existing.enabled) {
+        continue;
+      }
+      await this.repository.saveMcpServer({
+        ...existing,
+        enabled: false,
+        updatedAt: timestamp,
+      });
+    }
+  }
+
+  public async ensureBailianMcpServersSynced(
+    options: { force?: boolean } = {},
+  ): Promise<void> {
+    if (this.env.NODE_ENV === "test") {
+      return;
+    }
+
+    const now = Date.now();
+    if (
+      !options.force &&
+      now - this.bailianMcpLastSyncAtMs < this.bailianMcpSyncIntervalMs
+    ) {
+      return;
+    }
+    if (this.bailianMcpSyncPromise) {
+      return this.bailianMcpSyncPromise;
+    }
+
+    this.bailianMcpSyncPromise = this.syncBailianMcpServersFromProvider()
+      .catch((error) => {
+        logger.warn(
+          {
+            reason: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to sync Bailian MCP servers",
+        );
+      })
+      .finally(() => {
+        this.bailianMcpLastSyncAtMs = Date.now();
+        this.bailianMcpSyncPromise = null;
+      });
+
+    return this.bailianMcpSyncPromise;
+  }
+
   public async listEnabledMcpServers(ids: string[]) {
+    await this.ensureBailianMcpServersSynced();
     const servers = await this.repository.listMcpServers();
     return Promise.all(
       servers
@@ -613,6 +993,7 @@ class RuntimeState {
   public async resolveRuntime(profile: AgentProfile): Promise<ResolvedRuntimeSnapshot> {
     const workspace = await this.repository.getWorkspace();
     requireWorkspace(workspace);
+    await this.ensureBailianMcpServersSynced();
     return ResolvedRuntimeSnapshotSchema.parse(
       resolveRuntimeSnapshot({
         workspaceId: workspace.id,
@@ -3933,7 +4314,7 @@ export async function createApp(
       label: body.label ?? "Provider",
       apiBaseUrl: body.apiBaseUrl ?? existing?.apiBaseUrl ?? "",
       apiKeyRef: body.apiKeyRef ?? existing?.apiKeyRef ?? `provider:${id}:apiKey`,
-      defaultModel: body.defaultModel ?? existing?.defaultModel ?? "gpt-4.1-mini",
+      defaultModel: body.defaultModel ?? existing?.defaultModel ?? "gpt-5",
       visionModel: body.visionModel ?? existing?.visionModel ?? null,
       audioModel: body.audioModel ?? existing?.audioModel ?? null,
       documentModel: body.documentModel ?? existing?.documentModel ?? null,
@@ -4388,9 +4769,10 @@ export async function createApp(
     return next;
   });
 
-  app.get("/api/mcp/servers", { preHandler: requireOwner }, async () =>
-    state.repository.listMcpServers(),
-  );
+  app.get("/api/mcp/servers", { preHandler: requireOwner }, async () => {
+    await state.ensureBailianMcpServersSynced({ force: true });
+    return state.repository.listMcpServers();
+  });
 
   async function saveMcpServerHandler(request: FastifyRequest) {
     const body = request.body as Partial<ReturnType<typeof McpServerConfigSchema.parse>>;

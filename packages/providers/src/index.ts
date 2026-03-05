@@ -934,29 +934,78 @@ function dashscopeCompatibleBaseUrl(profile: ProviderProfile): string {
   return `${dashscopeOrigin(profile)}/compatible-mode/v1`;
 }
 
+function normalizeOpenAiModelId(model: string): string {
+  const value = model.trim();
+  if (!value) {
+    return model;
+  }
+
+  const normalized = value.toLowerCase();
+  const aliases: Record<string, string> = {
+    gpt5: "gpt-5",
+    "gpt-5": "gpt-5",
+    "gpt5.2": "gpt-5.2",
+    "gpt-5.2": "gpt-5.2",
+    "gpt.5.2": "gpt-5.2",
+    "gpt5.4": "gpt-5.4",
+    "gpt-5.4": "gpt-5.4",
+    "gpt.5.4": "gpt-5.4",
+  };
+  if (aliases[normalized]) {
+    return aliases[normalized];
+  }
+
+  return model;
+}
+
+function normalizeModelForProvider(
+  profile: ProviderProfile,
+  model: string,
+): string {
+  switch (profile.kind) {
+    case "openai":
+    case "openai_compatible_chat":
+    case "openai_compatible_responses":
+      return normalizeOpenAiModelId(model);
+    case "anthropic":
+    case "gemini":
+    case "openrouter":
+    case "bailian":
+      return model;
+    default:
+      return assertNever(profile.kind);
+  }
+}
+
 function resolveTaskModel(
   profile: ProviderProfile,
   task: "chat" | ProviderMediaCapability,
 ): string {
   if (task === "chat") {
-    return profile.defaultModel;
+    return normalizeModelForProvider(profile, profile.defaultModel);
   }
 
   switch (task) {
     case "vision":
-      return profile.visionModel ?? profile.defaultModel;
+      return normalizeModelForProvider(profile, profile.visionModel ?? profile.defaultModel);
     case "audio":
-      return profile.audioModel ??
+      return normalizeModelForProvider(
+        profile,
+        profile.audioModel ??
         (profile.kind === "openai" ||
             profile.kind === "openai_compatible_chat" ||
             profile.kind === "openai_compatible_responses"
           ? "gpt-4o-mini-transcribe"
           : profile.kind === "bailian"
           ? "qwen3-asr-flash"
-          : profile.defaultModel);
+          : profile.defaultModel),
+      );
     case "document":
-      return profile.documentModel ??
-        (profile.kind === "bailian" ? "qwen-doc-turbo" : profile.defaultModel);
+      return normalizeModelForProvider(
+        profile,
+        profile.documentModel ??
+          (profile.kind === "bailian" ? "qwen-doc-turbo" : profile.defaultModel),
+      );
     default:
       return assertNever(task);
   }
@@ -1080,7 +1129,7 @@ function streamDeltaForProvider(
   switch (kind) {
     case "openai":
     case "openai_compatible_responses":
-      return extractOpenAiResponsesDelta(payload);
+      return extractOpenAiResponsesDelta(payload) || extractOpenAiChatDelta(payload);
     case "openrouter":
       return extractOpenAiChatDelta(payload) || extractOpenAiResponsesDelta(payload);
     case "openai_compatible_chat":
@@ -1537,21 +1586,35 @@ function buildBailianMediaRequest(
         },
       };
     case "audio":
-      // qwen3-asr-flash is served by ASR task; use transcription endpoint.
-      const form = new FormData();
-      form.set("file", toBlob(input.rawBody, input.mimeType), input.fileName ?? "audio");
-      form.set("model", resolveTaskModel(profile, "audio"));
-      form.set("response_format", "json");
-      if (input.prompt) {
-        form.set("prompt", input.prompt);
-      }
-      appendLooseRecordToFormData(form, profile.extraBody);
       return {
-        url: `${compatibleBaseUrl}/audio/transcriptions`,
-        headers: mergeFormHeaders(profile, {
+        url: `${compatibleBaseUrl}/chat/completions`,
+        headers: mergeJsonHeaders(profile, {
           Authorization: `Bearer ${apiKey}`,
         }),
-        body: form,
+        body: {
+          model: resolveTaskModel(profile, "audio"),
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: input.prompt,
+                },
+                {
+                  type: "input_audio",
+                  input_audio: {
+                    data: dataUrlForBytes(input.rawBody, input.mimeType),
+                    format: inferAudioFormat(input.mimeType, input.fileName),
+                  },
+                },
+              ],
+            },
+          ],
+          max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+          stream: false,
+          ...profile.extraBody,
+        },
       };
     case "document":
       if (!providerSupportsDocumentInput({
@@ -1650,36 +1713,27 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
   openai: {
     kind: "openai",
     buildRequest(profile, apiKey, input) {
-      if (input.tools?.length && profile.toolCallingEnabled) {
-        return {
-          url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/chat/completions`,
-          headers: mergeJsonHeaders(profile, {
-            Authorization: `Bearer ${apiKey}`,
-          }),
-          body: {
-            model: input.model ?? profile.defaultModel,
-            messages: input.messages.map(messageToOpenAiShape),
-            tools: openAiToolDefinitions(input),
-            tool_choice: normalizeOpenAiToolChoice(input.toolChoice),
-            reasoning_effort: buildChatReasoningEffort(profile),
-            max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
-            stream: false,
-            ...buildSamplingOptions(profile),
-            ...profile.extraBody,
-          },
-        };
-      }
+      const model = normalizeModelForProvider(
+        profile,
+        input.model ?? profile.defaultModel,
+      );
       return {
         url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/responses`,
         headers: mergeJsonHeaders(profile, {
           Authorization: `Bearer ${apiKey}`,
         }),
         body: {
-          model: input.model ?? profile.defaultModel,
-          input: input.messages.map((message) => ({
-            role: message.role,
-            content: [{ type: "input_text", text: message.content }],
-          })),
+          model,
+          instructions: responsesSystemInstructions(input.messages) || undefined,
+          input: responsesInputMessages(input.messages),
+          tools:
+            input.tools?.length && profile.toolCallingEnabled
+              ? responsesToolDefinitions(input)
+              : undefined,
+          tool_choice:
+            input.tools?.length && profile.toolCallingEnabled
+              ? normalizeOpenRouterResponsesToolChoice(input.toolChoice)
+              : undefined,
           max_output_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
           reasoning: buildReasoningEffort(profile),
           text: wantsJsonMode(profile, input)
@@ -1966,8 +2020,20 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
           Authorization: `Bearer ${apiKey}`,
         }),
         body: {
-          model: input.model ?? profile.defaultModel,
+          model: normalizeModelForProvider(
+            profile,
+            input.model ?? profile.defaultModel,
+          ),
           messages: input.messages.map(messageToOpenAiShape),
+          tools:
+            input.tools?.length && profile.toolCallingEnabled
+              ? openAiToolDefinitions(input)
+              : undefined,
+          tool_choice:
+            input.tools?.length && profile.toolCallingEnabled
+              ? normalizeOpenAiToolChoice(input.toolChoice)
+              : undefined,
+          reasoning_effort: buildChatReasoningEffort(profile),
           max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
           response_format: wantsJsonMode(profile, input)
             ? { type: "json_object" }
@@ -1979,6 +2045,16 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        if (Array.isArray(record.choices)) {
+          return {
+            text: parseOpenAiChatText(record) || parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseOpenAiChatToolCalls(record),
+          };
+        }
+      }
       return buildMediaResponse(payload);
     },
   },
@@ -1991,11 +2067,20 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
           Authorization: `Bearer ${apiKey}`,
         }),
         body: {
-          model: input.model ?? profile.defaultModel,
-          input: input.messages.map((message) => ({
-            role: message.role,
-            content: [{ type: "input_text", text: message.content }],
-          })),
+          model: normalizeModelForProvider(
+            profile,
+            input.model ?? profile.defaultModel,
+          ),
+          instructions: responsesSystemInstructions(input.messages) || undefined,
+          input: responsesInputMessages(input.messages),
+          tools:
+            input.tools?.length && profile.toolCallingEnabled
+              ? responsesToolDefinitions(input)
+              : undefined,
+          tool_choice:
+            input.tools?.length && profile.toolCallingEnabled
+              ? normalizeOpenRouterResponsesToolChoice(input.toolChoice)
+              : undefined,
           max_output_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
           text: wantsJsonMode(profile, input)
             ? { format: { type: "json_object" } }
@@ -2006,6 +2091,23 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        if (Array.isArray(record.output)) {
+          return {
+            text: parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseResponsesToolCalls(record),
+          };
+        }
+        if (Array.isArray(record.choices)) {
+          return {
+            text: parseOpenAiChatText(record) || parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseOpenAiChatToolCalls(record),
+          };
+        }
+      }
       return buildMediaResponse(payload);
     },
   },
