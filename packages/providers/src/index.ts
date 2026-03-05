@@ -98,7 +98,7 @@ function defaultBaseUrl(kind: ProviderKind): string {
     case "openrouter":
       return "https://openrouter.ai/api/v1";
     case "bailian":
-      return "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation";
+      return "https://dashscope.aliyuncs.com/compatible-mode/v1";
     case "openai_compatible_chat":
     case "openai_compatible_responses":
       return "https://api.openai.com/v1";
@@ -927,6 +927,10 @@ function dashscopeOrigin(profile: ProviderProfile): string {
 }
 
 function dashscopeCompatibleBaseUrl(profile: ProviderProfile): string {
+  const configured = (profile.apiBaseUrl || defaultBaseUrl("bailian")).replace(/\/+$/, "");
+  if (configured.endsWith("/compatible-mode/v1")) {
+    return configured;
+  }
   return `${dashscopeOrigin(profile)}/compatible-mode/v1`;
 }
 
@@ -1082,8 +1086,9 @@ function streamDeltaForProvider(
       return extractOpenAiChatDelta(payload);
     case "anthropic":
       return extractAnthropicDelta(payload);
-    case "gemini":
     case "bailian":
+      return extractOpenAiChatDelta(payload);
+    case "gemini":
       return "";
     default:
       return assertNever(kind);
@@ -1108,6 +1113,7 @@ function withStreamingEnabled(args: {
       };
     case "openrouter":
     case "openai_compatible_chat":
+    case "bailian":
       return {
         ...args.preview,
         body: {
@@ -1124,7 +1130,6 @@ function withStreamingEnabled(args: {
         },
       };
     case "gemini":
-    case "bailian":
       return args.preview;
     default:
       return assertNever(args.profile.kind);
@@ -1910,28 +1915,34 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
     kind: "bailian",
     buildRequest(profile, apiKey, input) {
       const compatibleBaseUrl = dashscopeCompatibleBaseUrl(profile);
+      const jsonMode = wantsJsonMode(profile, input);
+      const enableThinking =
+        profile.reasoningEnabled &&
+        profile.reasoningLevel !== "off" &&
+        !jsonMode;
       return {
-        url: `${compatibleBaseUrl}/responses`,
+        url: `${compatibleBaseUrl}/chat/completions`,
         headers: mergeJsonHeaders(profile, {
           Authorization: `Bearer ${apiKey}`,
         }),
         body: {
           model: input.model ?? profile.defaultModel,
-          instructions: responsesSystemInstructions(input.messages) || undefined,
-          input: responsesInputMessages(input.messages),
+          messages: input.messages.map(messageToOpenAiShape),
           tools:
             input.tools?.length && profile.toolCallingEnabled
-              ? responsesToolDefinitions(input)
+              ? openAiToolDefinitions(input)
               : undefined,
           tool_choice:
             input.tools?.length && profile.toolCallingEnabled
-              ? normalizeBailianResponsesToolChoice(input.toolChoice)
+              ? normalizeOpenAiToolChoice(input.toolChoice)
               : undefined,
-          enable_thinking: profile.reasoningEnabled && profile.reasoningLevel !== "off",
-          max_output_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
-          text: wantsJsonMode(profile, input)
-            ? { format: { type: "json_object" } }
+          enable_thinking: enableThinking,
+          thinking_budget: enableThinking ? profile.thinkingBudget ?? undefined : undefined,
+          max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+          response_format: jsonMode
+            ? { type: "json_object" }
             : undefined,
+          stream: false,
           ...buildSamplingOptions(profile),
           ...profile.extraBody,
         },
@@ -1940,6 +1951,13 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
     parseResponse(payload) {
       if (payload && typeof payload === "object") {
         const record = payload as Record<string, unknown>;
+        if (Array.isArray(record.choices)) {
+          return {
+            text: parseOpenAiChatText(record) || parseProviderTextPayload(record),
+            raw: payload,
+            toolCalls: parseOpenAiChatToolCalls(record),
+          };
+        }
         if (Array.isArray(record.output)) {
           return {
             text: parseProviderTextPayload(record),
@@ -2027,11 +2045,11 @@ export function supportsProviderTextStreaming(profile: ProviderProfile): boolean
     case "openai":
     case "anthropic":
     case "openrouter":
+    case "bailian":
     case "openai_compatible_chat":
     case "openai_compatible_responses":
       return true;
     case "gemini":
-    case "bailian":
       return false;
     default:
       return assertNever(profile.kind);

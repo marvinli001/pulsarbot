@@ -30,8 +30,18 @@ import {
   parseJsonRecord,
   providerKindOptions,
   providerKindTemplates,
+  reasoningLevelOptions,
+  thinkingBudgetOptionsForProvider,
   useProviders,
 } from "../shared.js";
+
+function normalizeReasoningLevel(value: unknown): "off" | "low" | "medium" | "high" {
+  const normalized = String(value ?? "off").toLowerCase();
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+  return "off";
+}
 
 export function ProvidersPanel() {
   const providers = useProviders();
@@ -58,7 +68,7 @@ export function ProvidersPanel() {
     stream: defaultTemplate.stream,
     reasoningEnabled: false,
     reasoningLevel: "off",
-    thinkingBudget: "",
+    thinkingBudget: "auto",
     temperature: "0.2",
     topP: "",
     maxOutputTokens: "2048",
@@ -116,7 +126,9 @@ export function ProvidersPanel() {
           stream: form.stream,
           reasoningEnabled: form.reasoningEnabled,
           reasoningLevel: form.reasoningLevel,
-          thinkingBudget: form.thinkingBudget ? Number(form.thinkingBudget) : null,
+          thinkingBudget: form.thinkingBudget === "auto"
+            ? null
+            : Number(form.thinkingBudget),
           temperature: Number(form.temperature || "0.2"),
           topP: form.topP ? Number(form.topP) : null,
           maxOutputTokens: Number(form.maxOutputTokens || "2048"),
@@ -210,10 +222,10 @@ export function ProvidersPanel() {
       apiKey: "",
       stream: Boolean(provider.stream),
       reasoningEnabled: Boolean(provider.reasoningEnabled),
-      reasoningLevel: String(provider.reasoningLevel ?? "off"),
+      reasoningLevel: normalizeReasoningLevel(provider.reasoningLevel),
       thinkingBudget:
         provider.thinkingBudget === null || provider.thinkingBudget === undefined
-          ? ""
+          ? "auto"
           : String(provider.thinkingBudget),
       temperature: String(provider.temperature ?? "0.2"),
       topP: provider.topP === null || provider.topP === undefined ? "" : String(provider.topP),
@@ -238,6 +250,9 @@ export function ProvidersPanel() {
     isProgressVisible: saveMutation.isPending,
     onClick: () => saveMutation.mutate(),
   });
+
+  const showPerModalityModelOverrides = form.kind !== "bailian";
+  const thinkingBudgetOptions = thinkingBudgetOptionsForProvider(form.kind);
 
   return (
     <div className="grid gap-6 xl:grid-cols-[1.1fr,0.9fr]">
@@ -365,11 +380,24 @@ export function ProvidersPanel() {
             />
             <Input value={form.apiBaseUrl} onChange={(event) => setForm((current) => ({ ...current, apiBaseUrl: event.target.value }))} />
             <Input value={form.defaultModel} onChange={(event) => setForm((current) => ({ ...current, defaultModel: event.target.value }))} />
-            <div className="grid gap-3 md:grid-cols-3">
-              <Input value={form.visionModel} onChange={(event) => setForm((current) => ({ ...current, visionModel: event.target.value }))} placeholder="vision model override" />
-              <Input value={form.audioModel} onChange={(event) => setForm((current) => ({ ...current, audioModel: event.target.value }))} placeholder="audio / transcription model override" />
-              <Input value={form.documentModel} onChange={(event) => setForm((current) => ({ ...current, documentModel: event.target.value }))} placeholder="document model override" />
-            </div>
+            {showPerModalityModelOverrides ? (
+              <div className="grid gap-3 md:grid-cols-3">
+                <Input value={form.visionModel} onChange={(event) => setForm((current) => ({ ...current, visionModel: event.target.value }))} placeholder="vision model override" />
+                <Input value={form.audioModel} onChange={(event) => setForm((current) => ({ ...current, audioModel: event.target.value }))} placeholder="audio / transcription model override" />
+                <Input value={form.documentModel} onChange={(event) => setForm((current) => ({ ...current, documentModel: event.target.value }))} placeholder="document model override" />
+              </div>
+            ) : (
+              <div
+                className="rounded-2xl border px-4 py-3 text-sm"
+                style={{
+                  borderColor: "var(--app-border)",
+                  background: "var(--app-surface-soft)",
+                  color: "var(--app-muted-text)",
+                }}
+              >
+                Bailian 默认按 `Default Model` 走多模态能力；视觉/音频/文档模型留空即可。
+              </div>
+            )}
             <Input
               type="password"
               placeholder={editingId ? "Leave blank to keep existing API key" : "API key"}
@@ -383,8 +411,20 @@ export function ProvidersPanel() {
               onChange={(event) => setAccessTokenConfirmation(event.target.value)}
             />
             <div className="grid gap-3 md:grid-cols-2">
-              <Input value={form.reasoningLevel} onChange={(event) => setForm((current) => ({ ...current, reasoningLevel: event.target.value }))} placeholder="off | low | medium | high" />
-              <Input value={form.thinkingBudget} onChange={(event) => setForm((current) => ({ ...current, thinkingBudget: event.target.value }))} placeholder="thinking budget" />
+              <SelectField
+                value={form.reasoningLevel}
+                onChange={(next) =>
+                  setForm((current) => ({ ...current, reasoningLevel: next }))
+                }
+                options={reasoningLevelOptions}
+              />
+              <SelectField
+                value={form.thinkingBudget}
+                onChange={(next) =>
+                  setForm((current) => ({ ...current, thinkingBudget: next }))
+                }
+                options={thinkingBudgetOptions}
+              />
               <Input value={form.temperature} onChange={(event) => setForm((current) => ({ ...current, temperature: event.target.value }))} placeholder="temperature" />
               <Input value={form.topP} onChange={(event) => setForm((current) => ({ ...current, topP: event.target.value }))} placeholder="topP" />
               <Input value={form.maxOutputTokens} onChange={(event) => setForm((current) => ({ ...current, maxOutputTokens: event.target.value }))} placeholder="max output tokens" />
@@ -427,7 +467,7 @@ export function ProvidersPanel() {
                     stream: defaultTemplate.stream,
                     reasoningEnabled: false,
                     reasoningLevel: "off",
-                    thinkingBudget: "",
+                    thinkingBudget: "auto",
                     temperature: "0.2",
                     topP: "",
                     maxOutputTokens: "2048",

@@ -340,7 +340,7 @@ export class CloudflareApiClient {
         method: "GET",
       });
     } catch (error) {
-      logger.warn({ error }, "AI Search listing is unavailable for this account");
+      logger.debug({ error }, "AI Search listing is unavailable for this account");
       return [];
     }
   }
@@ -364,7 +364,7 @@ export class CloudflareApiClient {
       });
       return result.results ?? result.data ?? [];
     } catch (error) {
-      logger.warn({ error, indexName: args.indexName }, "AI Search query failed");
+      logger.debug({ error, indexName: args.indexName }, "AI Search query failed");
       return [];
     }
   }
@@ -372,7 +372,12 @@ export class CloudflareApiClient {
   public async initializeWorkspaceResources(args: {
     workspaceId: string;
     selection?: CloudflareResourceSelection;
-  }): Promise<Required<CloudflareResourceSelection>> {
+  }): Promise<{
+    d1DatabaseId: string;
+    r2BucketName: string;
+    vectorizeIndexName: string;
+    aiSearchIndexName?: string;
+  }> {
     const selected = args.selection ?? {};
     const d1Database =
       selected.d1DatabaseId ??
@@ -391,8 +396,9 @@ export class CloudflareApiClient {
       d1DatabaseId: d1Database,
       r2BucketName: r2Bucket,
       vectorizeIndexName: vectorizeIndex,
-      aiSearchIndexName:
-        selected.aiSearchIndexName ?? `pulsarbot-${args.workspaceId}`,
+      ...(selected.aiSearchIndexName
+        ? { aiSearchIndexName: selected.aiSearchIndexName }
+        : {}),
     };
   }
 

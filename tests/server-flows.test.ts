@@ -421,6 +421,7 @@ async function bootstrapApp(
     providerInvoker?: typeof fakeProviderInvoker;
     providerMediaInvoker?: typeof fakeProviderMediaInvoker;
     backgroundPollMs?: number;
+    cloudflareClientFactory?: (credentials: CloudflareCredentials) => unknown;
   },
 ) {
   process.env.NODE_ENV = "test";
@@ -438,8 +439,9 @@ async function bootstrapApp(
       DATA_DIR: dataDir,
       PORT: 3001,
     },
-    cloudflareClientFactory: (credentials) =>
-      new FakeCloudflareClient(credentials) as never,
+    cloudflareClientFactory:
+      options?.cloudflareClientFactory ??
+      ((credentials) => new FakeCloudflareClient(credentials) as never),
     providerInvoker: options?.providerInvoker ?? fakeProviderInvoker,
     providerMediaInvoker: options?.providerMediaInvoker ?? fakeProviderMediaInvoker,
     backgroundPollMs: options?.backgroundPollMs,
@@ -680,6 +682,174 @@ describe("server flows", () => {
       aiSearch: [
         {
           name: "test-account-existing-ai-search",
+        },
+      ],
+    });
+  });
+
+  it("returns structured provider test failure when API key is missing", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const { app, cookie } = await bootstrapApp(dataDir);
+    const providersResponse = await app.inject({
+      method: "GET",
+      url: "/api/providers",
+      headers: {
+        cookie,
+      },
+    });
+    const providers = providersResponse.json<Array<Record<string, any>>>();
+    const primary = providers.find((provider) => provider.label === "Primary Provider");
+    expect(primary).toBeTruthy();
+
+    const providerTest = await app.inject({
+      method: "POST",
+      url: `/api/providers/${String(primary!.id)}/test`,
+      headers: {
+        cookie,
+      },
+      payload: {
+        capabilities: ["text"],
+      },
+    });
+
+    expect(providerTest.statusCode).toBe(200);
+    expect(providerTest.json()).toMatchObject({
+      ok: false,
+      providerId: String(primary!.id),
+      requestedCapabilities: ["text"],
+      results: [
+        {
+          capability: "text",
+          status: "failed",
+        },
+      ],
+    });
+  });
+
+  it("normalizes provider reasoning level casing on save", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const { app, cookie } = await bootstrapApp(dataDir);
+    const providersResponse = await app.inject({
+      method: "GET",
+      url: "/api/providers",
+      headers: {
+        cookie,
+      },
+    });
+    const providers = providersResponse.json<Array<Record<string, any>>>();
+    const primary = providers.find((provider) => provider.label === "Primary Provider");
+    expect(primary).toBeTruthy();
+
+    const updateResponse = await app.inject({
+      method: "PUT",
+      url: `/api/providers/${String(primary!.id)}`,
+      headers: {
+        cookie,
+      },
+      payload: {
+        ...primary,
+        reasoningEnabled: true,
+        reasoningLevel: "High",
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    expect(updateResponse.json()).toMatchObject({
+      id: String(primary!.id),
+      reasoningEnabled: true,
+      reasoningLevel: "high",
+    });
+  });
+
+  it("normalizes wrapped cloudflare resource payloads to arrays", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    class WrappedCloudflareClient extends FakeCloudflareClient {
+      public override async listD1Databases(): Promise<any> {
+        return {
+          result: {
+            databases: [
+              {
+                id: "wrapped-d1-id",
+                name: "wrapped-d1-name",
+              },
+            ],
+          },
+        };
+      }
+
+      public override async listR2Buckets(): Promise<any> {
+        return {
+          buckets: [
+            {
+              name: "wrapped-r2",
+            },
+          ],
+        };
+      }
+
+      public override async listVectorizeIndexes(): Promise<any> {
+        return {
+          data: {
+            indexes: [
+              {
+                name: "wrapped-vectorize",
+              },
+            ],
+          },
+        };
+      }
+
+      public override async listAiSearchIndexes(): Promise<any> {
+        return {
+          results: [
+            {
+              id: "wrapped-ai-search",
+            },
+          ],
+        };
+      }
+    }
+
+    const { app, cookie } = await bootstrapApp(dataDir, {
+      cloudflareClientFactory: (credentials) =>
+        new WrappedCloudflareClient(credentials) as never,
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/bootstrap/cloudflare/resources",
+      headers: {
+        cookie,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      d1: [
+        {
+          uuid: "wrapped-d1-id",
+          name: "wrapped-d1-name",
+        },
+      ],
+      r2: [
+        {
+          name: "wrapped-r2",
+        },
+      ],
+      vectorize: [
+        {
+          name: "wrapped-vectorize",
+        },
+      ],
+      aiSearch: [
+        {
+          name: "wrapped-ai-search",
         },
       ],
     });

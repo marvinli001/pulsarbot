@@ -10,7 +10,10 @@ export const ProviderKindSchema = z.enum([
   "openai_compatible_responses",
 ]);
 
-export const ReasoningLevelSchema = z.enum(["off", "low", "medium", "high"]);
+export const ReasoningLevelSchema = z.preprocess(
+  (value) => typeof value === "string" ? value.toLowerCase() : value,
+  z.enum(["off", "low", "medium", "high"]),
+);
 export const MarketKindSchema = z.enum(["skills", "plugins", "mcp"]);
 export const RuntimeKindSchema = z.enum([
   "internal",

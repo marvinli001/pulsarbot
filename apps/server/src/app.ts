@@ -16,6 +16,7 @@ import Fastify, {
 import { AgentRuntime } from "@pulsarbot/agent";
 import { CloudflareApiClient } from "@pulsarbot/cloudflare";
 import {
+  AppError,
   createId,
   createLogger,
   deriveHkdfKeyMaterial,
@@ -147,6 +148,13 @@ function isIsoInFuture(value: string | null | undefined): boolean {
   return Boolean(value && Date.parse(value) > Date.now());
 }
 
+function isMissingSecretError(error: unknown): boolean {
+  if (error instanceof AppError) {
+    return error.code === "SECRET_NOT_FOUND";
+  }
+  return error instanceof Error && error.message.startsWith("Secret not found for scope:");
+}
+
 class RuntimeState {
   public repository: AppRepository = new InMemoryAppRepository();
   public readonly marketRoot = path.resolve(repoRootDir, "market");
@@ -234,7 +242,11 @@ class RuntimeState {
     requireWorkspace(workspace);
     const secret = await this.repository.getSecretByScope(workspace.id, apiKeyRef);
     if (!secret) {
-      throw new Error(`Secret not found for scope: ${apiKeyRef}`);
+      throw new AppError(
+        "SECRET_NOT_FOUND",
+        `Secret not found for scope: ${apiKeyRef}`,
+        400,
+      );
     }
     return decryptSecret({
       accessToken: this.env.PULSARBOT_ACCESS_TOKEN,
@@ -411,24 +423,121 @@ class RuntimeState {
       throw new Error("Cloudflare credentials have not been connected");
     }
     const client = this.makeCloudflareClient(credentials) as CloudflareApiClient & Record<string, unknown>;
-    const safeList = async <T>(fn: string): Promise<T[]> => {
+    const safeList = async (fn: string): Promise<unknown> => {
       const handler = client[fn];
       if (typeof handler !== "function") {
         return [];
       }
       try {
-        return (await (handler as (this: typeof client) => Promise<T[]>).call(client)) ?? [];
+        return (await (handler as (this: typeof client) => Promise<unknown>).call(client)) ?? [];
       } catch (error) {
         logger.warn({ error, fn }, "Cloudflare resource listing failed");
         return [];
       }
     };
 
+    const extractCollection = <T>(value: unknown, preferredKeys: string[]): T[] => {
+      if (Array.isArray(value)) {
+        return value as T[];
+      }
+      if (!value || typeof value !== "object") {
+        return [];
+      }
+
+      const keys = [...preferredKeys, "result", "results", "data", "items"];
+      const queue: Array<unknown> = [value];
+
+      while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || typeof current !== "object") {
+          continue;
+        }
+        const record = current as Record<string, unknown>;
+        for (const key of keys) {
+          const candidate = record[key];
+          if (Array.isArray(candidate)) {
+            return candidate as T[];
+          }
+          if (candidate && typeof candidate === "object") {
+            queue.push(candidate);
+          }
+        }
+      }
+
+      return [];
+    };
+
+    const toNamedResources = (
+      value: unknown,
+      preferredKeys: string[],
+    ): Array<{ name: string }> => {
+      return extractCollection<unknown>(value, preferredKeys)
+        .flatMap((item) => {
+          if (typeof item === "string") {
+            return [{ name: item }];
+          }
+          if (!item || typeof item !== "object") {
+            return [];
+          }
+          const record = item as Record<string, unknown>;
+          const nameCandidate = [
+            record.name,
+            record.id,
+            record.index_name,
+            record.bucket,
+            record.bucketName,
+            record.title,
+          ].find((entry) => typeof entry === "string" && entry.length > 0);
+
+          return typeof nameCandidate === "string"
+            ? [{ name: nameCandidate }]
+            : [];
+        })
+        .filter((entry, index, list) =>
+          list.findIndex((candidate) => candidate.name === entry.name) === index
+        );
+    };
+
+    const toD1Resources = (value: unknown): Array<{ uuid: string; name: string }> => {
+      return extractCollection<unknown>(value, ["databases", "d1"])
+        .flatMap((item) => {
+          if (typeof item === "string") {
+            return [{ uuid: item, name: item }];
+          }
+          if (!item || typeof item !== "object") {
+            return [];
+          }
+          const record = item as Record<string, unknown>;
+          const uuidCandidate = [
+            record.uuid,
+            record.id,
+            record.database_id,
+          ].find((entry) => typeof entry === "string" && entry.length > 0);
+          if (typeof uuidCandidate !== "string") {
+            return [];
+          }
+          const nameCandidate = typeof record.name === "string" && record.name.length > 0
+            ? record.name
+            : uuidCandidate;
+          return [{ uuid: uuidCandidate, name: nameCandidate }];
+        })
+        .filter((entry, index, list) =>
+          list.findIndex((candidate) => candidate.uuid === entry.uuid) === index
+        );
+    };
+
     return {
-      d1: await safeList<{ uuid: string; name: string }>("listD1Databases"),
-      r2: await safeList<{ name: string }>("listR2Buckets"),
-      vectorize: await safeList<{ name: string }>("listVectorizeIndexes"),
-      aiSearch: await safeList<{ name: string }>("listAiSearchIndexes"),
+      d1: toD1Resources(await safeList("listD1Databases")),
+      r2: toNamedResources(await safeList("listR2Buckets"), ["buckets", "r2"]),
+      vectorize: toNamedResources(await safeList("listVectorizeIndexes"), [
+        "indexes",
+        "vectorize",
+      ]),
+      aiSearch: toNamedResources(await safeList("listAiSearchIndexes"), [
+        "indexes",
+        "rags",
+        "aiSearch",
+      ]),
     };
   }
 
@@ -2519,6 +2628,20 @@ export async function createApp(
         return result.reply;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown agent error";
+        if (isMissingSecretError(error)) {
+          logger.warn({ error, conversationId }, "Provider API key is not configured");
+          await finalizeConversationTurn({
+            conversationId,
+            turnId: acquired.turnId!,
+            telegramChatId: String(payload.chatId),
+            telegramUserId: String(payload.userId),
+            stepCount: 0,
+            compacted: false,
+            toolCallCount: 0,
+            error: message,
+          });
+          return "Provider API key is not configured. Open Mini App > Providers and save a valid API key.";
+        }
         logger.error({ error, conversationId }, "Telegram turn failed");
         await finalizeConversationTurn({
           conversationId,
@@ -2910,7 +3033,6 @@ export async function createApp(
       const profile = await state.resolveProviderProfile(
         (request.params as { id: string }).id,
       );
-      const apiKey = await state.resolveApiKey(profile.apiKeyRef);
       const body = (request.body ?? {}) as {
         capabilities?: string[];
       };
@@ -2925,101 +3047,117 @@ export async function createApp(
         ? requested
         : ["text"];
 
-      const results: ProviderTestRunResult[] = await Promise.all(
-        capabilities.map(async (capability) => {
-          if (capability === "text") {
-            try {
-              const result = await state.runProvider({
-                profile,
-                apiKey,
-                input: {
-                  messages: [
-                    {
-                      role: "system",
-                      content: "Reply with OK.",
+      let apiKey: string | null = null;
+      let apiKeyError: string | null = null;
+      try {
+        apiKey = await state.resolveApiKey(profile.apiKeyRef);
+      } catch (error) {
+        apiKeyError = error instanceof Error
+          ? error.message
+          : "Provider API key is missing";
+      }
+
+      const results: ProviderTestRunResult[] = apiKey
+        ? await Promise.all(
+            capabilities.map(async (capability) => {
+              if (capability === "text") {
+                try {
+                  const result = await state.runProvider({
+                    profile,
+                    apiKey,
+                    input: {
+                      messages: [
+                        {
+                          role: "system",
+                          content: "Reply with OK.",
+                        },
+                        {
+                          role: "user",
+                          content: "Ping",
+                        },
+                      ],
                     },
-                    {
-                      role: "user",
-                      content: "Ping",
-                    },
-                  ],
-                },
+                  });
+                  return {
+                    capability,
+                    status: "ok" as const,
+                    outputPreview: result.text.slice(0, 200),
+                  };
+                } catch (error) {
+                  return {
+                    capability,
+                    status: "failed" as const,
+                    error: error instanceof Error ? error.message : String(error),
+                  };
+                }
+              }
+
+              if (capability === "vision" && !profile.visionEnabled) {
+                return {
+                  capability,
+                  status: "skipped" as const,
+                  reason: "vision-disabled",
+                };
+              }
+              if (capability === "audio" && !profile.audioInputEnabled) {
+                return {
+                  capability,
+                  status: "skipped" as const,
+                  reason: "audio-disabled",
+                };
+              }
+              if (capability === "document" && !profile.documentInputEnabled) {
+                return {
+                  capability,
+                  status: "skipped" as const,
+                  reason: "document-disabled",
+                };
+              }
+
+              const mediaCapability = capability as Exclude<ProviderTestCapability, "text">;
+              const input = providerMediaTestInput(mediaCapability);
+              const supported = supportsProviderCapability(profile, mediaCapability, {
+                fileName: input.fileName,
+                mimeType: input.mimeType,
               });
-              return {
-                capability,
-                status: "ok" as const,
-                outputPreview: result.text.slice(0, 200),
-              };
-            } catch (error) {
-              return {
-                capability,
-                status: "failed" as const,
-                error: error instanceof Error ? error.message : String(error),
-              };
-            }
-          }
+              if (!supported) {
+                return {
+                  capability: capability as ProviderTestCapability,
+                  status: "unsupported" as const,
+                };
+              }
 
-          if (capability === "vision" && !profile.visionEnabled) {
-            return {
-              capability,
-              status: "skipped" as const,
-              reason: "vision-disabled",
-            };
-          }
-          if (capability === "audio" && !profile.audioInputEnabled) {
-            return {
-              capability,
-              status: "skipped" as const,
-              reason: "audio-disabled",
-            };
-          }
-          if (capability === "document" && !profile.documentInputEnabled) {
-            return {
-              capability,
-              status: "skipped" as const,
-              reason: "document-disabled",
-            };
-          }
-
-          const mediaCapability = capability as Exclude<ProviderTestCapability, "text">;
-          const input = providerMediaTestInput(mediaCapability);
-          const supported = supportsProviderCapability(profile, mediaCapability, {
-            fileName: input.fileName,
-            mimeType: input.mimeType,
-          });
-          if (!supported) {
-            return {
-              capability: capability as ProviderTestCapability,
-              status: "unsupported" as const,
-            };
-          }
-
-          try {
-            const result = await state.runProviderMedia({
-              profile,
-              apiKey,
-              input,
-            });
-            if (!result) {
-              return {
-                capability: capability as ProviderTestCapability,
-                status: "unsupported" as const,
-              };
-            }
-            return {
-              capability,
-              status: "ok" as const,
-              outputPreview: result.text.slice(0, 200),
-            };
-          } catch (error) {
-            return {
-              capability,
-              status: "failed" as const,
-              error: error instanceof Error ? error.message : String(error),
-            };
-          }
-        }),
-      );
+              try {
+                const result = await state.runProviderMedia({
+                  profile,
+                  apiKey,
+                  input,
+                });
+                if (!result) {
+                  return {
+                    capability: capability as ProviderTestCapability,
+                    status: "unsupported" as const,
+                  };
+                }
+                return {
+                  capability,
+                  status: "ok" as const,
+                  outputPreview: result.text.slice(0, 200),
+                };
+              } catch (error) {
+                return {
+                  capability,
+                  status: "failed" as const,
+                  error: error instanceof Error ? error.message : String(error),
+                };
+              }
+            }),
+          )
+        : capabilities.map((capability) => ({
+            capability,
+            status: "failed" as const,
+            error: apiKeyError ?? "Provider API key is missing",
+          }));
 
       const workspace = await state.repository.getWorkspace();
       requireWorkspace(workspace);

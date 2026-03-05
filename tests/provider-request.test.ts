@@ -239,7 +239,7 @@ describe("provider request preview", () => {
     });
   });
 
-  it("builds a Bailian responses payload for native tool calling and thinking", () => {
+  it("builds a Bailian chat-completions payload for native tool calling and thinking", () => {
     const preview = createProviderRequestPreview({
       profile: profile("bailian", {
         reasoningEnabled: true,
@@ -263,25 +263,60 @@ describe("provider request preview", () => {
       },
     });
 
-    expect(preview.url).toContain("/compatible-mode/v1/responses");
+    expect(preview.url).toContain("/compatible-mode/v1/chat/completions");
     expect(preview.body.enable_thinking).toBe(true);
     expect(preview.body.tools).toEqual([
       {
         type: "function",
-        name: "search_web",
-        description: "Search the web",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string" } },
-          required: ["query"],
+        function: {
+          name: "search_web",
+          description: "Search the web",
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
         },
       },
     ]);
     expect(preview.body.tool_choice).toEqual({
-      type: "allowed_tools",
-      mode: "required",
-      tools: [{ type: "function", name: "search_web" }],
+      type: "function",
+      function: { name: "search_web" },
     });
+  });
+
+  it("disables Bailian thinking when JSON mode is requested and forwards thinking budget otherwise", () => {
+    const withJsonMode = createProviderRequestPreview({
+      profile: profile("bailian", {
+        reasoningEnabled: true,
+        reasoningLevel: "high",
+        thinkingBudget: 2048,
+      }),
+      apiKey: "bailian-key",
+      input: {
+        messages: [{ role: "user", content: "Return strict JSON" }],
+        jsonMode: true,
+      },
+    });
+
+    expect(withJsonMode.body.response_format).toEqual({ type: "json_object" });
+    expect(withJsonMode.body.enable_thinking).toBe(false);
+    expect(withJsonMode.body.thinking_budget).toBeUndefined();
+
+    const withoutJsonMode = createProviderRequestPreview({
+      profile: profile("bailian", {
+        reasoningEnabled: true,
+        reasoningLevel: "high",
+        thinkingBudget: 2048,
+      }),
+      apiKey: "bailian-key",
+      input: {
+        messages: [{ role: "user", content: "Think deeply before answering." }],
+      },
+    });
+
+    expect(withoutJsonMode.body.enable_thinking).toBe(true);
+    expect(withoutJsonMode.body.thinking_budget).toBe(2048);
   });
 
   it("covers the configured provider kinds", () => {
@@ -312,12 +347,13 @@ describe("provider request preview", () => {
       {
         kind: "bailian" as const,
         apiKey: "bailian-key",
-        urlPart: "/compatible-mode/v1/responses",
+        urlPart: "/compatible-mode/v1/chat/completions",
         header: "Authorization",
         assert(preview: ReturnType<typeof createProviderRequestPreview>) {
           expect(preview.body.model).toBe("test-model");
-          expect(preview.body.input).toBeTruthy();
-          expect(preview.body.enable_thinking).toBe(true);
+          expect(preview.body.messages).toBeTruthy();
+          expect(preview.body.enable_thinking).toBe(false);
+          expect(preview.body.response_format).toEqual({ type: "json_object" });
         },
       },
       {
@@ -457,22 +493,26 @@ describe("provider response parsing", () => {
     ]);
   });
 
-  it("parses Bailian responses function_call blocks", () => {
+  it("parses Bailian chat-completions tool_calls", () => {
     const adapter = getProviderAdapter("bailian");
     const result = adapter.parseResponse({
-      id: "resp_bl_1",
-      output: [
+      id: "chatcmpl_bl_1",
+      choices: [
         {
-          type: "function_call",
-          id: "fc_1",
-          call_id: "call_1",
-          name: "search_web",
-          arguments: "{\"query\":\"tokyo weather\"}",
-        },
-        {
-          type: "message",
-          role: "assistant",
-          content: [{ type: "output_text", text: "Using tool now." }],
+          message: {
+            role: "assistant",
+            content: "Using tool now.",
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: {
+                  name: "search_web",
+                  arguments: "{\"query\":\"tokyo weather\"}",
+                },
+              },
+            ],
+          },
         },
       ],
     });

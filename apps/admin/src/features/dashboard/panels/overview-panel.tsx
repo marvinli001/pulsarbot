@@ -63,27 +63,44 @@ export function OverviewPanel() {
     aiSearchIndexName: "",
   });
 
+  const d1Resources = Array.isArray(resources.data?.d1) ? resources.data.d1 : [];
+  const r2Resources = Array.isArray(resources.data?.r2) ? resources.data.r2 : [];
+  const vectorizeResources = Array.isArray(resources.data?.vectorize)
+    ? resources.data.vectorize
+    : [];
+  const aiSearchResources = Array.isArray(resources.data?.aiSearch)
+    ? resources.data.aiSearch
+    : [];
+
   useEffect(() => {
     if (!resources.data) {
       return;
     }
+    const nextD1Resources = Array.isArray(resources.data.d1) ? resources.data.d1 : [];
+    const nextR2Resources = Array.isArray(resources.data.r2) ? resources.data.r2 : [];
+    const nextVectorizeResources = Array.isArray(resources.data.vectorize)
+      ? resources.data.vectorize
+      : [];
+    const nextAiSearchResources = Array.isArray(resources.data.aiSearch)
+      ? resources.data.aiSearch
+      : [];
 
     setResourceSelection((current) => ({
       d1DatabaseId:
         current.d1DatabaseId ||
-        (resources.data.d1.length === 1 ? resources.data.d1[0]?.uuid ?? "" : ""),
+        (nextD1Resources.length === 1 ? nextD1Resources[0]?.uuid ?? "" : ""),
       r2BucketName:
         current.r2BucketName ||
-        (resources.data.r2.length === 1 ? resources.data.r2[0]?.name ?? "" : ""),
+        (nextR2Resources.length === 1 ? nextR2Resources[0]?.name ?? "" : ""),
       vectorizeIndexName:
         current.vectorizeIndexName ||
-        (resources.data.vectorize.length === 1
-          ? resources.data.vectorize[0]?.name ?? ""
+        (nextVectorizeResources.length === 1
+          ? nextVectorizeResources[0]?.name ?? ""
           : ""),
       aiSearchIndexName:
         current.aiSearchIndexName ||
-        (resources.data.aiSearch.length === 1
-          ? resources.data.aiSearch[0]?.name ?? ""
+        (nextAiSearchResources.length === 1
+          ? nextAiSearchResources[0]?.name ?? ""
           : ""),
     }));
   }, [resources.data]);
@@ -273,7 +290,7 @@ export function OverviewPanel() {
           ? "Create a new D1 database"
           : "Select an existing D1 database",
     },
-    ...(resources.data?.d1 ?? []).map((database) => ({
+    ...d1Resources.map((database) => ({
       value: database.uuid,
       label: `${database.name} (${database.uuid})`,
     })),
@@ -286,7 +303,7 @@ export function OverviewPanel() {
           ? "Create a new R2 bucket"
           : "Use saved or auto-created R2 bucket",
     },
-    ...(resources.data?.r2 ?? []).map((bucket) => ({
+    ...r2Resources.map((bucket) => ({
       value: bucket.name,
       label: bucket.name,
     })),
@@ -299,7 +316,7 @@ export function OverviewPanel() {
           ? "Create a new Vectorize index"
           : "Use saved or auto-created Vectorize index",
     },
-    ...(resources.data?.vectorize ?? []).map((index) => ({
+    ...vectorizeResources.map((index) => ({
       value: index.name,
       label: index.name,
     })),
@@ -309,16 +326,16 @@ export function OverviewPanel() {
       value: "",
       label: "Use saved or default AI Search instance",
     },
-    ...(resources.data?.aiSearch ?? []).map((index) => ({
+    ...aiSearchResources.map((index) => ({
       value: index.name,
       label: index.name,
     })),
   ];
   const discoveredResourceCounts = [
-    { label: "D1 Databases", value: String(resources.data?.d1.length ?? 0) },
-    { label: "R2 Buckets", value: String(resources.data?.r2.length ?? 0) },
-    { label: "Vectorize", value: String(resources.data?.vectorize.length ?? 0) },
-    { label: "AI Search", value: String(resources.data?.aiSearch.length ?? 0) },
+    { label: "D1 Databases", value: String(d1Resources.length) },
+    { label: "R2 Buckets", value: String(r2Resources.length) },
+    { label: "Vectorize", value: String(vectorizeResources.length) },
+    { label: "AI Search", value: String(aiSearchResources.length) },
   ];
 
   return (
@@ -512,7 +529,7 @@ export function OverviewPanel() {
               <KeyValueGrid items={discoveredResourceCounts} />
             </div>
             {bootstrapMode === "existing" &&
-            (resources.data?.d1.length ?? 0) === 0 &&
+            d1Resources.length === 0 &&
             !resources.isLoading ? (
               <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
                 当前账号下没有读到任何 D1 数据库。若这是首次部署，切到

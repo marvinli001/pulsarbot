@@ -274,11 +274,11 @@ export const providerKindTemplates: Record<
   },
   bailian: {
     label: "Bailian Provider",
-    apiBaseUrl: "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-    defaultModel: "qwen-max",
-    visionModel: "qwen-vl-max-latest",
-    audioModel: "qwen3-asr-flash",
-    documentModel: "qwen-doc-turbo",
+    apiBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    defaultModel: "qwen3.5-plus",
+    visionModel: "",
+    audioModel: "",
+    documentModel: "",
     visionEnabled: true,
     audioInputEnabled: true,
     documentInputEnabled: true,
@@ -315,6 +315,39 @@ export const providerKindTemplates: Record<
     jsonModeEnabled: true,
   },
 };
+
+export const reasoningLevelOptions: Array<{ value: string; label: string }> = [
+  { value: "off", label: "Off" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+];
+
+const commonThinkingBudgetOptions: Array<{ value: string; label: string }> = [
+  { value: "auto", label: "Auto" },
+  { value: "512", label: "512" },
+  { value: "1024", label: "1024" },
+  { value: "2048", label: "2048" },
+  { value: "4096", label: "4096" },
+];
+
+const bailianThinkingBudgetOptions: Array<{ value: string; label: string }> = [
+  { value: "auto", label: "Auto (Bailian default)" },
+  { value: "512", label: "512" },
+  { value: "1024", label: "1024" },
+  { value: "2048", label: "2048" },
+  { value: "4096", label: "4096" },
+  { value: "8192", label: "8192" },
+];
+
+export function thinkingBudgetOptionsForProvider(
+  kind: ProviderKindOption,
+): Array<{ value: string; label: string }> {
+  if (kind === "bailian") {
+    return bailianThinkingBudgetOptions;
+  }
+  return commonThinkingBudgetOptions;
+}
 
 export function useSessionBootstrap() {
   return useQuery({
