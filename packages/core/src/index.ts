@@ -9,10 +9,11 @@ export const envSchema = z.object({
   BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(10 * 1024 * 1024),
   CORS_ORIGIN: z.string().optional(),
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
-  TELEGRAM_WEBHOOK_URL: z.string().url().optional(),
-  PUBLIC_BASE_URL: z.string().url().optional(),
-  RAILWAY_PUBLIC_DOMAIN: z.string().min(1).optional(),
-  RAILWAY_STATIC_URL: z.string().url().optional(),
+  // Optional URL-ish values are normalized by the server runtime.
+  TELEGRAM_WEBHOOK_URL: z.string().optional(),
+  PUBLIC_BASE_URL: z.string().optional(),
+  RAILWAY_PUBLIC_DOMAIN: z.string().optional(),
+  RAILWAY_STATIC_URL: z.string().optional(),
   PULSARBOT_ACCESS_TOKEN: z.string().min(1, "PULSARBOT_ACCESS_TOKEN is required"),
 });
 

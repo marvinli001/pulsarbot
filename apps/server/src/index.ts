@@ -23,9 +23,36 @@ function printStartupError(error: unknown) {
   console.error("Server failed to start:", error);
 }
 
+function installShutdownHandlers(app: Awaited<ReturnType<typeof createApp>>) {
+  let shuttingDown = false;
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.warn(`[server] Received ${signal}, shutting down gracefully...`);
+    try {
+      await app.close();
+      console.warn("[server] Shutdown complete.");
+      process.exit(0);
+    } catch (error) {
+      console.error("[server] Shutdown failed:", error);
+      process.exit(1);
+    }
+  };
+
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+}
+
 try {
   const app = await createApp();
   const port = Number(process.env.PORT ?? 3000);
+  installShutdownHandlers(app);
 
   await app.listen({
     host: "0.0.0.0",
