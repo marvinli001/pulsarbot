@@ -955,7 +955,8 @@ function resolveTaskModel(
           ? "qwen3-asr-flash"
           : profile.defaultModel);
     case "document":
-      return profile.documentModel ?? profile.defaultModel;
+      return profile.documentModel ??
+        (profile.kind === "bailian" ? "qwen-doc-turbo" : profile.defaultModel);
     default:
       return assertNever(task);
   }
@@ -1529,7 +1530,8 @@ function buildBailianMediaRequest(
           },
           parameters: {
             result_format: "message",
-            incremental_output: false,
+            // qwen3.5-plus multimodal generation requires incremental_output=true.
+            incremental_output: true,
           },
           ...profile.extraBody,
         },
@@ -1551,9 +1553,10 @@ function buildBailianMediaRequest(
                   text: input.prompt,
                 },
                 {
-                  type: "audio_url",
-                  audio_url: {
-                    url: dataUrlForBytes(input.rawBody, input.mimeType),
+                  type: "input_audio",
+                  input_audio: {
+                    data: dataUrlForBytes(input.rawBody, input.mimeType),
+                    format: inferAudioFormat(input.mimeType, input.fileName),
                   },
                 },
               ],
@@ -1572,26 +1575,24 @@ function buildBailianMediaRequest(
         return null;
       }
       return {
-        url: `${compatibleBaseUrl}/responses`,
+        url: `${compatibleBaseUrl}/chat/completions`,
         headers: mergeJsonHeaders(profile, {
           Authorization: `Bearer ${apiKey}`,
         }),
         body: {
           model: resolveTaskModel(profile, "document"),
-          input: [
+          messages: [
+            {
+              role: "system",
+              content: "fileid://<uploaded-file-id>",
+            },
             {
               role: "user",
-              content: [
-                { type: "input_text", text: input.prompt },
-                {
-                  type: "input_file",
-                  filename: input.fileName ?? "document",
-                  file_data: dataUrlForBytes(input.rawBody, input.mimeType),
-                },
-              ],
+              content: input.prompt,
             },
           ],
-          max_output_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+          max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+          stream: false,
           ...profile.extraBody,
         },
       };
@@ -2174,11 +2175,123 @@ export function createProviderMediaRequestPreview(args: {
   }
 }
 
+function parseBailianUploadedFileId(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  if (typeof record.id === "string" && record.id) {
+    return record.id;
+  }
+  if (record.data && typeof record.data === "object") {
+    const dataRecord = record.data as Record<string, unknown>;
+    if (typeof dataRecord.id === "string" && dataRecord.id) {
+      return dataRecord.id;
+    }
+  }
+  return null;
+}
+
+async function invokeBailianDocumentMedia(args: {
+  profile: ProviderProfile;
+  apiKey: string;
+  input: ProviderMediaInvocationInput;
+}): Promise<ProviderInvocationResult> {
+  const { profile, apiKey, input } = args;
+  const compatibleBaseUrl = dashscopeCompatibleBaseUrl(profile);
+  const form = new FormData();
+  form.set("purpose", "file-extract");
+  form.set("file", toBlob(input.rawBody, input.mimeType), input.fileName ?? "document");
+
+  const uploadResponse = await fetch(`${compatibleBaseUrl}/files`, {
+    method: "POST",
+    headers: mergeFormHeaders(profile, {
+      Authorization: `Bearer ${apiKey}`,
+    }),
+    body: form,
+  });
+
+  if (!uploadResponse.ok) {
+    const text = await uploadResponse.text();
+    throw new AppError(
+      "PROVIDER_REQUEST_FAILED",
+      `Provider media request failed: ${uploadResponse.status} ${text}`,
+      uploadResponse.status,
+    );
+  }
+
+  const uploadPayload = await readResponsePayload(uploadResponse);
+  const fileId = parseBailianUploadedFileId(uploadPayload);
+  if (!fileId) {
+    throw new AppError(
+      "PROVIDER_REQUEST_FAILED",
+      `Provider media request failed: uploaded file id missing (${parseTextFromUnknown(uploadPayload)})`,
+      502,
+    );
+  }
+
+  try {
+    const response = await fetch(`${compatibleBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: mergeJsonHeaders(profile, {
+        Authorization: `Bearer ${apiKey}`,
+      }),
+      body: JSON.stringify({
+        model: resolveTaskModel(profile, "document"),
+        messages: [
+          {
+            role: "system",
+            content: `fileid://${fileId}`,
+          },
+          {
+            role: "user",
+            content: input.prompt,
+          },
+        ],
+        max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+        stream: false,
+        ...profile.extraBody,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new AppError(
+        "PROVIDER_REQUEST_FAILED",
+        `Provider media request failed: ${response.status} ${text}`,
+        response.status,
+      );
+    }
+
+    const payload = await readResponsePayload(response);
+    return buildMediaResponse(payload);
+  } finally {
+    void fetch(`${compatibleBaseUrl}/files/${encodeURIComponent(fileId)}`, {
+      method: "DELETE",
+      headers: compactHeaders({
+        Authorization: `Bearer ${apiKey}`,
+        ...profile.headers,
+      }),
+    }).catch(() => undefined);
+  }
+}
+
 export async function invokeProviderMedia(args: {
   profile: ProviderProfile;
   apiKey: string;
   input: ProviderMediaInvocationInput;
 }): Promise<ProviderInvocationResult | null> {
+  if (args.profile.kind === "bailian" && args.input.kind === "document") {
+    if (!providerSupportsDocumentInput({
+      profile: args.profile,
+      mimeType: args.input.mimeType,
+      fileName: args.input.fileName,
+    })) {
+      return null;
+    }
+    return invokeBailianDocumentMedia(args);
+  }
+
   const preview = createProviderMediaRequestPreview(args);
   if (!preview) {
     return null;

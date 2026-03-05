@@ -251,7 +251,6 @@ export function ProvidersPanel() {
     onClick: () => saveMutation.mutate(),
   });
 
-  const showPerModalityModelOverrides = form.kind !== "bailian";
   const thinkingBudgetOptions = thinkingBudgetOptionsForProvider(form.kind);
 
   return (
@@ -380,24 +379,11 @@ export function ProvidersPanel() {
             />
             <Input value={form.apiBaseUrl} onChange={(event) => setForm((current) => ({ ...current, apiBaseUrl: event.target.value }))} />
             <Input value={form.defaultModel} onChange={(event) => setForm((current) => ({ ...current, defaultModel: event.target.value }))} />
-            {showPerModalityModelOverrides ? (
-              <div className="grid gap-3 md:grid-cols-3">
-                <Input value={form.visionModel} onChange={(event) => setForm((current) => ({ ...current, visionModel: event.target.value }))} placeholder="vision model override" />
-                <Input value={form.audioModel} onChange={(event) => setForm((current) => ({ ...current, audioModel: event.target.value }))} placeholder="audio / transcription model override" />
-                <Input value={form.documentModel} onChange={(event) => setForm((current) => ({ ...current, documentModel: event.target.value }))} placeholder="document model override" />
-              </div>
-            ) : (
-              <div
-                className="rounded-2xl border px-4 py-3 text-sm"
-                style={{
-                  borderColor: "var(--app-border)",
-                  background: "var(--app-surface-soft)",
-                  color: "var(--app-muted-text)",
-                }}
-              >
-                Bailian 默认按 `Default Model` 走多模态能力；视觉/音频/文档模型留空即可。
-              </div>
-            )}
+            <div className="grid gap-3 md:grid-cols-3">
+              <Input value={form.visionModel} onChange={(event) => setForm((current) => ({ ...current, visionModel: event.target.value }))} placeholder="vision model override" />
+              <Input value={form.audioModel} onChange={(event) => setForm((current) => ({ ...current, audioModel: event.target.value }))} placeholder="audio / transcription model override" />
+              <Input value={form.documentModel} onChange={(event) => setForm((current) => ({ ...current, documentModel: event.target.value }))} placeholder="document model override" />
+            </div>
             <Input
               type="password"
               placeholder={editingId ? "Leave blank to keep existing API key" : "API key"}

@@ -687,16 +687,20 @@ describe("provider media request preview", () => {
 
     expect(audioPreview?.url).toContain("/compatible-mode/v1/chat/completions");
     expect(audioBody.messages[0].content[1]).toMatchObject({
-      type: "audio_url",
+      type: "input_audio",
+    });
+    expect(audioBody.messages[0].content[1].input_audio).toMatchObject({
+      format: "mp3",
     });
 
     expect(imagePreview?.url).toContain("/multimodal-generation/generation");
     expect(imageBody.input.messages[0].content[0].image).toContain("data:image/png;base64,");
+    expect(imageBody.parameters.incremental_output).toBe(true);
 
-    expect(documentPreview?.url).toContain("/compatible-mode/v1/responses");
-    expect(documentBody.input[0].content[1]).toMatchObject({
-      type: "input_file",
-      filename: "manual.pdf",
+    expect(documentPreview?.url).toContain("/compatible-mode/v1/chat/completions");
+    expect(documentBody.messages[0]).toMatchObject({
+      role: "system",
+      content: "fileid://<uploaded-file-id>",
     });
   });
 
