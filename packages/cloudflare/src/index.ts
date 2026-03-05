@@ -75,13 +75,24 @@ export class CloudflareApiClient {
   }
 
   public async verifyCredentials(): Promise<boolean> {
-    const response = await this.request<{
-      status: string;
-    }>("/user/tokens/verify", {
-      accountScoped: false,
+    if (this.credentials.apiToken) {
+      const response = await this.request<{
+        status: string;
+      }>("/user/tokens/verify", {
+        accountScoped: false,
+        method: "GET",
+      });
+      return response.status === "active";
+    }
+
+    const account = await this.request<{
+      id: string;
+    }>("", {
+      accountScoped: true,
       method: "GET",
     });
-    return response.status === "active";
+
+    return Boolean(account.id);
   }
 
   public getCredentials(): CloudflareCredentials {

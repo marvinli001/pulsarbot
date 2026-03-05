@@ -134,6 +134,30 @@ export function parseArgs(value: string) {
     .filter(Boolean);
 }
 
+function readableMutationError(error: unknown) {
+  let message = error instanceof Error ? error.message : "Request failed";
+
+  try {
+    const parsed = JSON.parse(message) as {
+      message?: string;
+      error?: string;
+    };
+    if (typeof parsed.message === "string" && parsed.message.trim().length > 0) {
+      message = parsed.message.trim();
+    } else if (typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+      message = parsed.error.trim();
+    }
+  } catch {
+    // Keep original message when body is not JSON.
+  }
+
+  if (message.includes("Missing \"Authorization\" header")) {
+    return "Cloudflare 鉴权失败：当前流程需要有效 API Token（Bearer）或正确的 Global API Key + Email。请检查鉴权模式与字段。";
+  }
+
+  return message;
+}
+
 export const providerKindOptions: Array<{
   value: ProviderKindOption;
   label: string;
@@ -536,10 +560,19 @@ export function MutationBadge({
   idleLabel?: string;
 }) {
   if (mutation.isError) {
+    const message = readableMutationError(mutation.error);
     return (
-      <Badge tone="danger">
-        {mutation.error instanceof Error ? mutation.error.message : "Request failed"}
-      </Badge>
+      <div
+        className="w-full rounded-2xl border px-3 py-2 text-xs leading-5 md:w-auto"
+        style={{
+          background: "var(--app-danger-bg)",
+          borderColor: "color-mix(in srgb, var(--app-danger-text) 30%, var(--app-border))",
+          color: "var(--app-danger-text)",
+          overflowWrap: "anywhere",
+        }}
+      >
+        {message}
+      </div>
     );
   }
 

@@ -153,6 +153,7 @@ function supportsNativeToolCalling(provider: ProviderProfile): boolean {
   }
   return provider.kind === "openai" ||
     provider.kind === "anthropic" ||
+    provider.kind === "gemini" ||
     provider.kind === "openrouter" ||
     provider.kind === "bailian";
 }

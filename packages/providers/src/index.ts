@@ -247,6 +247,49 @@ function anthropicToolDefinitions(input: ProviderInvocationInput) {
   }));
 }
 
+function geminiToolDeclarations(input: ProviderInvocationInput) {
+  if (!input.tools?.length) {
+    return undefined;
+  }
+  return input.tools.map((tool) => ({
+    name: tool.id,
+    description: tool.description,
+    parameters: tool.inputSchema,
+  }));
+}
+
+function normalizeGeminiToolConfig(
+  value: ProviderToolChoice | undefined,
+):
+  | {
+      functionCallingConfig: {
+        mode: "AUTO" | "NONE" | "ANY";
+        allowedFunctionNames?: string[];
+      };
+    }
+  | undefined {
+  if (!value || value === "auto") {
+    return {
+      functionCallingConfig: {
+        mode: "AUTO",
+      },
+    };
+  }
+  if (value === "none") {
+    return {
+      functionCallingConfig: {
+        mode: "NONE",
+      },
+    };
+  }
+  return {
+    functionCallingConfig: {
+      mode: "ANY",
+      allowedFunctionNames: [value.toolId],
+    },
+  };
+}
+
 function responsesToolDefinitions(input: ProviderInvocationInput) {
   if (!input.tools?.length) {
     return undefined;
@@ -603,6 +646,134 @@ function parseAnthropicText(payload: Record<string, unknown>): string {
     })
     .join("\n\n")
     .trim();
+}
+
+function parseGeminiToolCalls(payload: Record<string, unknown>): ProviderToolCall[] {
+  const candidates = payload.candidates;
+  if (!Array.isArray(candidates)) {
+    return [];
+  }
+  const firstCandidate = candidates[0];
+  if (!firstCandidate || typeof firstCandidate !== "object") {
+    return [];
+  }
+  const content = (firstCandidate as Record<string, unknown>).content;
+  if (!content || typeof content !== "object") {
+    return [];
+  }
+  const parts = (content as Record<string, unknown>).parts;
+  if (!Array.isArray(parts)) {
+    return [];
+  }
+
+  return parts.flatMap((part, index) => {
+    if (!part || typeof part !== "object") {
+      return [];
+    }
+    const functionCall = (part as Record<string, unknown>).functionCall;
+    if (!functionCall || typeof functionCall !== "object") {
+      return [];
+    }
+    const callRecord = functionCall as Record<string, unknown>;
+    const toolId = typeof callRecord.name === "string" ? callRecord.name : "";
+    if (!toolId) {
+      return [];
+    }
+    const callId = (
+      (typeof callRecord.id === "string" && callRecord.id) ||
+      (typeof callRecord.callId === "string" && callRecord.callId) ||
+      `call_${index + 1}`
+    );
+    return [
+      {
+        id: callId,
+        toolId,
+        input: parseToolInput(callRecord.args),
+      },
+    ];
+  });
+}
+
+function parseGeminiToolResult(content: string): Record<string, LooseJsonValue> {
+  const text = content.trim();
+  if (!text) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, LooseJsonValue>;
+    }
+    return {
+      result: parsed as LooseJsonValue,
+    };
+  } catch {
+    return {
+      text,
+    };
+  }
+}
+
+function messageToGeminiShape(
+  message: ProviderMessage,
+  toolNameByCallId: Map<string, string>,
+): { role: "user" | "model"; parts: Array<Record<string, unknown>> } | null {
+  if (message.role === "system") {
+    return null;
+  }
+  if (message.role === "user") {
+    return {
+      role: "user",
+      parts: [{ text: message.content }],
+    };
+  }
+  if (message.role === "tool") {
+    const toolName = message.toolCallId
+      ? toolNameByCallId.get(message.toolCallId)
+      : undefined;
+    if (!toolName) {
+      return message.content.trim()
+        ? {
+            role: "user",
+            parts: [{ text: message.content }],
+          }
+        : null;
+    }
+    return {
+      role: "user",
+      parts: [
+        {
+          functionResponse: {
+            name: toolName,
+            response: parseGeminiToolResult(message.content),
+          },
+        },
+      ],
+    };
+  }
+
+  const parts: Array<Record<string, unknown>> = [];
+  if (message.content.trim()) {
+    parts.push({ text: message.content });
+  }
+  if (message.toolCalls?.length) {
+    for (const toolCall of message.toolCalls) {
+      toolNameByCallId.set(toolCall.id, toolCall.toolId);
+      parts.push({
+        functionCall: {
+          name: toolCall.toolId,
+          args: toolCall.input ?? {},
+        },
+      });
+    }
+  }
+  if (parts.length === 0) {
+    return null;
+  }
+  return {
+    role: "model",
+    parts,
+  };
 }
 
 function buildSamplingOptions(profile: ProviderProfile) {
@@ -1611,6 +1782,7 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
     kind: "gemini",
     buildRequest(profile, apiKey, input) {
       const model = input.model ?? profile.defaultModel;
+      const toolNameByCallId = new Map<string, string>();
       return {
         url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/models/${model}:generateContent`,
         headers: mergeJsonHeaders(profile, {
@@ -1618,16 +1790,29 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
         }),
         body: {
           contents: input.messages
-            .filter((message) => message.role !== "system")
-            .map((message) => ({
-              role: message.role === "assistant" ? "model" : "user",
-              parts: [{ text: message.content }],
-            })),
+            .map((message) => messageToGeminiShape(message, toolNameByCallId))
+            .filter((
+              message,
+            ): message is { role: "user" | "model"; parts: Array<Record<string, unknown>> } =>
+              Boolean(message)
+            ),
           systemInstruction: {
             parts: input.messages
               .filter((message) => message.role === "system")
               .map((message) => ({ text: message.content })),
           },
+          tools:
+            input.tools?.length && profile.toolCallingEnabled
+              ? [
+                  {
+                    functionDeclarations: geminiToolDeclarations(input),
+                  },
+                ]
+              : undefined,
+          toolConfig:
+            input.tools?.length && profile.toolCallingEnabled
+              ? normalizeGeminiToolConfig(input.toolChoice)
+              : undefined,
           generationConfig: {
             maxOutputTokens: input.maxOutputTokens ?? profile.maxOutputTokens,
             responseMimeType: wantsJsonMode(profile, input)
@@ -1652,6 +1837,14 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
       };
     },
     parseResponse(payload) {
+      if (payload && typeof payload === "object") {
+        const record = payload as Record<string, unknown>;
+        return {
+          text: parseProviderTextPayload(record) || parseTextFromUnknown(payload),
+          raw: payload,
+          toolCalls: parseGeminiToolCalls(record),
+        };
+      }
       return buildMediaResponse(payload);
     },
   },

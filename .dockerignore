@@ -1,0 +1,16 @@
+.git
+.gitignore
+.turbo
+.playwright-cli
+node_modules
+coverage
+test-results
+output
+tests
+doc
+README.md
+PLAN.md
+PLAN-1.md
+PLAN-2.md
+DEPLOY_RAILWAY_TELEGRAM_MINIAPP.md
+**/*.log

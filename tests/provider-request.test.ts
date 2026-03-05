@@ -194,6 +194,51 @@ describe("provider request preview", () => {
     });
   });
 
+  it("builds a Gemini payload for native tool calling", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("gemini"),
+      apiKey: "gemini-key",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: { type: "tool", toolId: "search_web" },
+      },
+    });
+
+    expect(preview.url).toContain(":generateContent");
+    expect(preview.body.tools).toEqual([
+      {
+        functionDeclarations: [
+          {
+            name: "search_web",
+            description: "Search the web",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+      },
+    ]);
+    expect(preview.body.toolConfig).toEqual({
+      functionCallingConfig: {
+        mode: "ANY",
+        allowedFunctionNames: ["search_web"],
+      },
+    });
+  });
+
   it("builds a Bailian responses payload for native tool calling and thinking", () => {
     const preview = createProviderRequestPreview({
       profile: profile("bailian", {
@@ -428,6 +473,39 @@ describe("provider response parsing", () => {
           type: "message",
           role: "assistant",
           content: [{ type: "output_text", text: "Using tool now." }],
+        },
+      ],
+    });
+
+    expect(result.text).toContain("Using tool now.");
+    expect(result.toolCalls).toEqual([
+      {
+        id: "call_1",
+        toolId: "search_web",
+        input: { query: "tokyo weather" },
+      },
+    ]);
+  });
+
+  it("parses Gemini functionCall blocks", () => {
+    const adapter = getProviderAdapter("gemini");
+    const result = adapter.parseResponse({
+      candidates: [
+        {
+          content: {
+            parts: [
+              {
+                functionCall: {
+                  id: "call_1",
+                  name: "search_web",
+                  args: { query: "tokyo weather" },
+                },
+              },
+              {
+                text: "Using tool now.",
+              },
+            ],
+          },
         },
       ],
     });

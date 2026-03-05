@@ -165,11 +165,48 @@ const createTableStatements = [
   )`,
 ];
 
+const createIndexStatements = [
+  "CREATE INDEX IF NOT EXISTS idx_install_record_kind ON install_record(kind)",
+  "CREATE INDEX IF NOT EXISTS idx_message_conversation_created_at ON message(conversation_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_message_telegram_message_id ON message(telegram_message_id)",
+  "CREATE INDEX IF NOT EXISTS idx_auth_session_jwt_jti ON auth_session(json_extract(data, '$.jwtJti'))",
+  "CREATE INDEX IF NOT EXISTS idx_auth_session_expires_at ON auth_session(json_extract(data, '$.expiresAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_memory_chunk_workspace_id ON memory_chunk(json_extract(data, '$.workspaceId'))",
+  "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
+  "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
+];
+
 const alterStatements = [
   "ALTER TABLE workspace ADD COLUMN active_agent_profile_id TEXT",
   "ALTER TABLE message ADD COLUMN source_type TEXT NOT NULL DEFAULT 'text'",
   "ALTER TABLE message ADD COLUMN telegram_message_id TEXT",
   "ALTER TABLE message ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+];
+
+const migrationHistoryBootstrapStatement = `CREATE TABLE IF NOT EXISTS migration_history (
+  id TEXT PRIMARY KEY,
+  statement TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+)`;
+
+interface MigrationDefinition {
+  id: string;
+  statement: string;
+}
+
+const migrationDefinitions: MigrationDefinition[] = [
+  ...createTableStatements.map((statement, index) => ({
+    id: `create_${index + 1}`,
+    statement,
+  })),
+  ...alterStatements.map((statement, index) => ({
+    id: `alter_${index + 1}`,
+    statement,
+  })),
+  ...createIndexStatements.map((statement, index) => ({
+    id: `index_${index + 1}`,
+    statement,
+  })),
 ];
 
 function isIgnorableMigrationError(error: unknown): boolean {
@@ -179,23 +216,40 @@ function isIgnorableMigrationError(error: unknown): boolean {
   return /duplicate column name|already exists|duplicate/i.test(error.message);
 }
 
-export const migrationStatements = [...createTableStatements, ...alterStatements];
+export const migrationStatements = migrationDefinitions.map((migration) => migration.statement);
 
 export async function runMigrations(
   client: CloudflareApiClient,
   databaseId: string,
 ): Promise<void> {
-  for (const statement of createTableStatements) {
-    await client.executeD1(databaseId, statement);
-  }
-  for (const statement of alterStatements) {
+  await client.executeD1(databaseId, migrationHistoryBootstrapStatement);
+  const appliedMigrations = new Set(
+    (
+      await client.queryD1<{ id: string }>(
+        databaseId,
+        "SELECT id FROM migration_history",
+      )
+    ).map((row) => row.id),
+  );
+
+  for (const migration of migrationDefinitions) {
+    if (appliedMigrations.has(migration.id)) {
+      continue;
+    }
     try {
-      await client.executeD1(databaseId, statement);
+      await client.executeD1(databaseId, migration.statement);
     } catch (error) {
       if (!isIgnorableMigrationError(error)) {
         throw error;
       }
     }
+    await client.executeD1(
+      databaseId,
+      `INSERT INTO migration_history (id, statement, applied_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO NOTHING`,
+      [migration.id, migration.statement, nowIso()],
+    );
   }
 }
 
@@ -560,15 +614,27 @@ export class D1AppRepository implements AppRepository {
   }
 
   public async listInstallRecords(kind?: InstallRecord["kind"]): Promise<InstallRecord[]> {
-    const records = await this.listJsonTable("install_record", InstallRecordSchema);
-    return kind ? records.filter((item) => item.kind === kind) : records;
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      kind
+        ? "SELECT data FROM install_record WHERE kind = ?"
+        : "SELECT data FROM install_record",
+      kind ? [kind] : [],
+    );
+    return rows.map((row) => InstallRecordSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveInstallRecord(record: InstallRecord): Promise<void> {
-    await this.saveJsonRow("install_record", {
-      id: record.id,
-      data: InstallRecordSchema.parse(record),
-    });
+    const parsed = InstallRecordSchema.parse(record);
+    await this.client.executeD1(
+      this.databaseId,
+      `INSERT INTO install_record (id, kind, data)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        kind = excluded.kind,
+        data = excluded.data`,
+      [parsed.id, parsed.kind, JSON.stringify(parsed)],
+    );
   }
 
   public async deleteInstallRecord(
@@ -738,16 +804,23 @@ export class D1AppRepository implements AppRepository {
     documentId?: string;
     workspaceId?: string;
   }): Promise<MemoryChunk[]> {
-    const rows = await this.listJsonTable("memory_chunk", MemoryChunkSchema);
-    return rows.filter((row) => {
-      if (args?.documentId && row.documentId !== args.documentId) {
-        return false;
-      }
-      if (args?.workspaceId && row.workspaceId !== args.workspaceId) {
-        return false;
-      }
-      return true;
-    });
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.documentId) {
+      predicates.push("json_extract(data, '$.documentId') = ?");
+      params.push(args.documentId);
+    }
+    if (args?.workspaceId) {
+      predicates.push("json_extract(data, '$.workspaceId') = ?");
+      params.push(args.workspaceId);
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data FROM memory_chunk${whereClause}`,
+      params,
+    );
+    return rows.map((row) => MemoryChunkSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveMemoryChunk(chunk: MemoryChunk): Promise<void> {

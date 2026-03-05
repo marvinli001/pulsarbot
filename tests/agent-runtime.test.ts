@@ -401,8 +401,8 @@ describe("AgentRuntime", () => {
     );
   });
 
-  it("enables native tool-calling path for openrouter and bailian providers", async () => {
-    for (const kind of ["openrouter", "bailian"] as const) {
+  it("enables native tool-calling path for gemini, openrouter, and bailian providers", async () => {
+    for (const kind of ["gemini", "openrouter", "bailian"] as const) {
       const memory = createMemoryStore();
       memory.listToolDescriptors = vi.fn(() => [
         {
@@ -421,7 +421,9 @@ describe("AgentRuntime", () => {
       const provider = createProviderProfile({
         kind,
         apiBaseUrl:
-          kind === "openrouter"
+          kind === "gemini"
+            ? "https://generativelanguage.googleapis.com/v1beta"
+            : kind === "openrouter"
             ? "https://openrouter.ai/api/v1"
             : "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
       });
