@@ -6,6 +6,7 @@ RUN apt-get update \
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+ENV CI=1
 
 RUN npm install -g pnpm@10.6.3
 
@@ -19,7 +20,7 @@ COPY infra ./infra
 
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @pulsarbot/server build
-RUN pnpm prune --prod
+RUN pnpm --config.confirmModulesPurge=false prune --prod
 
 RUN mkdir -p /runtime/apps/server /runtime/apps/admin /runtime/packages /runtime/market \
   && cp /app/package.json /app/pnpm-workspace.yaml /runtime/ \

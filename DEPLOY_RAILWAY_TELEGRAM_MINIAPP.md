@@ -126,6 +126,20 @@ curl -sS https://<your-domain>/healthz
 
 预期返回里包含 `"ok": true`。
 
+如果 Railway 日志里持续出现 `Healthcheck failed` / `service unavailable`，优先检查下面两项：
+
+1. 是否在**当前部署服务**里配置了这两个必需变量：
+   - `TELEGRAM_BOT_TOKEN`
+   - `PULSARBOT_ACCESS_TOKEN`
+2. 是否误把变量配在了另一个服务（Railway 导入 monorepo 时可能出现双服务）
+
+当前服务在缺少必需环境变量时会直接退出。最新版本会在启动日志中打印明确提示，例如：
+
+`Server failed to start due to invalid environment variables:`
+
+- `TELEGRAM_BOT_TOKEN: Required`
+- `PULSARBOT_ACCESS_TOKEN: Required`
+
 ### 3.6 关于“导入仓库后自动挂载 Volume”
 
 当前不能仅靠仓库内 `railway.json` 自动创建并挂载 Volume。原因是 Railway 的 Config as Code 仅覆盖 build/deploy 配置，不覆盖 Volume 资源本身。
