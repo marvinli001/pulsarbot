@@ -416,7 +416,12 @@ class RuntimeState {
       if (typeof handler !== "function") {
         return [];
       }
-      return (await (handler as () => Promise<T[]>)()) ?? [];
+      try {
+        return (await (handler as (this: typeof client) => Promise<T[]>).call(client)) ?? [];
+      } catch (error) {
+        logger.warn({ error, fn }, "Cloudflare resource listing failed");
+        return [];
+      }
     };
 
     return {

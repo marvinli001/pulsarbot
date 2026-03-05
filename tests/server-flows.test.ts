@@ -64,6 +64,39 @@ class FakeCloudflareClient {
     return [];
   }
 
+  public async listD1Databases() {
+    return [
+      {
+        uuid: `${this.credentials.accountId}-existing-d1`,
+        name: `${this.credentials.accountId}-existing-d1`,
+      },
+    ];
+  }
+
+  public async listR2Buckets() {
+    return [
+      {
+        name: `${this.credentials.accountId}-existing-r2`,
+      },
+    ];
+  }
+
+  public async listVectorizeIndexes() {
+    return [
+      {
+        name: `${this.credentials.accountId}-existing-vector`,
+      },
+    ];
+  }
+
+  public async listAiSearchIndexes() {
+    return [
+      {
+        name: `${this.credentials.accountId}-existing-ai-search`,
+      },
+    ];
+  }
+
   public async putR2Object(args: {
     bucketName: string;
     key: string;
@@ -521,6 +554,45 @@ afterEach(async () => {
 });
 
 describe("server flows", () => {
+  it("lists cloudflare resources without losing method context", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const { app, cookie } = await bootstrapApp(dataDir);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/bootstrap/cloudflare/resources",
+      headers: {
+        cookie,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      d1: [
+        {
+          uuid: "test-account-existing-d1",
+          name: "test-account-existing-d1",
+        },
+      ],
+      r2: [
+        {
+          name: "test-account-existing-r2",
+        },
+      ],
+      vectorize: [
+        {
+          name: "test-account-existing-vector",
+        },
+      ],
+      aiSearch: [
+        {
+          name: "test-account-existing-ai-search",
+        },
+      ],
+    });
+  });
+
   it("covers bootstrap, provider test, telegram turn, and export/import restore", async () => {
     const firstDir = await createTempDataDir();
     createdDirs.push(firstDir);
