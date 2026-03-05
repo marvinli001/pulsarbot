@@ -554,6 +554,98 @@ afterEach(async () => {
 });
 
 describe("server flows", () => {
+  it("keeps admin API session valid after bootstrap switches repository", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    process.env.NODE_ENV = "test";
+    process.env.TELEGRAM_BOT_TOKEN = "123456:TESTTOKEN";
+    process.env.PULSARBOT_ACCESS_TOKEN = "dev-access-token";
+    process.env.DATA_DIR = dataDir;
+    process.env.PORT = "3001";
+
+    const { createApp } = await importAppModule();
+    const app = await createApp({
+      env: {
+        NODE_ENV: "test",
+        TELEGRAM_BOT_TOKEN: "123456:TESTTOKEN",
+        PULSARBOT_ACCESS_TOKEN: "dev-access-token",
+        DATA_DIR: dataDir,
+        PORT: 3001,
+      },
+      cloudflareClientFactory: (credentials) =>
+        new FakeCloudflareClient(credentials) as never,
+      providerInvoker: fakeProviderInvoker,
+      providerMediaInvoker: fakeProviderMediaInvoker,
+      telegramFactory: fakeTelegramFactory as never,
+    });
+
+    const session = await app.inject({
+      method: "POST",
+      url: "/api/session/telegram",
+      payload: {
+        userId: "42",
+        username: "owner",
+      },
+    });
+    const initialCookie = getCookie(session);
+
+    await app.inject({
+      method: "POST",
+      url: "/api/bootstrap/verify-access-token",
+      payload: {
+        accessToken: "dev-access-token",
+      },
+    });
+
+    const connect = await app.inject({
+      method: "POST",
+      url: "/api/bootstrap/cloudflare/connect",
+      headers: {
+        cookie: initialCookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        accountId: "test-account",
+        apiToken: "test-token",
+      },
+    });
+    expect(connect.statusCode).toBe(200);
+
+    const initResources = await app.inject({
+      method: "POST",
+      url: "/api/bootstrap/cloudflare/init-resources",
+      headers: {
+        cookie: initialCookie,
+      },
+      payload: {
+        label: "Pulsarbot Test",
+        timezone: "UTC",
+      },
+    });
+    expect(initResources.statusCode).toBe(200);
+
+    const refreshedCookie = getCookie(initResources);
+    expect(refreshedCookie).toContain("pulsarbot_session=");
+
+    const workspace = await app.inject({
+      method: "GET",
+      url: "/api/workspace",
+      headers: {
+        cookie: refreshedCookie,
+      },
+    });
+    expect(workspace.statusCode).toBe(200);
+    expect(workspace.json()).toMatchObject({
+      bootstrapState: {
+        resourcesInitialized: true,
+      },
+      workspace: {
+        id: "main",
+      },
+    });
+  });
+
   it("lists cloudflare resources without losing method context", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);

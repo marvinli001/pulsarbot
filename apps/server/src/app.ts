@@ -1625,6 +1625,40 @@ export async function createApp(
     }
   };
 
+  const issueSession = async (
+    reply: FastifyReply,
+    args: { userId: string; username?: string },
+  ) => {
+    const workspace = await state.repository.getWorkspace();
+    const jti = createId("jwt");
+    const userId = args.userId || "dev-owner";
+    const token = await reply.jwtSign(
+      {
+        sub: userId,
+        username: args.username,
+        role: "owner",
+        jti,
+      },
+      {
+        expiresIn: "12h",
+      },
+    );
+
+    reply.setCookie("pulsarbot_session", token, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "lax",
+      secure: state.env.NODE_ENV === "production",
+    });
+
+    await state.repository.saveAuthSession({
+      workspaceId: workspace?.id ?? "bootstrap",
+      telegramUserId: userId,
+      jwtJti: jti,
+      expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 12).toISOString(),
+    });
+  };
+
   const audit = async (
     actorTelegramUserId: string,
     eventType: string,
@@ -2566,35 +2600,14 @@ export async function createApp(
     }
 
     const bootstrapState = await state.repository.getBootstrapState();
-    const jti = createId("jwt");
-    const token = await reply.jwtSign(
-      {
-        sub: user.userId || "dev-owner",
-        username: user.username,
-        role: "owner",
-        jti,
-      },
-      {
-        expiresIn: "12h",
-      },
-    );
-
-    reply.setCookie("pulsarbot_session", token, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "lax",
-      secure: state.env.NODE_ENV === "production",
-    });
-
-    await state.repository.saveAuthSession({
-      workspaceId: workspace?.id ?? "bootstrap",
-      telegramUserId: user.userId || "dev-owner",
-      jwtJti: jti,
-      expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 12).toISOString(),
-    });
+    const sessionUser = {
+      userId: user.userId || "dev-owner",
+      ...(user.username ? { username: user.username } : {}),
+    };
+    await issueSession(reply, sessionUser);
 
     return {
-      user,
+      user: sessionUser,
       bootstrapState,
       workspace,
       adminIdentity: await state.repository.getAdminIdentity(),
@@ -2742,6 +2755,10 @@ export async function createApp(
         bootstrapArgs.selection = body.selection;
       }
       await state.bootstrapWorkspace(bootstrapArgs);
+      await issueSession(reply, {
+        userId: user.sub ?? "dev-owner",
+        ...(user.username ? { username: user.username } : {}),
+      });
       await audit(user.sub ?? "dev-owner", "bootstrap_workspace", "workspace", "main");
       return {
         ok: true,

@@ -1,3 +1,34 @@
+let refreshSessionPromise: Promise<void> | null = null;
+
+async function refreshTelegramSession(): Promise<void> {
+  if (refreshSessionPromise) {
+    return refreshSessionPromise;
+  }
+
+  refreshSessionPromise = (async () => {
+    const response = await fetch("/api/session/telegram", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(devTelegramSessionPayload()),
+    });
+
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+
+    await response.json().catch(() => null);
+  })();
+
+  try {
+    await refreshSessionPromise;
+  } finally {
+    refreshSessionPromise = null;
+  }
+}
+
 export async function apiFetch<T>(
   input: string,
   init?: RequestInit,
@@ -7,11 +38,17 @@ export async function apiFetch<T>(
     headers.set("content-type", "application/json");
   }
 
-  const response = await fetch(input, {
+  const doFetch = () => fetch(input, {
     credentials: "include",
     headers,
     ...init,
   });
+  let response = await doFetch();
+
+  if (response.status === 401 && input !== "/api/session/telegram") {
+    await refreshTelegramSession();
+    response = await doFetch();
+  }
 
   if (!response.ok) {
     throw new Error(await response.text());
