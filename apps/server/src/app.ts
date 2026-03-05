@@ -156,6 +156,10 @@ function isMissingSecretError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Secret not found for scope:");
 }
 
+function isMissingProviderProfileError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("Provider profile not found:");
+}
+
 interface TelegramWebhookInfo {
   url?: string;
   has_custom_certificate?: boolean;
@@ -207,6 +211,24 @@ function normalizeWebhookUrlInput(input: string | undefined): string | null {
     }
     return new URL("/telegram/webhook", `${base}/`).toString();
   }
+}
+
+function parseTelegramUpdateId(payload: unknown): number | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  const value = record.update_id;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  return null;
 }
 
 function inferPublicBaseUrlFromRequest(request: FastifyRequest): string | null {
@@ -886,19 +908,15 @@ class RuntimeState {
     timezone?: string | undefined;
     timestamp: string;
   }) {
-    const primaryProviderProfileId = createId("provider");
-    const backgroundProviderProfileId = createId("provider");
-    const balancedProfileId = createId("agent");
-    const backgroundProfileId = createId("agent");
     const workspace = WorkspaceSchema.parse({
       id: args.workspaceId,
       label: args.label ?? "Pulsarbot Workspace",
       timezone: args.timezone ?? "UTC",
       ownerTelegramUserId: args.ownerTelegramUserId,
       ownerTelegramUsername: args.ownerTelegramUsername ?? null,
-      primaryModelProfileId: primaryProviderProfileId,
-      backgroundModelProfileId: backgroundProviderProfileId,
-      activeAgentProfileId: balancedProfileId,
+      primaryModelProfileId: null,
+      backgroundModelProfileId: null,
+      activeAgentProfileId: null,
       createdAt: args.timestamp,
       updatedAt: args.timestamp,
     });
@@ -915,115 +933,6 @@ class RuntimeState {
     for (const record of createDefaultInstallRecords(this.catalog)) {
       await this.repository.saveInstallRecord(record);
     }
-
-    const makeProvider = (
-      id: string,
-      label: string,
-      apiKeyRef: string,
-      stream: boolean,
-    ): ProviderProfile => ({
-      id,
-      kind: "openai",
-      label,
-      apiBaseUrl: "https://api.openai.com/v1",
-      apiKeyRef,
-      defaultModel: "gpt-4.1-mini",
-      visionModel: null,
-      audioModel: null,
-      documentModel: null,
-      stream,
-      reasoningEnabled: false,
-      reasoningLevel: "off",
-      thinkingBudget: null,
-      temperature: stream ? 0.2 : 0.1,
-      topP: null,
-      maxOutputTokens: stream ? 2048 : 1024,
-      toolCallingEnabled: stream,
-      jsonModeEnabled: stream,
-      visionEnabled: false,
-      audioInputEnabled: false,
-      documentInputEnabled: false,
-      headers: {},
-      extraBody: {},
-      enabled: true,
-      createdAt: args.timestamp,
-      updatedAt: args.timestamp,
-    });
-
-    await this.repository.saveProviderProfile(
-      makeProvider(
-        primaryProviderProfileId,
-        "Primary Provider",
-        "provider:primary:apiKey",
-        true,
-      ),
-    );
-    await this.repository.saveProviderProfile(
-      makeProvider(
-        backgroundProviderProfileId,
-        "Background Provider",
-        "provider:background:apiKey",
-        false,
-      ),
-    );
-
-    await this.repository.saveAgentProfile(
-      AgentProfileSchema.parse({
-        id: balancedProfileId,
-        label: "balanced",
-        description: "Default interactive Telegram profile.",
-        systemPrompt:
-          "You are Pulsarbot, a Telegram-native personal agent with tools, memory, and concise answers.",
-        primaryModelProfileId: primaryProviderProfileId,
-        backgroundModelProfileId: backgroundProviderProfileId,
-        embeddingModelProfileId: null,
-        enabledSkillIds: ["core-agent", "memory-core"],
-        enabledPluginIds: [
-          "time-context",
-          "native-google-search",
-          "native-bing-search",
-          "web-browse-fetcher",
-          "document-processor",
-        ],
-        enabledMcpServerIds: [],
-        maxPlanningSteps: 8,
-        maxToolCalls: 6,
-        maxTurnDurationMs: 30_000,
-        maxToolDurationMs: 15_000,
-        compactSoftThreshold: 0.7,
-        compactHardThreshold: 0.85,
-        allowNetworkTools: true,
-        allowWriteTools: true,
-        allowMcpTools: true,
-        createdAt: args.timestamp,
-        updatedAt: args.timestamp,
-      }),
-    );
-    await this.repository.saveAgentProfile(
-      AgentProfileSchema.parse({
-        id: backgroundProfileId,
-        label: "background-low-cost",
-        description: "Compact and summarize conversations.",
-        systemPrompt: "You summarize and compact conversations for Pulsarbot.",
-        primaryModelProfileId: backgroundProviderProfileId,
-        backgroundModelProfileId: null,
-        embeddingModelProfileId: null,
-        enabledSkillIds: ["core-agent"],
-        enabledPluginIds: ["time-context"],
-        enabledMcpServerIds: [],
-        maxPlanningSteps: 2,
-        maxToolCalls: 1,
-        maxTurnDurationMs: 15_000,
-        maxToolDurationMs: 10_000,
-        compactSoftThreshold: 0.7,
-        compactHardThreshold: 0.85,
-        allowNetworkTools: false,
-        allowWriteTools: true,
-        allowMcpTools: false,
-        createdAt: args.timestamp,
-        updatedAt: args.timestamp,
-      }),
-    );
   }
 
   public async exportBundle(exportPassphrase: string) {
@@ -1352,6 +1261,7 @@ function normalizeTelegramPayload(
   payload:
     | TelegramUpdatePayload
     | {
+        updateId?: number | null;
         chatId: number;
         threadId?: number | null;
         userId: number;
@@ -1363,11 +1273,13 @@ function normalizeTelegramPayload(
   if ("content" in payload && payload.content) {
     return {
       ...payload,
+      updateId: payload.updateId ?? null,
       threadId: payload.threadId ?? null,
     };
   }
 
   return {
+    updateId: payload.updateId ?? null,
     chatId: payload.chatId,
     threadId: payload.threadId ?? null,
     userId: payload.userId,
@@ -2764,7 +2676,15 @@ export async function createApp(
         );
         const normalizedText = processedPayload.normalizedText;
         const document = processedPayload.document;
-        const runtime = await state.resolveRuntime(profile);
+        let runtime: ResolvedRuntimeSnapshot;
+        try {
+          runtime = await state.resolveRuntime(profile);
+        } catch (error) {
+          if (isMissingProviderProfileError(error)) {
+            return "No provider is configured for the active profile yet. Open the Mini App to add one.";
+          }
+          throw error;
+        }
         await state.repository.appendConversationMessage(conversationId, {
           id: createId("msg"),
           conversationId,
@@ -2775,6 +2695,7 @@ export async function createApp(
           metadata: {
             ...payload.content.metadata,
             threadId: payload.threadId,
+            ...(payload.updateId !== null ? { updateId: payload.updateId } : {}),
             ...(document ? { documentId: document.id } : {}),
           },
           createdAt: nowIso(),
@@ -3290,17 +3211,42 @@ export async function createApp(
     "/api/providers/:id",
     { preHandler: requireOwner },
     async (request) => {
-      const body = (request.body ?? {}) as { accessToken?: string };
-      if (body.accessToken !== state.env.PULSARBOT_ACCESS_TOKEN) {
-        throw app.httpErrors.unauthorized("Invalid access token");
-      }
       const id = (request.params as { id: string }).id;
+      const providers = await state.repository.listProviderProfiles();
+      const target = providers.find((item) => item.id === id);
+      if (!target) {
+        throw app.httpErrors.notFound("Provider not found");
+      }
       await state.repository.deleteProviderProfile(id);
+      const workspace = await state.repository.getWorkspace();
+      if (workspace) {
+        const nextPrimary = workspace.primaryModelProfileId === id
+          ? null
+          : workspace.primaryModelProfileId;
+        const nextBackground = workspace.backgroundModelProfileId === id
+          ? null
+          : workspace.backgroundModelProfileId;
+        if (
+          nextPrimary !== workspace.primaryModelProfileId ||
+          nextBackground !== workspace.backgroundModelProfileId
+        ) {
+          await state.repository.saveWorkspace({
+            ...workspace,
+            primaryModelProfileId: nextPrimary,
+            backgroundModelProfileId: nextBackground,
+            updatedAt: nowIso(),
+          });
+        }
+      }
       await audit(
         (request.user as { sub?: string }).sub ?? "unknown",
         "delete_provider",
         "provider_profile",
         id,
+        {
+          kind: target.kind,
+          label: target.label,
+        },
       );
       return { ok: true };
     },
@@ -4099,7 +4045,58 @@ export async function createApp(
     },
   );
 
-  app.post("/telegram/webhook", async (request, reply) => telegram.handler(request, reply));
+  app.post("/telegram/webhook", async (request, reply) => {
+    const updateId = parseTelegramUpdateId(request.body);
+    let claimed = false;
+
+    if (updateId !== null) {
+      try {
+        const claimResult = await state.repository.claimTelegramUpdate(updateId, isoAfter(120_000));
+        if (claimResult === "duplicate") {
+          return reply.code(200).send({
+            ok: true,
+            ignored: true,
+            reason: claimResult,
+          });
+        }
+        if (claimResult === "in_progress") {
+          return reply.code(409).send({
+            ok: false,
+            error: "Update is still being processed",
+            reason: claimResult,
+          });
+        }
+        claimed = true;
+      } catch (error) {
+        logger.error({ error, updateId }, "Failed to claim Telegram update lock");
+      }
+    }
+
+    try {
+      await telegram.handler(request, reply);
+      if (!claimed || updateId === null) {
+        return;
+      }
+
+      if (reply.statusCode >= 500) {
+        await state.repository.releaseTelegramUpdate(updateId);
+      } else {
+        await state.repository.completeTelegramUpdate(updateId);
+      }
+    } catch (error) {
+      if (claimed && updateId !== null) {
+        try {
+          await state.repository.releaseTelegramUpdate(updateId);
+        } catch (releaseError) {
+          logger.warn(
+            { error: releaseError, updateId },
+            "Failed to release Telegram update lock after handler failure",
+          );
+        }
+      }
+      throw error;
+    }
+  });
 
   return app;
 }

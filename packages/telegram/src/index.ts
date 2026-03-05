@@ -3,6 +3,7 @@ import { nowIso } from "@pulsarbot/core";
 import type { TelegramInboundContent } from "@pulsarbot/shared";
 
 export interface TelegramUpdatePayload {
+  updateId: number | null;
   chatId: number;
   threadId: number | null;
   userId: number;
@@ -80,6 +81,19 @@ function parseThreadId(value: unknown): number | null {
 }
 
 function parseChatId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  return null;
+}
+
+function parseUpdateId(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
   }
@@ -222,22 +236,26 @@ async function dispatchMessage(args: {
   }
 
   const updateRecord = ctx.update as unknown as Record<string, unknown>;
+  const updateId = parseUpdateId(updateRecord.update_id);
   const threadContext = readThreadContext(updateRecord.message ?? ctx.msg);
-  let placeholder;
   try {
-    placeholder = await ctx.reply("Thinking…", threadContext.replyOptions);
+    await ctx.api.sendChatAction(
+      ctx.chat!.id,
+      "typing",
+      threadContext.replyOptions,
+    );
   } catch {
-    placeholder = await ctx.reply("Thinking…");
+    // Ignore typing indicator errors to keep webhook processing resilient.
   }
   const controller = createTelegramStreamController({
     ctx,
-    placeholderMessageId: placeholder.message_id,
     ...(threadContext.replyOptions
       ? { replyOptions: threadContext.replyOptions }
       : {}),
   });
   const reply = await onMessage(
     {
+      updateId,
       chatId: ctx.chat!.id,
       threadId: threadContext.threadId,
       userId: ctx.from!.id,
@@ -261,9 +279,9 @@ function normalizeTelegramError(error: unknown): string {
 
 export function createTelegramStreamController(args: {
   ctx: Context;
-  placeholderMessageId: number;
   replyOptions?: ThreadReplyOptions;
 }): TelegramResponseStreamController {
+  let responseMessageId: number | null = null;
   let latestText = "";
   let lastRenderedText = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -277,14 +295,26 @@ export function createTelegramStreamController(args: {
     if (closed || !latestText || latestText === lastRenderedText) {
       return true;
     }
-    if (!force && editCount >= maxEdits) {
+    if (!force && responseMessageId !== null && editCount >= maxEdits) {
       return false;
+    }
+
+    if (responseMessageId === null) {
+      try {
+        const message = await args.ctx.reply(latestText, args.replyOptions);
+        responseMessageId = message.message_id;
+        lastRenderedText = latestText;
+        lastFlushAt = Date.now();
+        return true;
+      } catch {
+        return false;
+      }
     }
 
     try {
       await args.ctx.api.editMessageText(
         args.ctx.chat!.id,
-        args.placeholderMessageId,
+        responseMessageId,
         latestText,
       );
       lastRenderedText = latestText;
@@ -302,7 +332,7 @@ export function createTelegramStreamController(args: {
   };
 
   const scheduleFlush = () => {
-    if (closed || timer || editCount >= maxEdits) {
+    if (closed || timer || (responseMessageId !== null && editCount >= maxEdits)) {
       return;
     }
     const delay = Math.max(0, throttleMs - (Date.now() - lastFlushAt));
@@ -334,10 +364,15 @@ export function createTelegramStreamController(args: {
         timer = null;
       }
       latestText = finalText || latestText;
+      if (!latestText) {
+        closed = true;
+        return;
+      }
       const rendered = await flush(true);
-      if (!rendered && latestText) {
+      if (!rendered && responseMessageId === null && latestText) {
         try {
-          await args.ctx.reply(latestText, args.replyOptions);
+          const message = await args.ctx.reply(latestText, args.replyOptions);
+          responseMessageId = message.message_id;
           lastRenderedText = latestText;
         } catch {
           // Do not throw from finalize if Telegram rejects fallback send.
@@ -518,6 +553,7 @@ export function createTelegramBot(args: {
     }
     const reply = await args.onMessage(
       {
+        updateId: parseUpdateId((ctx.update as Record<string, unknown>).update_id),
         chatId: ctx.chat!.id,
         threadId: threadContext.threadId,
         userId: ctx.from.id,

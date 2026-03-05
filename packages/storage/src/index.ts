@@ -163,6 +163,14 @@ const createTableStatements = [
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS telegram_update_receipt (
+    id TEXT PRIMARY KEY,
+    update_id INTEGER NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    lock_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
 ];
 
 const createIndexStatements = [
@@ -174,6 +182,7 @@ const createIndexStatements = [
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_workspace_id ON memory_chunk(json_extract(data, '$.workspaceId'))",
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
   "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
+  "CREATE INDEX IF NOT EXISTS idx_telegram_update_receipt_status ON telegram_update_receipt(status, updated_at)",
 ];
 
 const alterStatements = [
@@ -332,6 +341,7 @@ export function rewrapSecret(args: {
 }
 
 export type ConversationMessage = MessageRecord;
+type TelegramUpdateClaimResult = "claimed" | "duplicate" | "in_progress";
 
 export interface AppRepository {
   getWorkspace(): Promise<Workspace | null>;
@@ -394,6 +404,12 @@ export interface AppRepository {
     conversationId: string,
     message: ConversationMessage,
   ): Promise<void>;
+  claimTelegramUpdate(
+    updateId: number,
+    lockExpiresAt: string,
+  ): Promise<TelegramUpdateClaimResult>;
+  completeTelegramUpdate(updateId: number): Promise<void>;
+  releaseTelegramUpdate(updateId: number): Promise<void>;
   listAuditEvents(limit?: number): Promise<AuditEvent[]>;
   saveAuditEvent(event: AuditEvent): Promise<void>;
   listImportExportRuns(limit?: number): Promise<ImportExportRun[]>;
@@ -1003,6 +1019,82 @@ export class D1AppRepository implements AppRepository {
     );
   }
 
+  public async claimTelegramUpdate(
+    updateId: number,
+    lockExpiresAt: string,
+  ): Promise<TelegramUpdateClaimResult> {
+    const lockId = `tgupd:${updateId}`;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const existingRows = await this.client.queryD1<{
+        status: string;
+        lock_expires_at: string | null;
+      }>(
+        this.databaseId,
+        "SELECT status, lock_expires_at FROM telegram_update_receipt WHERE update_id = ? LIMIT 1",
+        [updateId],
+      );
+      const existing = existingRows[0];
+
+      if (existing) {
+        if (existing.status === "completed") {
+          return "duplicate";
+        }
+        if (
+          existing.status === "processing" &&
+          existing.lock_expires_at &&
+          Date.parse(existing.lock_expires_at) > Date.now()
+        ) {
+          return "in_progress";
+        }
+        await this.client.executeD1(
+          this.databaseId,
+          "DELETE FROM telegram_update_receipt WHERE update_id = ? AND status = 'processing'",
+          [updateId],
+        );
+      }
+
+      try {
+        const timestamp = nowIso();
+        await this.client.executeD1(
+          this.databaseId,
+          `INSERT INTO telegram_update_receipt (
+            id, update_id, status, lock_expires_at, created_at, updated_at
+          ) VALUES (?, ?, 'processing', ?, ?, ?)`,
+          [lockId, updateId, lockExpiresAt, timestamp, timestamp],
+        );
+        return "claimed";
+      } catch (error) {
+        if (error instanceof Error && /unique|constraint/i.test(error.message)) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    return "in_progress";
+  }
+
+  public async completeTelegramUpdate(updateId: number): Promise<void> {
+    await this.client.executeD1(
+      this.databaseId,
+      `UPDATE telegram_update_receipt
+      SET status = 'completed',
+          lock_expires_at = NULL,
+          updated_at = ?
+      WHERE update_id = ?`,
+      [nowIso(), updateId],
+    );
+  }
+
+  public async releaseTelegramUpdate(updateId: number): Promise<void> {
+    await this.client.executeD1(
+      this.databaseId,
+      "DELETE FROM telegram_update_receipt WHERE update_id = ? AND status = 'processing'",
+      [updateId],
+    );
+  }
+
   public async listAuditEvents(limit = 50): Promise<AuditEvent[]> {
     const rows = await this.listJsonTable("audit_event", AuditEventSchema);
     return rows
@@ -1112,6 +1204,11 @@ export class InMemoryAppRepository implements AppRepository {
   private auditEvents = new Map<string, AuditEvent>();
   private importExportRuns = new Map<string, ImportExportRun>();
   private providerTestRuns = new Map<string, ProviderTestRun>();
+  private telegramUpdates = new Map<number, {
+    status: "processing" | "completed";
+    lockExpiresAt: string | null;
+    updatedAt: string;
+  }>();
 
   public async getWorkspace(): Promise<Workspace | null> {
     return this.workspace;
@@ -1427,6 +1524,49 @@ export class InMemoryAppRepository implements AppRepository {
     const list = this.messages.get(conversationId) ?? [];
     list.push(parsed);
     this.messages.set(conversationId, list);
+  }
+
+  public async claimTelegramUpdate(
+    updateId: number,
+    lockExpiresAt: string,
+  ): Promise<TelegramUpdateClaimResult> {
+    const existing = this.telegramUpdates.get(updateId);
+    if (existing?.status === "completed") {
+      return "duplicate";
+    }
+    if (
+      existing?.status === "processing" &&
+      existing.lockExpiresAt &&
+      Date.parse(existing.lockExpiresAt) > Date.now()
+    ) {
+      return "in_progress";
+    }
+    this.telegramUpdates.set(updateId, {
+      status: "processing",
+      lockExpiresAt,
+      updatedAt: nowIso(),
+    });
+    return "claimed";
+  }
+
+  public async completeTelegramUpdate(updateId: number): Promise<void> {
+    const existing = this.telegramUpdates.get(updateId);
+    if (!existing) {
+      return;
+    }
+    this.telegramUpdates.set(updateId, {
+      status: "completed",
+      lockExpiresAt: null,
+      updatedAt: nowIso(),
+    });
+  }
+
+  public async releaseTelegramUpdate(updateId: number): Promise<void> {
+    const existing = this.telegramUpdates.get(updateId);
+    if (!existing || existing.status !== "processing") {
+      return;
+    }
+    this.telegramUpdates.delete(updateId);
   }
 
   public async listAuditEvents(limit = 50): Promise<AuditEvent[]> {

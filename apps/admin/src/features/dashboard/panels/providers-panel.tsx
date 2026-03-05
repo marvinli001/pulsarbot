@@ -156,9 +156,6 @@ export function ProvidersPanel() {
     mutationFn: (id: string) =>
       apiFetch(`/api/providers/${id}`, {
         method: "DELETE",
-        body: JSON.stringify({
-          accessToken: accessTokenConfirmation,
-        }),
       }),
     onSuccess: async () => {
       notificationOccurred("success");
@@ -252,12 +249,13 @@ export function ProvidersPanel() {
   });
 
   const thinkingBudgetOptions = thinkingBudgetOptionsForProvider(form.kind);
+  const configuredProviders = providers.data ?? [];
 
   return (
     <div className="grid gap-6 xl:grid-cols-[1.1fr,0.9fr]">
       <Panel title="Configured Providers" subtitle="原生 OpenAI / Claude / Gemini / OpenRouter / 百炼 / Compatible provider 档位。">
         <div className="space-y-3">
-          {providers.data?.map((provider) => (
+          {configuredProviders.length > 0 ? configuredProviders.map((provider) => (
             <div
               key={String(provider.id)}
               className="rounded-2xl border border-slate-200 p-4"
@@ -341,7 +339,6 @@ export function ProvidersPanel() {
                   <Button
                     type="button"
                     tone="ghost"
-                    disabled={!accessTokenConfirmation}
                     onClick={() => deleteMutation.mutate(String(provider.id))}
                   >
                     Delete
@@ -361,7 +358,14 @@ export function ProvidersPanel() {
                 }
               />
             </div>
-          ))}
+          )) : (
+            <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-4">
+              <p className="font-medium text-slate-900">No providers configured yet.</p>
+              <p className="mt-1 text-sm text-slate-600">
+                点击下方 <span className="font-medium">Create Provider</span> 添加至少一个模型提供商，然后在 Workspace / Profiles 里绑定它。
+              </p>
+            </div>
+          )}
         </div>
       </Panel>
       <div className="grid gap-6">

@@ -345,6 +345,7 @@ function buildFakeTelegramContent(message: Record<string, any>, body: Record<str
 const fakeTelegramFactory = ({ onMessage }: {
   onMessage: (
     payload: {
+      updateId: number | null;
       chatId: number;
       threadId: number | null;
       userId: number;
@@ -366,6 +367,9 @@ const fakeTelegramFactory = ({ onMessage }: {
     const rawThreadId = message.message_thread_id ?? body.messageThreadId ?? body.threadId;
     const parsedThreadId = Number(rawThreadId);
     const response = await onMessage({
+      updateId: Number.isFinite(Number(body.update_id))
+        ? Math.trunc(Number(body.update_id))
+        : null,
       chatId: Number(message.chat?.id ?? body.chatId ?? 1),
       threadId: Number.isFinite(parsedThreadId) ? Math.trunc(parsedThreadId) : null,
       username: message.from?.username ?? body.username,
@@ -517,20 +521,124 @@ async function upsertPrimaryProviderApiKey(
   app: Awaited<ReturnType<typeof bootstrapApp>>["app"],
   cookie: string,
 ) {
-  const providersResponse = await app.inject({
-    method: "GET",
-    url: "/api/providers",
-    headers: {
-      cookie,
-    },
-  });
-  const providers = providersResponse.json<Array<Record<string, any>>>();
-  const primary = providers.find((provider) => provider.label === "Primary Provider");
-  expect(primary).toBeTruthy();
+  const ensurePrimaryProvider = async () => {
+    const providersResponse = await app.inject({
+      method: "GET",
+      url: "/api/providers",
+      headers: {
+        cookie,
+      },
+    });
+    const providers = providersResponse.json<Array<Record<string, any>>>();
+    if (providers[0]) {
+      return providers[0];
+    }
 
-  await app.inject({
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/providers",
+      headers: {
+        cookie,
+      },
+      payload: {
+        label: "Primary Provider",
+        kind: "openai",
+        apiBaseUrl: "https://api.openai.com/v1",
+        defaultModel: "gpt-4.1-mini",
+        stream: true,
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    return created.json<Record<string, any>>();
+  };
+
+  const ensureBalancedProfile = async (primaryProviderId: string) => {
+    for (const [kind, manifestId] of [
+      ["skills", "core-agent"],
+      ["skills", "memory-core"],
+      ["plugins", "time-context"],
+      ["plugins", "native-google-search"],
+      ["plugins", "native-bing-search"],
+      ["plugins", "web-browse-fetcher"],
+      ["plugins", "document-processor"],
+    ] as const) {
+      const enable = await app.inject({
+        method: "POST",
+        url: `/api/market/${kind}/${manifestId}/enable`,
+        headers: {
+          cookie,
+        },
+      });
+      expect(enable.statusCode).toBe(200);
+    }
+
+    const payload = {
+      label: "balanced",
+      description: "Default interactive Telegram profile.",
+      systemPrompt:
+        "You are Pulsarbot, a Telegram-native personal agent with tools, memory, and concise answers.",
+      primaryModelProfileId: primaryProviderId,
+      backgroundModelProfileId: null,
+      embeddingModelProfileId: null,
+      enabledSkillIds: ["core-agent", "memory-core"],
+      enabledPluginIds: [
+        "time-context",
+        "native-google-search",
+        "native-bing-search",
+        "web-browse-fetcher",
+        "document-processor",
+      ],
+      enabledMcpServerIds: [],
+      maxPlanningSteps: 8,
+      maxToolCalls: 6,
+      maxTurnDurationMs: 30_000,
+      maxToolDurationMs: 15_000,
+      compactSoftThreshold: 0.7,
+      compactHardThreshold: 0.85,
+      allowNetworkTools: true,
+      allowWriteTools: true,
+      allowMcpTools: true,
+    };
+
+    const profilesResponse = await app.inject({
+      method: "GET",
+      url: "/api/agent-profiles",
+      headers: {
+        cookie,
+      },
+    });
+    const profiles = profilesResponse.json<Array<Record<string, any>>>();
+    const existing = profiles.find((item) => item.label === "balanced") ?? profiles[0];
+    if (existing) {
+      const updated = await app.inject({
+        method: "PUT",
+        url: `/api/agent-profiles/${String(existing.id)}`,
+        headers: {
+          cookie,
+        },
+        payload,
+      });
+      expect(updated.statusCode).toBe(200);
+      return String(existing.id);
+    }
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/agent-profiles",
+      headers: {
+        cookie,
+      },
+      payload,
+    });
+    expect(created.statusCode).toBe(200);
+    return String(created.json<Record<string, any>>().id);
+  };
+
+  const primary = await ensurePrimaryProvider();
+
+  const providerUpdate = await app.inject({
     method: "PUT",
-    url: `/api/providers/${primary!.id}`,
+    url: `/api/providers/${primary.id}`,
     headers: {
       cookie,
     },
@@ -540,8 +648,71 @@ async function upsertPrimaryProviderApiKey(
       accessToken: "dev-access-token",
     },
   });
+  expect(providerUpdate.statusCode).toBe(200);
 
-  return primary!.id as string;
+  const profileId = await ensureBalancedProfile(String(primary.id));
+
+  const workspaceResponse = await app.inject({
+    method: "GET",
+    url: "/api/workspace",
+    headers: {
+      cookie,
+    },
+  });
+  const workspace = workspaceResponse.json<Record<string, any>>().workspace as Record<string, any>;
+  if (
+    workspace.primaryModelProfileId !== String(primary.id) ||
+    workspace.activeAgentProfileId !== profileId
+  ) {
+    const workspaceUpdate = await app.inject({
+      method: "PUT",
+      url: "/api/workspace",
+      headers: {
+        cookie,
+      },
+      payload: {
+        primaryModelProfileId: String(primary.id),
+        activeAgentProfileId: profileId,
+      },
+    });
+    expect(workspaceUpdate.statusCode).toBe(200);
+  }
+
+  return String(primary.id);
+}
+
+async function ensurePrimaryProviderWithoutApiKey(
+  app: Awaited<ReturnType<typeof bootstrapApp>>["app"],
+  cookie: string,
+) {
+  const providersResponse = await app.inject({
+    method: "GET",
+    url: "/api/providers",
+    headers: {
+      cookie,
+    },
+  });
+  const providers = providersResponse.json<Array<Record<string, any>>>();
+  if (providers[0]) {
+    return String(providers[0].id);
+  }
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/providers",
+    headers: {
+      cookie,
+    },
+    payload: {
+      label: "Primary Provider",
+      kind: "openai",
+      apiBaseUrl: "https://api.openai.com/v1",
+      defaultModel: "gpt-4.1-mini",
+      stream: true,
+    },
+  });
+  expect(created.statusCode).toBe(200);
+  return String(created.json<Record<string, any>>().id);
 }
 
 const createdDirs: string[] = [];
@@ -696,20 +867,11 @@ describe("server flows", () => {
     createdDirs.push(dataDir);
 
     const { app, cookie } = await bootstrapApp(dataDir);
-    const providersResponse = await app.inject({
-      method: "GET",
-      url: "/api/providers",
-      headers: {
-        cookie,
-      },
-    });
-    const providers = providersResponse.json<Array<Record<string, any>>>();
-    const primary = providers.find((provider) => provider.label === "Primary Provider");
-    expect(primary).toBeTruthy();
+    const providerId = await ensurePrimaryProviderWithoutApiKey(app, cookie);
 
     const providerTest = await app.inject({
       method: "POST",
-      url: `/api/providers/${String(primary!.id)}/test`,
+      url: `/api/providers/${providerId}/test`,
       headers: {
         cookie,
       },
@@ -721,7 +883,7 @@ describe("server flows", () => {
     expect(providerTest.statusCode).toBe(200);
     expect(providerTest.json()).toMatchObject({
       ok: false,
-      providerId: String(primary!.id),
+      providerId,
       requestedCapabilities: ["text"],
       results: [
         {
@@ -737,25 +899,15 @@ describe("server flows", () => {
     createdDirs.push(dataDir);
 
     const { app, cookie } = await bootstrapApp(dataDir);
-    const providersResponse = await app.inject({
-      method: "GET",
-      url: "/api/providers",
-      headers: {
-        cookie,
-      },
-    });
-    const providers = providersResponse.json<Array<Record<string, any>>>();
-    const primary = providers.find((provider) => provider.label === "Primary Provider");
-    expect(primary).toBeTruthy();
+    const providerId = await ensurePrimaryProviderWithoutApiKey(app, cookie);
 
     const updateResponse = await app.inject({
       method: "PUT",
-      url: `/api/providers/${String(primary!.id)}`,
+      url: `/api/providers/${providerId}`,
       headers: {
         cookie,
       },
       payload: {
-        ...primary,
         reasoningEnabled: true,
         reasoningLevel: "High",
       },
@@ -763,7 +915,7 @@ describe("server flows", () => {
 
     expect(updateResponse.statusCode).toBe(200);
     expect(updateResponse.json()).toMatchObject({
-      id: String(primary!.id),
+      id: providerId,
       reasoningEnabled: true,
       reasoningLevel: "high",
     });
@@ -1340,6 +1492,48 @@ describe("server flows", () => {
       });
       return response.json<Record<string, any>>().activeTurnLocks.length === 0;
     }, 5_000, 50);
+
+    await appState.app.close();
+  });
+
+  it("deduplicates repeated Telegram webhook deliveries by update_id", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const payload = {
+      update_id: 99123,
+      message: {
+        message_id: 321,
+        text: "duplicate check",
+        chat: { id: 7101 },
+        from: { id: 42, username: "owner" },
+      },
+    };
+
+    const firstDelivery = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload,
+    });
+    expect(firstDelivery.statusCode).toBe(200);
+    expect(firstDelivery.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+    });
+
+    const duplicateDelivery = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload,
+    });
+    expect(duplicateDelivery.statusCode).toBe(200);
+    expect(duplicateDelivery.json()).toMatchObject({
+      ok: true,
+      ignored: true,
+      reason: "duplicate",
+    });
 
     await appState.app.close();
   });
