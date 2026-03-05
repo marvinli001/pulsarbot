@@ -283,6 +283,28 @@ curl -sS "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 
 这是预期行为：生产环境要求 Telegram `initData`。请从 Telegram 客户端进入 Mini App。
 
+### 8.4 启动日志报错 `ERR_MODULE_NOT_FOUND: @fastify/cookie`
+
+如果日志类似：
+
+- `Cannot find package '@fastify/cookie' imported from /app/apps/server/dist/index.js`
+
+这不是业务代码问题，而是镜像打包阶段把 monorepo 的运行时依赖裁掉了。常见于旧版 Dockerfile 使用：
+
+- `pnpm prune --prod`
+- 手动 `cp -R /app/node_modules /runtime/node_modules`
+
+处理方式：
+
+1. 确认已部署包含最新 Dockerfile 的提交（`infra/docker/Dockerfile`）；
+2. 在 Railway 构建日志中确认出现：
+   - `pnpm --filter @pulsarbot/server deploy --prod --legacy /runtime/apps/server`
+3. 同时确认不再出现：
+   - `pnpm prune --prod`
+4. 重新执行 `Deploy latest commit`。
+
+补充：如果你已经改了仓库但日志仍显示旧命令，通常是服务没有读取到最新 Config as Code，先检查服务的配置文件路径是否指向根目录 `railway.json`（或 `infra/railway/railway.json`），再重新部署。
+
 ## 9. 上线后最小自检清单
 
 - `GET /healthz` 正常

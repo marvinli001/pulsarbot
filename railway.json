@@ -17,7 +17,7 @@
     ]
   },
   "deploy": {
-    "startCommand": "node apps/server/dist/index.js",
+    "startCommand": "node /app/apps/server/dist/index.js",
     "healthcheckPath": "/healthz",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
