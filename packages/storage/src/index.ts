@@ -23,6 +23,8 @@ import {
   SearchSettingsSchema,
   SecretEnvelopeSchema,
   ToolRunRecordSchema,
+  TurnEventSchema,
+  TurnStateSchema,
   WorkspaceSchema,
   type AdminIdentity,
   type AgentProfile,
@@ -45,6 +47,8 @@ import {
   type SearchSettings,
   type SecretEnvelope,
   type ToolRunRecord,
+  type TurnEvent,
+  type TurnState,
   type Workspace,
 } from "@pulsarbot/shared";
 
@@ -171,6 +175,14 @@ const createTableStatements = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS turn_state_snapshot (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS turn_event (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
 ];
 
 const createIndexStatements = [
@@ -183,6 +195,10 @@ const createIndexStatements = [
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
   "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
   "CREATE INDEX IF NOT EXISTS idx_telegram_update_receipt_status ON telegram_update_receipt(status, updated_at)",
+  "CREATE INDEX IF NOT EXISTS idx_turn_event_turn_seq ON turn_event(json_extract(data, '$.turnId'), json_extract(data, '$.seq'))",
+  "CREATE INDEX IF NOT EXISTS idx_turn_event_occurred_at ON turn_event(json_extract(data, '$.occurredAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_turn_state_turn_id ON turn_state_snapshot(json_extract(data, '$.turnId'))",
+  "CREATE INDEX IF NOT EXISTS idx_turn_state_updated_at ON turn_state_snapshot(json_extract(data, '$.updatedAt'))",
 ];
 
 const alterStatements = [
@@ -400,10 +416,25 @@ export interface AppRepository {
   listConversations(): Promise<ConversationRecord[]>;
   saveConversation(conversation: ConversationRecord): Promise<void>;
   listConversationMessages(conversationId: string): Promise<ConversationMessage[]>;
+  saveConversationMessage(
+    conversationId: string,
+    message: ConversationMessage,
+  ): Promise<void>;
   appendConversationMessage(
     conversationId: string,
     message: ConversationMessage,
   ): Promise<void>;
+  getLatestTurnState(turnId: string): Promise<TurnState | null>;
+  saveTurnStateSnapshot(state: TurnState): Promise<void>;
+  appendTurnEvent(event: TurnEvent): Promise<void>;
+  listTurnEvents(
+    turnId: string,
+    args?: {
+      cursorSeq?: number;
+      limit?: number;
+    },
+  ): Promise<TurnEvent[]>;
+  pruneTurnEventsOlderThan(cutoffIso: string): Promise<number>;
   claimTelegramUpdate(
     updateId: number,
     lockExpiresAt: string,
@@ -997,6 +1028,13 @@ export class D1AppRepository implements AppRepository {
     conversationId: string,
     message: ConversationMessage,
   ): Promise<void> {
+    await this.saveConversationMessage(conversationId, message);
+  }
+
+  public async saveConversationMessage(
+    conversationId: string,
+    message: ConversationMessage,
+  ): Promise<void> {
     const parsed = MessageRecordSchema.parse({
       ...message,
       conversationId,
@@ -1005,7 +1043,14 @@ export class D1AppRepository implements AppRepository {
       this.databaseId,
       `INSERT INTO message (
         id, conversation_id, role, content, source_type, telegram_message_id, metadata_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        conversation_id = excluded.conversation_id,
+        role = excluded.role,
+        content = excluded.content,
+        source_type = excluded.source_type,
+        telegram_message_id = excluded.telegram_message_id,
+        metadata_json = excluded.metadata_json`,
       [
         parsed.id,
         conversationId,
@@ -1017,6 +1062,81 @@ export class D1AppRepository implements AppRepository {
         parsed.createdAt,
       ],
     );
+  }
+
+  public async getLatestTurnState(turnId: string): Promise<TurnState | null> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data FROM turn_state_snapshot
+      WHERE json_extract(data, '$.turnId') = ?
+      ORDER BY json_extract(data, '$.updatedAt') DESC
+      LIMIT 1`,
+      [turnId],
+    );
+    const row = rows[0];
+    return row ? TurnStateSchema.parse(JSON.parse(row.data)) : null;
+  }
+
+  public async saveTurnStateSnapshot(state: TurnState): Promise<void> {
+    await this.saveJsonRow("turn_state_snapshot", {
+      id: state.id,
+      data: TurnStateSchema.parse(state),
+    });
+  }
+
+  public async appendTurnEvent(event: TurnEvent): Promise<void> {
+    const parsed = TurnEventSchema.parse(event);
+    await this.client.executeD1(
+      this.databaseId,
+      `INSERT INTO turn_event (id, data)
+      VALUES (?, ?)
+      ON CONFLICT(id) DO NOTHING`,
+      [parsed.id, JSON.stringify(parsed)],
+    );
+  }
+
+  public async listTurnEvents(
+    turnId: string,
+    args?: {
+      cursorSeq?: number;
+      limit?: number;
+    },
+  ): Promise<TurnEvent[]> {
+    const limit = Math.min(Math.max(args?.limit ?? 100, 1), 500);
+    const predicates = ["json_extract(data, '$.turnId') = ?"];
+    const params: unknown[] = [turnId];
+
+    if (typeof args?.cursorSeq === "number") {
+      predicates.push("CAST(json_extract(data, '$.seq') AS INTEGER) > ?");
+      params.push(args.cursorSeq);
+    }
+
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data FROM turn_event
+      WHERE ${predicates.join(" AND ")}
+      ORDER BY CAST(json_extract(data, '$.seq') AS INTEGER) ASC
+      LIMIT ?`,
+      [...params, limit],
+    );
+    return rows.map((row) => TurnEventSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async pruneTurnEventsOlderThan(cutoffIso: string): Promise<number> {
+    const staleIds = await this.client.queryD1<{ id: string }>(
+      this.databaseId,
+      `SELECT id FROM turn_event
+      WHERE json_extract(data, '$.occurredAt') < ?`,
+      [cutoffIso],
+    );
+    for (const row of staleIds) {
+      await this.client.executeD1(
+        this.databaseId,
+        "DELETE FROM turn_event WHERE id = ?",
+        [row.id],
+      );
+    }
+    return staleIds.length;
   }
 
   public async claimTelegramUpdate(
@@ -1201,6 +1321,8 @@ export class InMemoryAppRepository implements AppRepository {
   private jobs = new Map<string, JobRecord>();
   private conversations = new Map<string, ConversationRecord>();
   private messages = new Map<string, ConversationMessage[]>();
+  private turnStateSnapshots = new Map<string, TurnState>();
+  private turnEvents = new Map<string, TurnEvent>();
   private auditEvents = new Map<string, AuditEvent>();
   private importExportRuns = new Map<string, ImportExportRun>();
   private providerTestRuns = new Map<string, ProviderTestRun>();
@@ -1517,13 +1639,79 @@ export class InMemoryAppRepository implements AppRepository {
     conversationId: string,
     message: ConversationMessage,
   ): Promise<void> {
+    await this.saveConversationMessage(conversationId, message);
+  }
+
+  public async saveConversationMessage(
+    conversationId: string,
+    message: ConversationMessage,
+  ): Promise<void> {
     const parsed = MessageRecordSchema.parse({
       ...message,
       conversationId,
     });
     const list = this.messages.get(conversationId) ?? [];
-    list.push(parsed);
+    const existingIndex = list.findIndex((item) => item.id === parsed.id);
+    if (existingIndex >= 0) {
+      list[existingIndex] = parsed;
+    } else {
+      list.push(parsed);
+    }
+    list.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     this.messages.set(conversationId, list);
+  }
+
+  public async getLatestTurnState(turnId: string): Promise<TurnState | null> {
+    const states = [...this.turnStateSnapshots.values()]
+      .filter((state) => state.turnId === turnId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return states[0] ?? null;
+  }
+
+  public async saveTurnStateSnapshot(state: TurnState): Promise<void> {
+    const parsed = TurnStateSchema.parse(state);
+    this.turnStateSnapshots.set(parsed.id, parsed);
+  }
+
+  public async appendTurnEvent(event: TurnEvent): Promise<void> {
+    const parsed = TurnEventSchema.parse(event);
+    if (this.turnEvents.has(parsed.id)) {
+      return;
+    }
+    this.turnEvents.set(parsed.id, parsed);
+  }
+
+  public async listTurnEvents(
+    turnId: string,
+    args?: {
+      cursorSeq?: number;
+      limit?: number;
+    },
+  ): Promise<TurnEvent[]> {
+    const limit = Math.min(Math.max(args?.limit ?? 100, 1), 500);
+    return [...this.turnEvents.values()]
+      .filter((event) => {
+        if (event.turnId !== turnId) {
+          return false;
+        }
+        if (typeof args?.cursorSeq === "number" && event.seq <= args.cursorSeq) {
+          return false;
+        }
+        return true;
+      })
+      .sort((left, right) => left.seq - right.seq)
+      .slice(0, limit);
+  }
+
+  public async pruneTurnEventsOlderThan(cutoffIso: string): Promise<number> {
+    let deleted = 0;
+    for (const [id, event] of this.turnEvents.entries()) {
+      if (event.occurredAt < cutoffIso) {
+        this.turnEvents.delete(id);
+        deleted += 1;
+      }
+    }
+    return deleted;
   }
 
   public async claimTelegramUpdate(

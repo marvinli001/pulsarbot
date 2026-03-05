@@ -67,6 +67,12 @@ type ThreadReplyOptions = {
   direct_messages_topic_id?: number;
 };
 
+type FinalizedReplyContext = {
+  chatId: number;
+  threadId: number | null;
+  replyText: string;
+};
+
 function parseThreadId(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -228,8 +234,9 @@ async function dispatchMessage(args: {
   token: string;
   content: TelegramInboundContent;
   onMessage: TelegramUpdateHandler;
+  onFinalizedReply?: ((context: FinalizedReplyContext) => Promise<void> | void) | undefined;
 }) {
-  const { ctx, content, onMessage, token } = args;
+  const { ctx, content, onMessage, token, onFinalizedReply } = args;
   if (!ensurePrivate(ctx)) {
     await ctx.reply("This version only supports private chats.");
     return;
@@ -267,78 +274,124 @@ async function dispatchMessage(args: {
   );
 
   await controller.finalize(reply);
+  if (onFinalizedReply) {
+    try {
+      await onFinalizedReply({
+        chatId: ctx.chat!.id,
+        threadId: threadContext.threadId,
+        replyText: reply,
+      });
+    } catch {
+      // Ignore topic-renaming failures so the webhook response remains resilient.
+    }
+  }
 
   if (content.kind !== "text") {
     void token;
   }
 }
 
-function normalizeTelegramError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+export function isForumTopicServiceMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const record = message as Record<string, unknown>;
+  return (
+    "forum_topic_created" in record ||
+    "forum_topic_edited" in record ||
+    "forum_topic_closed" in record ||
+    "forum_topic_reopened" in record ||
+    "general_forum_topic_hidden" in record ||
+    "general_forum_topic_unhidden" in record
+  );
+}
+
+export function getImplicitForumTopicThreadId(message: unknown): number | null {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+  const record = message as Record<string, unknown>;
+  if (!("forum_topic_created" in record)) {
+    return null;
+  }
+  const forumTopicCreated = record.forum_topic_created;
+  if (!forumTopicCreated || typeof forumTopicCreated !== "object") {
+    return null;
+  }
+  const createdRecord = forumTopicCreated as Record<string, unknown>;
+  if (createdRecord.is_name_implicit !== true) {
+    return null;
+  }
+  const { threadId } = readThreadContext(message);
+  return threadId;
+}
+
+export function buildForumTopicNameFromReply(replyText: string): string | null {
+  const normalized = replyText.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return null;
+  }
+  return normalized.slice(0, 128);
+}
+
+function createTopicKey(chatId: number, threadId: number): string {
+  return `${chatId}:${threadId}`;
+}
+
+function createNonZeroDraftId(seed?: number): number {
+  const MAX_INT_31 = 2_147_483_647;
+  if (typeof seed === "number" && Number.isFinite(seed)) {
+    const normalized = Math.abs(Math.trunc(seed)) % MAX_INT_31;
+    return normalized === 0 ? 1 : normalized;
+  }
+  const fallback = Date.now() % MAX_INT_31;
+  return fallback === 0 ? 1 : fallback;
 }
 
 export function createTelegramStreamController(args: {
   ctx: Context;
   replyOptions?: ThreadReplyOptions;
 }): TelegramResponseStreamController {
-  let responseMessageId: number | null = null;
   let latestText = "";
   let lastRenderedText = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
   let lastFlushAt = 0;
-  let editCount = 0;
   let closed = false;
-  const maxEdits = 30;
-  const throttleMs = 800;
+  const throttleMs = 300;
+  const draftId = createNonZeroDraftId(args.ctx.msg?.message_id ?? Date.now());
+  const draftThreadId = args.replyOptions?.message_thread_id ??
+    args.replyOptions?.direct_messages_topic_id;
 
-  const flush = async (force = false): Promise<boolean> => {
+  const flush = async (): Promise<boolean> => {
     if (closed || !latestText || latestText === lastRenderedText) {
       return true;
     }
-    if (!force && responseMessageId !== null && editCount >= maxEdits) {
-      return false;
-    }
-
-    if (responseMessageId === null) {
-      try {
-        const message = await args.ctx.reply(latestText, args.replyOptions);
-        responseMessageId = message.message_id;
-        lastRenderedText = latestText;
-        lastFlushAt = Date.now();
-        return true;
-      } catch {
-        return false;
-      }
-    }
 
     try {
-      await args.ctx.api.editMessageText(
+      await args.ctx.api.sendMessageDraft(
         args.ctx.chat!.id,
-        responseMessageId,
+        draftId,
         latestText,
+        typeof draftThreadId === "number"
+          ? { message_thread_id: draftThreadId }
+          : undefined,
       );
       lastRenderedText = latestText;
       lastFlushAt = Date.now();
-      editCount += 1;
       return true;
-    } catch (error) {
-      const message = normalizeTelegramError(error);
-      if (!/message is not modified/i.test(message)) {
-        return false;
-      }
-      lastRenderedText = latestText;
-      return true;
+    } catch {
+      return false;
     }
   };
 
   const scheduleFlush = () => {
-    if (closed || timer || (responseMessageId !== null && editCount >= maxEdits)) {
+    if (closed || timer) {
       return;
     }
     const delay = Math.max(0, throttleMs - (Date.now() - lastFlushAt));
     timer = setTimeout(() => {
       timer = null;
-      void flush(false).then(() => {
+      void flush().then(() => {
         if (latestText !== lastRenderedText) {
           scheduleFlush();
         }
@@ -368,15 +421,12 @@ export function createTelegramStreamController(args: {
         closed = true;
         return;
       }
-      const rendered = await flush(true);
-      if (!rendered && responseMessageId === null && latestText) {
-        try {
-          const message = await args.ctx.reply(latestText, args.replyOptions);
-          responseMessageId = message.message_id;
-          lastRenderedText = latestText;
-        } catch {
-          // Do not throw from finalize if Telegram rejects fallback send.
-        }
+      await flush();
+      try {
+        await args.ctx.reply(latestText, args.replyOptions);
+        lastRenderedText = latestText;
+      } catch {
+        // Do not throw from finalize if Telegram rejects fallback send.
       }
       closed = true;
     },
@@ -388,6 +438,7 @@ export function createTelegramBot(args: {
   onMessage: TelegramUpdateHandler;
 }) {
   const bot = new Bot(args.token);
+  const implicitTopicNames = new Map<string, true>();
   const webhookState: {
     updatedAt: string;
     status: "ready";
@@ -425,11 +476,43 @@ export function createTelegramBot(args: {
     );
   });
 
+  bot.on("message", async (ctx, next) => {
+    const implicitThreadId = getImplicitForumTopicThreadId(ctx.message);
+    if (implicitThreadId !== null) {
+      implicitTopicNames.set(createTopicKey(ctx.chat!.id, implicitThreadId), true);
+    }
+    if (isForumTopicServiceMessage(ctx.message)) {
+      return;
+    }
+    await next();
+  });
+
+  const maybeRenameImplicitTopic = async (context: FinalizedReplyContext) => {
+    if (context.threadId === null) {
+      return;
+    }
+    const key = createTopicKey(context.chatId, context.threadId);
+    if (!implicitTopicNames.has(key)) {
+      return;
+    }
+    implicitTopicNames.delete(key);
+    const nextName = buildForumTopicNameFromReply(context.replyText);
+    if (!nextName) {
+      return;
+    }
+    try {
+      await bot.api.editForumTopic(context.chatId, context.threadId, { name: nextName });
+    } catch {
+      // Ignore topic-editing errors because this is a post-reply enhancement.
+    }
+  };
+
   bot.on("message:text", async (ctx) => {
     await dispatchMessage({
       ctx,
       token: args.token,
       onMessage: args.onMessage,
+      onFinalizedReply: maybeRenameImplicitTopic,
       content: {
         kind: "text",
         text: ctx.message.text,
@@ -444,6 +527,7 @@ export function createTelegramBot(args: {
       ctx,
       token: args.token,
       onMessage: args.onMessage,
+      onFinalizedReply: maybeRenameImplicitTopic,
       content: {
         kind: "voice",
         fileId: ctx.message.voice.file_id,
@@ -466,6 +550,7 @@ export function createTelegramBot(args: {
       ctx,
       token: args.token,
       onMessage: args.onMessage,
+      onFinalizedReply: maybeRenameImplicitTopic,
       content: {
         kind: "image",
         fileId: photo.file_id,
@@ -486,6 +571,7 @@ export function createTelegramBot(args: {
       ctx,
       token: args.token,
       onMessage: args.onMessage,
+      onFinalizedReply: maybeRenameImplicitTopic,
       content: {
         kind: "document",
         fileId: document.file_id,
@@ -506,6 +592,7 @@ export function createTelegramBot(args: {
       ctx,
       token: args.token,
       onMessage: args.onMessage,
+      onFinalizedReply: maybeRenameImplicitTopic,
       content: {
         kind: "audio",
         fileId: audio.file_id,
@@ -527,6 +614,7 @@ export function createTelegramBot(args: {
       ctx,
       token: args.token,
       onMessage: args.onMessage,
+      onFinalizedReply: maybeRenameImplicitTopic,
       content: {
         kind: "text",
         text: ctx.editedMessage.text,

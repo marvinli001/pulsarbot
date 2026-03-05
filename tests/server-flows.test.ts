@@ -1388,7 +1388,7 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
-  it("blocks concurrent turns for the same Telegram chat while a turn is running", async () => {
+  it("queues concurrent turns for the same Telegram chat instead of returning a lock error", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
 
@@ -1457,7 +1457,7 @@ describe("server flows", () => {
     expect(healthDuringTurn.statusCode).toBe(200);
     expect(healthDuringTurn.json<Record<string, any>>().activeTurnLocks).toHaveLength(1);
 
-    const overlappingTurn = await appState.app.inject({
+    const overlappingTurn = appState.app.inject({
       method: "POST",
       url: "/telegram/webhook",
       payload: {
@@ -1469,18 +1469,21 @@ describe("server flows", () => {
       },
     });
 
-    expect(overlappingTurn.statusCode).toBe(200);
-    expect(overlappingTurn.json()).toMatchObject({
-      ok: true,
-      response: "A previous agent turn is still running for this chat. Please try again in a moment.",
-    });
-
     const completedTurn = await firstTurn;
     expect(completedTurn.statusCode).toBe(200);
     expect(completedTurn.json()).toMatchObject({
       ok: true,
       response: "Echo: slow turn",
     });
+
+    const queuedTurn = await overlappingTurn;
+    expect(queuedTurn.statusCode).toBe(200);
+    expect(queuedTurn.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+    });
+    expect(
+      queuedTurn.json<Record<string, unknown>>().response,
+    ).not.toBe("A previous agent turn is still running for this chat. Please try again in a moment.");
 
     await waitForCondition(async () => {
       const response = await appState.app.inject({
@@ -1534,6 +1537,135 @@ describe("server flows", () => {
       ignored: true,
       reason: "duplicate",
     });
+
+    await appState.app.close();
+  });
+
+  it("exposes graph turn state and events through system diagnostics APIs", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const slowProviderInvoker = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderInvocationInput;
+      }): Promise<ProviderInvocationResult> => {
+        void args.profile;
+        void args.apiKey;
+        const messages = args.input.messages;
+        const system = messages.find((message) => message.role === "system")?.content ?? "";
+        const user = messages.find((message) => message.role === "user")?.content ?? "";
+        const hasToolResult = messages.some((message) => message.role === "tool");
+
+        if (system.includes("Return strict JSON")) {
+          await new Promise((resolve) => setTimeout(resolve, 180));
+          return {
+            text: JSON.stringify({
+              type: "final_response",
+              content: `Echo: ${user}`,
+            }),
+            raw: {},
+          };
+        }
+
+        if (!hasToolResult) {
+          await new Promise((resolve) => setTimeout(resolve, 180));
+        }
+
+        return {
+          text: `Echo: ${user || "done"}`,
+          raw: {},
+        };
+      },
+    );
+
+    const appState = await bootstrapApp(dataDir, {
+      providerInvoker: slowProviderInvoker,
+      backgroundPollMs: 50,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const pendingTurn = appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        update_id: 120045,
+        message: {
+          message_id: 9001,
+          text: "graph diagnostics",
+          chat: { id: 7301 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const health = await appState.app.inject({
+      method: "GET",
+      url: "/api/system/health",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(health.statusCode).toBe(200);
+    const healthPayload = health.json<Record<string, any>>();
+    expect(healthPayload.graph?.enabled).toBe(true);
+    expect(Array.isArray(healthPayload.activeTurnLocks)).toBe(true);
+    expect(healthPayload.activeTurnLocks.length).toBeGreaterThan(0);
+
+    const turnId = String(healthPayload.activeTurnLocks[0].id);
+
+    const stateDuringTurn = await appState.app.inject({
+      method: "GET",
+      url: `/api/system/turns/${turnId}/state`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(stateDuringTurn.statusCode).toBe(200);
+    expect(stateDuringTurn.json<Record<string, any>>()).toMatchObject({
+      turnId,
+      graphVersion: "v1",
+    });
+
+    const eventsDuringTurn = await appState.app.inject({
+      method: "GET",
+      url: `/api/system/turns/${turnId}/events?limit=200`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(eventsDuringTurn.statusCode).toBe(200);
+    const events = eventsDuringTurn.json<Array<Record<string, any>>>();
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.some((event) => event.eventType === "turn_started")).toBe(true);
+    expect(events.some((event) => event.eventType === "node_started")).toBe(true);
+
+    const turnResponse = await pendingTurn;
+    expect(turnResponse.statusCode).toBe(200);
+
+    const stateAfterTurn = await appState.app.inject({
+      method: "GET",
+      url: `/api/system/turns/${turnId}/state`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(stateAfterTurn.statusCode).toBe(200);
+    expect(["succeeded", "failed", "aborted"]).toContain(
+      stateAfterTurn.json<Record<string, any>>().status,
+    );
+
+    const missing = await appState.app.inject({
+      method: "GET",
+      url: "/api/system/turns/turn_missing/state",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(missing.statusCode).toBe(404);
 
     await appState.app.close();
   });

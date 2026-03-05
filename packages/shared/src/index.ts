@@ -369,10 +369,114 @@ export const ConversationTurnSchema = z.object({
   compacted: z.boolean().default(false),
   summaryId: z.string().nullable().default(null),
   error: z.string().nullable().default(null),
+  graphVersion: z.string().nullable().default(null),
+  stateSnapshotId: z.string().nullable().default(null),
+  lastEventSeq: z.number().int().nonnegative().default(0),
+  currentNode: z.string().nullable().default(null),
+  resumeEligible: z.boolean().default(false),
   startedAt: z.string().min(1),
   finishedAt: z.string().nullable().default(null),
   lockExpiresAt: z.string().nullable().default(null),
   updatedAt: z.string().min(1),
+});
+
+const TurnToolResultSchema = z.object({
+  callId: z.string().min(1),
+  toolId: z.string().min(1),
+  source: z.enum(["plugin", "mcp", "builtin"]),
+  input: LooseRecordSchema.default({}),
+  output: JsonValueSchema,
+  status: z.enum(["pending", "completed", "failed"]),
+  idempotencyKey: z.string().min(1),
+  startedAt: z.string().min(1),
+  finishedAt: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+});
+
+const TurnErrorSchema = z.object({
+  code: z.string().min(1),
+  message: z.string().min(1),
+  nodeId: z.string().min(1).nullable().default(null),
+  retryable: z.boolean().default(false),
+  raw: LooseRecordSchema.default({}),
+});
+
+export const TurnStateSchema = z.object({
+  id: z.string().min(1),
+  turnId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  conversationId: z.string().min(1),
+  graphVersion: z.literal("v1").default("v1"),
+  status: z.enum(["running", "waiting_retry", "succeeded", "failed", "aborted"]),
+  currentNode: z.string().min(1),
+  version: z.number().int().nonnegative().default(0),
+  input: z.object({
+    updateId: z.number().int().nullable().default(null),
+    chatId: z.number().int(),
+    threadId: z.number().int().nullable().default(null),
+    userId: z.number().int(),
+    username: z.string().nullable().default(null),
+    messageId: z.number().int().nullable().default(null),
+    contentKind: z.enum(["text", "voice", "image", "document", "audio"]),
+    normalizedText: z.string().default(""),
+    rawMetadata: LooseRecordSchema.default({}),
+  }),
+  context: z.object({
+    profileId: z.string().min(1).nullable().default(null),
+    timezone: z.string().min(1),
+    nowIso: z.string().min(1),
+    runtimeSnapshot: LooseRecordSchema.default({}),
+    searchSettings: SearchSettingsSchema.nullable().default(null),
+    historyWindow: z.number().int().nonnegative().default(0),
+    summaryCursor: z.string().nullable().default(null),
+  }),
+  budgets: z.object({
+    maxPlanningSteps: z.number().int().positive().default(1),
+    maxToolCalls: z.number().int().positive().default(1),
+    maxTurnDurationMs: z.number().int().positive().default(1),
+    stepsUsed: z.number().int().nonnegative().default(0),
+    toolCallsUsed: z.number().int().nonnegative().default(0),
+    deadlineAt: z.string().min(1),
+  }),
+  toolResults: z.array(TurnToolResultSchema).default([]),
+  output: z.object({
+    replyText: z.string().default(""),
+    telegramReplyMessageId: z.string().nullable().default(null),
+    streamingEnabled: z.boolean().default(false),
+    lastRenderedChars: z.number().int().nonnegative().default(0),
+  }),
+  error: TurnErrorSchema.nullable().default(null),
+  recovery: z.object({
+    resumeEligible: z.boolean().default(true),
+    resumeCount: z.number().int().nonnegative().default(0),
+    lastRecoveredAt: z.string().nullable().default(null),
+  }),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
+export const TurnEventTypeSchema = z.enum([
+  "turn_started",
+  "node_started",
+  "node_succeeded",
+  "node_failed",
+  "tool_started",
+  "tool_succeeded",
+  "tool_failed",
+  "turn_succeeded",
+  "turn_failed",
+  "turn_recovered",
+]);
+
+export const TurnEventSchema = z.object({
+  id: z.string().min(1),
+  turnId: z.string().min(1),
+  seq: z.number().int().nonnegative(),
+  nodeId: z.string().min(1),
+  eventType: TurnEventTypeSchema,
+  attempt: z.number().int().positive().default(1),
+  payload: LooseRecordSchema.default({}),
+  occurredAt: z.string().min(1),
 });
 
 export const DocumentMetadataSchema = z.object({
@@ -585,6 +689,9 @@ export type ToolRunRecord = z.infer<typeof ToolRunRecordSchema>;
 export type CloudflareCredentials = z.infer<typeof CloudflareCredentialsSchema>;
 export type ConversationSummary = z.infer<typeof ConversationSummarySchema>;
 export type ConversationTurn = z.infer<typeof ConversationTurnSchema>;
+export type TurnState = z.infer<typeof TurnStateSchema>;
+export type TurnEventType = z.infer<typeof TurnEventTypeSchema>;
+export type TurnEvent = z.infer<typeof TurnEventSchema>;
 export type DocumentMetadata = z.infer<typeof DocumentMetadataSchema>;
 export type DocumentArtifact = z.infer<typeof DocumentArtifactSchema>;
 export type MemoryDocument = z.infer<typeof MemoryDocumentSchema>;

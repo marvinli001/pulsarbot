@@ -14,7 +14,7 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
-import { AgentRuntime } from "@pulsarbot/agent";
+import { AgentRuntime, runGraph } from "@pulsarbot/agent";
 import { CloudflareApiClient } from "@pulsarbot/cloudflare";
 import {
   AppError,
@@ -48,6 +48,8 @@ import {
   ProviderProfileSchema,
   ResolvedRuntimeSnapshotSchema,
   SearchSettingsSchema,
+  TurnEventTypeSchema,
+  TurnStateSchema,
   WorkspaceExportBundleSchema,
   WorkspaceSchema,
   type AgentProfile,
@@ -65,6 +67,9 @@ import {
   type ResolvedRuntimeSnapshot,
   type SearchSettings,
   type TelegramInboundContent,
+  type TurnEvent,
+  type TurnEventType,
+  type TurnState,
   type Workspace,
 } from "@pulsarbot/shared";
 import {
@@ -160,6 +165,33 @@ function isMissingProviderProfileError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Provider profile not found:");
 }
 
+const TURN_GRAPH_VERSION = "v1";
+const TURN_EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TURN_GRAPH_RECOVERABLE_NODES = new Set([
+  "persist_assistant_message",
+  "persist_tool_runs",
+  "finalize_turn",
+]);
+const TURN_GRAPH_NON_RESUMABLE_NODES = new Set(["run_agent_core", "emit_reply"]);
+
+function toTurnError(args: {
+  error: unknown;
+  nodeId: string;
+  retryable?: boolean;
+  code?: string;
+}): NonNullable<TurnState["error"]> {
+  const message = args.error instanceof Error ? args.error.message : String(args.error);
+  return {
+    code: args.code ?? "TURN_NODE_FAILED",
+    message,
+    nodeId: args.nodeId,
+    retryable: args.retryable ?? false,
+    raw: toLooseJsonRecord({
+      message,
+    }),
+  };
+}
+
 interface TelegramWebhookInfo {
   url?: string;
   has_custom_certificate?: boolean;
@@ -170,6 +202,11 @@ interface TelegramWebhookInfo {
   last_synchronization_error_date?: number;
   max_connections?: number;
   allowed_updates?: string[];
+}
+
+interface ActiveTurnQueueItem {
+  promise: Promise<void>;
+  resolve: () => void;
 }
 
 function normalizePublicBaseUrl(input: string | undefined): string | null {
@@ -1774,7 +1811,51 @@ export async function createApp(
     loggerInstance: logger,
     bodyLimit: env.BODY_LIMIT_BYTES,
   });
-  const activeTurns = new Set<string>();
+  const activeTurns = new Map<string, ActiveTurnQueueItem>();
+  const acquireActiveTurnSlot = async (
+    conversationId: string,
+    maxWaitMs = 60_000,
+  ): Promise<ActiveTurnQueueItem | null> => {
+    const deadline = Date.now() + maxWaitMs;
+
+    while (true) {
+      const existing = activeTurns.get(conversationId);
+      if (!existing) {
+        let resolve!: () => void;
+        const promise = new Promise<void>((next) => {
+          resolve = next;
+        });
+        const slot: ActiveTurnQueueItem = {
+          promise,
+          resolve,
+        };
+        activeTurns.set(conversationId, slot);
+        return slot;
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        return null;
+      }
+
+      await new Promise<void>((next) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            next();
+          }
+        }, remainingMs);
+        void existing.promise.then(() => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            next();
+          }
+        });
+      });
+    }
+  };
   const jwtSecret = getJwtSecret(state.env.PULSARBOT_ACCESS_TOKEN);
 
   await app.register(sensible);
@@ -1957,6 +2038,11 @@ export async function createApp(
     profileId: string;
     telegramChatId: string;
     telegramUserId: string;
+    turnId?: string;
+    graphVersion?: string | null;
+    stateSnapshotId?: string | null;
+    currentNode?: string | null;
+    resumeEligible?: boolean;
   }) => {
     const existingConversation = await state.repository.getConversation(args.conversationId);
     if (
@@ -1971,7 +2057,7 @@ export async function createApp(
     }
 
     const timestamp = nowIso();
-    const turnId = createId("turn");
+    const turnId = args.turnId ?? createId("turn");
     const lockExpiresAt = isoAfter(90_000);
 
     await state.repository.saveConversation({
@@ -1999,6 +2085,11 @@ export async function createApp(
       compacted: false,
       summaryId: null,
       error: null,
+      graphVersion: args.graphVersion ?? TURN_GRAPH_VERSION,
+      stateSnapshotId: args.stateSnapshotId ?? null,
+      lastEventSeq: 0,
+      currentNode: args.currentNode ?? "acquire_turn_lock",
+      resumeEligible: args.resumeEligible ?? true,
       startedAt: timestamp,
       finishedAt: null,
       lockExpiresAt,
@@ -2019,7 +2110,12 @@ export async function createApp(
     stepCount: number;
     compacted: boolean;
     toolCallCount: number;
+    status?: ConversationTurn["status"];
     error?: string | null;
+    stateSnapshotId?: string | null;
+    currentNode?: string | null;
+    resumeEligible?: boolean;
+    lastEventSeq?: number;
   }) => {
     const conversation = await state.repository.getConversation(args.conversationId);
     const turn = await state.repository.getConversationTurn(args.turnId);
@@ -2044,17 +2140,50 @@ export async function createApp(
     if (turn) {
       await state.repository.saveConversationTurn({
         ...turn,
-        status: args.error ? "failed" : "completed",
+        status: args.status ?? (args.error ? "failed" : "completed"),
         stepCount: args.stepCount,
         toolCallCount: args.toolCallCount,
         compacted: args.compacted,
         summaryId: latestSummary?.id ?? turn.summaryId,
         error: args.error ?? null,
+        stateSnapshotId: args.stateSnapshotId ?? turn.stateSnapshotId ?? null,
+        currentNode: args.currentNode ?? turn.currentNode ?? null,
+        resumeEligible: args.resumeEligible ?? false,
+        lastEventSeq: args.lastEventSeq ?? turn.lastEventSeq ?? 0,
         finishedAt: timestamp,
         lockExpiresAt: null,
         updatedAt: timestamp,
       });
     }
+  };
+
+  const updateTurnGraphPointers = async (args: {
+    turnId: string;
+    stateSnapshotId?: string | null;
+    currentNode?: string | null;
+    lastEventSeq?: number;
+    resumeEligible?: boolean;
+  }) => {
+    const turn = await state.repository.getConversationTurn(args.turnId);
+    if (!turn) {
+      return;
+    }
+    await state.repository.saveConversationTurn({
+      ...turn,
+      ...(typeof args.stateSnapshotId !== "undefined"
+        ? { stateSnapshotId: args.stateSnapshotId }
+        : {}),
+      ...(typeof args.currentNode !== "undefined"
+        ? { currentNode: args.currentNode }
+        : {}),
+      ...(typeof args.lastEventSeq !== "undefined"
+        ? { lastEventSeq: args.lastEventSeq }
+        : {}),
+      ...(typeof args.resumeEligible !== "undefined"
+        ? { resumeEligible: args.resumeEligible }
+        : {}),
+      updatedAt: nowIso(),
+    });
   };
 
   const resolveMediaProvider = async (
@@ -2619,14 +2748,60 @@ export async function createApp(
     return pending.length;
   };
 
-	  const telegram = (options.telegramFactory ?? createTelegramBot)({
-	    token: state.env.TELEGRAM_BOT_TOKEN,
-	    onMessage: async (rawPayload, stream) => {
-	      const streamController = stream ?? {
-	        enabled: false,
-	        emit: async () => {},
-	      };
-	      const payload = normalizeTelegramPayload(rawPayload);
+  const userMessageIdForTurn = (turnId: string) => `msg:${turnId}:user`;
+  const assistantMessageIdForTurn = (turnId: string) => `msg:${turnId}:assistant`;
+  const toolRunIdForTurn = (turnId: string, callId: string) => `tool:${turnId}:${callId}`;
+
+  const persistAssistantArtifactsFromState = async (args: {
+    conversationId: string;
+    stateSnapshot: TurnState;
+  }) => {
+    await state.repository.saveConversationMessage(args.conversationId, {
+      id: assistantMessageIdForTurn(args.stateSnapshot.turnId),
+      conversationId: args.conversationId,
+      role: "assistant",
+      content: args.stateSnapshot.output.replyText,
+      sourceType: "text",
+      telegramMessageId: null,
+      metadata: toLooseJsonRecord({
+        turnId: args.stateSnapshot.turnId,
+        compacted: Boolean(args.stateSnapshot.context.summaryCursor),
+        ...(args.stateSnapshot.context.summaryCursor
+          ? {
+              summary: args.stateSnapshot.context.summaryCursor,
+            }
+          : {}),
+      }),
+      createdAt: nowIso(),
+    });
+
+    for (const toolResult of args.stateSnapshot.toolResults) {
+      await state.repository.saveToolRun({
+        id: toolRunIdForTurn(args.stateSnapshot.turnId, toolResult.callId),
+        conversationId: args.conversationId,
+        turnId: args.stateSnapshot.turnId,
+        toolId: toolResult.toolId,
+        toolSource: toolResult.source,
+        input: toolResult.input,
+        output: toolResult.output,
+        status: toolResult.status,
+        durationMs:
+          Date.parse(toolResult.finishedAt ?? toolResult.startedAt) -
+          Date.parse(toolResult.startedAt),
+        createdAt: toolResult.startedAt,
+      });
+    }
+  };
+
+  const telegram = (options.telegramFactory ?? createTelegramBot)({
+    token: state.env.TELEGRAM_BOT_TOKEN,
+    onMessage: async (rawPayload, stream) => {
+      const streamController = stream ?? {
+        enabled: false,
+        emit: async () => {},
+        finalize: async () => {},
+      };
+      const payload = normalizeTelegramPayload(rawPayload);
       const workspace = await state.repository.getWorkspace();
       requireWorkspace(workspace);
 
@@ -2640,161 +2815,766 @@ export async function createApp(
       const conversationId = payload.threadId === null
         ? `telegram:${payload.chatId}`
         : `telegram:${payload.chatId}:thread:${payload.threadId}`;
-      if (activeTurns.has(conversationId)) {
+      const activeTurnSlot = await acquireActiveTurnSlot(conversationId, 60_000);
+      if (!activeTurnSlot) {
         return "A previous agent turn is still running for this chat. Please try again in a moment.";
       }
-      const profiles = await state.repository.listAgentProfiles();
-      const profile =
-        profiles.find((item) => item.id === workspace.activeAgentProfileId) ??
-        profiles.find((item) => item.label === "balanced") ??
-        profiles[0];
-      if (!profile) {
-        return "No agent profile is configured yet. Open the Mini App first.";
-      }
 
-      const acquired = await acquireConversationTurn({
+      const startedAt = nowIso();
+      const turnId = createId("turn");
+      const stateSnapshotId = createId("state");
+      const fallbackText = normalizeInboundText(payload.content);
+      const fallbackDeadlineAt = new Date(
+        Date.parse(startedAt) + 30_000,
+      ).toISOString();
+
+      let turnState = TurnStateSchema.parse({
+        id: stateSnapshotId,
+        turnId,
         workspaceId: workspace.id,
         conversationId,
-        profileId: profile.id,
-        telegramChatId: String(payload.chatId),
-        telegramUserId: String(payload.userId),
-      });
-      if (!acquired.acquired) {
-        return "A previous agent turn is still running for this chat. Please try again in a moment.";
-      }
-
-      activeTurns.add(conversationId);
-
-      try {
-        const history = await state.repository.listConversationMessages(conversationId);
-        const fallbackText = normalizeInboundText(payload.content);
-        const processedPayload = await registerDocument(
-          workspace.id,
-          payload,
-          profile,
-          fallbackText,
-        );
-        const normalizedText = processedPayload.normalizedText;
-        const document = processedPayload.document;
-        let runtime: ResolvedRuntimeSnapshot;
-        try {
-          runtime = await state.resolveRuntime(profile);
-        } catch (error) {
-          if (isMissingProviderProfileError(error)) {
-            return "No provider is configured for the active profile yet. Open the Mini App to add one.";
-          }
-          throw error;
-        }
-        await state.repository.appendConversationMessage(conversationId, {
-          id: createId("msg"),
-          conversationId,
-          role: "user",
-          content: normalizedText,
-          sourceType: sourceTypeForContent(payload.content),
-          telegramMessageId: payload.messageId ? String(payload.messageId) : null,
-          metadata: {
+        graphVersion: TURN_GRAPH_VERSION,
+        status: "running",
+        currentNode: "ingest_input",
+        version: 0,
+        input: {
+          updateId: payload.updateId,
+          chatId: payload.chatId,
+          threadId: payload.threadId,
+          userId: payload.userId,
+          username: payload.username ?? null,
+          messageId: payload.messageId,
+          contentKind: payload.content.kind,
+          normalizedText: fallbackText,
+          rawMetadata: toLooseJsonRecord({
             ...payload.content.metadata,
             threadId: payload.threadId,
             ...(payload.updateId !== null ? { updateId: payload.updateId } : {}),
-            ...(document ? { documentId: document.id } : {}),
-          },
-          createdAt: nowIso(),
-        });
+          }),
+        },
+        context: {
+          profileId: null,
+          timezone: workspace.timezone,
+          nowIso: startedAt,
+          runtimeSnapshot: {},
+          searchSettings: null,
+          historyWindow: 0,
+          summaryCursor: null,
+        },
+        budgets: {
+          maxPlanningSteps: 8,
+          maxToolCalls: 6,
+          maxTurnDurationMs: 30_000,
+          stepsUsed: 0,
+          toolCallsUsed: 0,
+          deadlineAt: fallbackDeadlineAt,
+        },
+        toolResults: [],
+        output: {
+          replyText: "",
+          telegramReplyMessageId: null,
+          streamingEnabled: streamController.enabled,
+          lastRenderedChars: 0,
+        },
+        error: null,
+        recovery: {
+          resumeEligible: true,
+          resumeCount: 0,
+          lastRecoveredAt: null,
+        },
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      });
 
-        const result = await state.agent.runTurn({
-          profile,
-          userMessage: normalizedText,
-          history,
-	          ...(streamController.enabled
-	            ? {
-	                streamReply: {
-	                  onPartial: (text: string) => streamController.emit(text),
-	                },
-	              }
-	            : {}),
-          context: {
-            workspaceId: workspace.id,
-            conversationId,
-            turnId: acquired.turnId ?? undefined,
-            nowIso: nowIso(),
-            timezone: workspace.timezone,
-            profileId: profile.id,
-            searchSettings: runtime.searchSettings,
-            runtime,
-          },
-        });
+      const graphContext: {
+        workspace: Workspace;
+        payload: TelegramUpdatePayload;
+        conversationId: string;
+        profile: AgentProfile | null;
+        runtime: ResolvedRuntimeSnapshot | null;
+        acquiredTurnId: string | null;
+        document: DocumentMetadata | null;
+      } = {
+        workspace,
+        payload,
+        conversationId,
+        profile: null,
+        runtime: null,
+        acquiredTurnId: null,
+        document: null,
+      };
 
-        await state.repository.appendConversationMessage(conversationId, {
-          id: createId("msg"),
-          conversationId,
-          role: "assistant",
-          content: result.reply,
-          sourceType: "text",
-          telegramMessageId: null,
-          metadata: {
-            turnId: result.turnId,
-            compacted: result.compacted,
-            ...(result.summary ? { summary: result.summary } : {}),
-          },
-          createdAt: nowIso(),
+      let eventSeq = 0;
+
+      const persistTurnState = async () => {
+        turnState = TurnStateSchema.parse({
+          ...turnState,
+          version: turnState.version + 1,
+          updatedAt: nowIso(),
         });
-        for (const toolRun of result.toolRuns) {
-          await state.repository.saveToolRun({
-            id: toolRun.id,
-            conversationId,
-            turnId: result.turnId,
-            toolId: toolRun.toolId,
-            toolSource: toolRun.source,
-            input: toLooseJsonRecord(toolRun.input),
-            output: toolRun.output as never,
-            status: "completed",
-            durationMs: 0,
-            createdAt: nowIso(),
-          });
+        await state.repository.saveTurnStateSnapshot(turnState);
+        await updateTurnGraphPointers({
+          turnId: turnState.turnId,
+          stateSnapshotId: turnState.id,
+          currentNode: turnState.currentNode,
+          lastEventSeq: eventSeq,
+          resumeEligible: turnState.recovery.resumeEligible,
+        });
+      };
+
+      const appendTurnEvent = async (args: {
+        nodeId: string;
+        eventType: TurnEventType;
+        attempt: number;
+        payload?: Record<string, unknown>;
+      }) => {
+        eventSeq += 1;
+        const event: TurnEvent = {
+          id: createId("tevt"),
+          turnId: turnState.turnId,
+          seq: eventSeq,
+          nodeId: args.nodeId,
+          eventType: TurnEventTypeSchema.parse(args.eventType),
+          attempt: args.attempt,
+          payload: toLooseJsonRecord(args.payload ?? {}),
+          occurredAt: nowIso(),
+        };
+        await state.repository.appendTurnEvent(event);
+        await updateTurnGraphPointers({
+          turnId: turnState.turnId,
+          stateSnapshotId: turnState.id,
+          currentNode: turnState.currentNode,
+          lastEventSeq: eventSeq,
+          resumeEligible: turnState.recovery.resumeEligible,
+        });
+      };
+
+      const graphNodeOrder = [
+        "ingest_input",
+        "acquire_turn_lock",
+        "preprocess_content",
+        "load_runtime",
+        "persist_user_message",
+        "run_agent_core",
+        "persist_assistant_message",
+        "persist_tool_runs",
+        "finalize_turn",
+        "emit_reply",
+      ] as const;
+
+      const nextNodeFor = (nodeId: string): string | null => {
+        if (nodeId === "fail_turn") {
+          return "emit_reply";
         }
-        await finalizeConversationTurn({
-          conversationId,
-          turnId: result.turnId,
-          telegramChatId: String(payload.chatId),
-          telegramUserId: String(payload.userId),
-          stepCount: result.stepCount,
-          compacted: result.compacted,
-          toolCallCount: result.toolRuns.length,
+        if (nodeId === "emit_reply") {
+          return null;
+        }
+        if (turnState.status === "aborted") {
+          return graphContext.acquiredTurnId ? "finalize_turn" : "emit_reply";
+        }
+        const index = graphNodeOrder.indexOf(nodeId as (typeof graphNodeOrder)[number]);
+        if (index < 0 || index + 1 >= graphNodeOrder.length) {
+          return null;
+        }
+        return graphNodeOrder[index + 1] ?? null;
+      };
+
+      try {
+        await persistTurnState();
+        await appendTurnEvent({
+          nodeId: "ingest_input",
+          eventType: "turn_started",
+          attempt: 1,
         });
-        return result.reply;
+
+        await runGraph({
+          state: turnState,
+          context: graphContext,
+          startNode: "ingest_input",
+          failNode: "fail_turn",
+          resolveNext: ({ nodeId }) => nextNodeFor(nodeId),
+          hooks: {
+            onNodeStarted: async ({ nodeId, attempt }) => {
+              turnState.currentNode = nodeId;
+              turnState.recovery.resumeEligible = !TURN_GRAPH_NON_RESUMABLE_NODES.has(nodeId);
+              await persistTurnState();
+              await appendTurnEvent({
+                nodeId,
+                eventType: "node_started",
+                attempt,
+                payload: {
+                  status: turnState.status,
+                },
+              });
+            },
+            onNodeSucceeded: async ({ nodeId, attempt }) => {
+              await persistTurnState();
+              await appendTurnEvent({
+                nodeId,
+                eventType: "node_succeeded",
+                attempt,
+                payload: {
+                  status: turnState.status,
+                },
+              });
+            },
+            onNodeFailed: async ({ nodeId, attempt, error }) => {
+              turnState.status = "failed";
+              turnState.error = toTurnError({
+                error,
+                nodeId,
+              });
+              turnState.recovery.resumeEligible = false;
+              await persistTurnState();
+              await appendTurnEvent({
+                nodeId,
+                eventType: "node_failed",
+                attempt,
+                payload: {
+                  error: turnState.error.message,
+                  code: turnState.error.code,
+                },
+              });
+            },
+          },
+          nodes: {
+            ingest_input: {
+              id: "ingest_input",
+              run: async () => {
+                const profiles = await state.repository.listAgentProfiles();
+                const profile =
+                  profiles.find((item) => item.id === workspace.activeAgentProfileId) ??
+                  profiles.find((item) => item.label === "balanced") ??
+                  profiles[0];
+                if (!profile) {
+                  turnState.status = "aborted";
+                  turnState.error = {
+                    code: "NO_AGENT_PROFILE",
+                    message: "No agent profile is configured",
+                    nodeId: "ingest_input",
+                    retryable: false,
+                    raw: {},
+                  };
+                  turnState.output.replyText =
+                    "No agent profile is configured yet. Open the Mini App first.";
+                  turnState.recovery.resumeEligible = false;
+                  return "emit_reply";
+                }
+                graphContext.profile = profile;
+                turnState.context.profileId = profile.id;
+                turnState.context.nowIso = nowIso();
+                turnState.budgets.maxPlanningSteps = profile.maxPlanningSteps;
+                turnState.budgets.maxToolCalls = profile.maxToolCalls;
+                turnState.budgets.maxTurnDurationMs = profile.maxTurnDurationMs;
+                turnState.budgets.deadlineAt = new Date(
+                  Date.now() + profile.maxTurnDurationMs,
+                ).toISOString();
+              },
+            },
+            acquire_turn_lock: {
+              id: "acquire_turn_lock",
+              run: async () => {
+                const profileId = turnState.context.profileId;
+                if (!profileId) {
+                  throw new Error("Profile id is missing before lock acquisition");
+                }
+                const acquired = await acquireConversationTurn({
+                  workspaceId: workspace.id,
+                  conversationId,
+                  profileId,
+                  telegramChatId: String(payload.chatId),
+                  telegramUserId: String(payload.userId),
+                  turnId: turnState.turnId,
+                  graphVersion: TURN_GRAPH_VERSION,
+                  stateSnapshotId: turnState.id,
+                  currentNode: "acquire_turn_lock",
+                  resumeEligible: true,
+                });
+                if (!acquired.acquired) {
+                  turnState.status = "aborted";
+                  turnState.error = {
+                    code: "TURN_LOCK_CONFLICT",
+                    message: "A previous turn is still running",
+                    nodeId: "acquire_turn_lock",
+                    retryable: true,
+                    raw: {},
+                  };
+                  turnState.output.replyText =
+                    "A previous agent turn is still running for this chat. Please try again in a moment.";
+                  turnState.recovery.resumeEligible = false;
+                  return "emit_reply";
+                }
+                graphContext.acquiredTurnId = acquired.turnId ?? turnState.turnId;
+                turnState.turnId = graphContext.acquiredTurnId;
+              },
+            },
+            preprocess_content: {
+              id: "preprocess_content",
+              run: async () => {
+                if (!graphContext.profile) {
+                  throw new Error("Profile is missing for preprocess");
+                }
+                const processedPayload = await registerDocument(
+                  workspace.id,
+                  payload,
+                  graphContext.profile,
+                  turnState.input.normalizedText,
+                );
+                graphContext.document = processedPayload.document;
+                turnState.input.normalizedText = processedPayload.normalizedText;
+                turnState.input.rawMetadata = toLooseJsonRecord({
+                  ...turnState.input.rawMetadata,
+                  ...(processedPayload.document
+                    ? {
+                        documentId: processedPayload.document.id,
+                      }
+                    : {}),
+                });
+              },
+            },
+            load_runtime: {
+              id: "load_runtime",
+              run: async () => {
+                if (!graphContext.profile) {
+                  throw new Error("Profile is missing for runtime resolution");
+                }
+                try {
+                  graphContext.runtime = await state.resolveRuntime(graphContext.profile);
+                  turnState.context.runtimeSnapshot = toLooseJsonRecord(
+                    JSON.parse(JSON.stringify(graphContext.runtime)) as Record<string, unknown>,
+                  );
+                  turnState.context.searchSettings = graphContext.runtime.searchSettings;
+                } catch (error) {
+                  if (isMissingProviderProfileError(error)) {
+                    turnState.status = "aborted";
+                    turnState.error = {
+                      code: "NO_PROVIDER_PROFILE",
+                      message: error instanceof Error ? error.message : String(error),
+                      nodeId: "load_runtime",
+                      retryable: false,
+                      raw: {},
+                    };
+                    turnState.output.replyText =
+                      "No provider is configured for the active profile yet. Open the Mini App to add one.";
+                    turnState.recovery.resumeEligible = false;
+                    return graphContext.acquiredTurnId ? "finalize_turn" : "emit_reply";
+                  }
+                  throw error;
+                }
+              },
+            },
+            persist_user_message: {
+              id: "persist_user_message",
+              run: async () => {
+                await state.repository.saveConversationMessage(conversationId, {
+                  id: userMessageIdForTurn(turnState.turnId),
+                  conversationId,
+                  role: "user",
+                  content: turnState.input.normalizedText,
+                  sourceType: sourceTypeForContent(payload.content),
+                  telegramMessageId: payload.messageId ? String(payload.messageId) : null,
+                  metadata: toLooseJsonRecord({
+                    ...payload.content.metadata,
+                    threadId: payload.threadId,
+                    ...(payload.updateId !== null ? { updateId: payload.updateId } : {}),
+                    ...(graphContext.document ? { documentId: graphContext.document.id } : {}),
+                  }),
+                  createdAt: nowIso(),
+                });
+                turnState.context.historyWindow = (
+                  await state.repository.listConversationMessages(conversationId)
+                ).length;
+              },
+            },
+            run_agent_core: {
+              id: "run_agent_core",
+              run: async () => {
+                if (!graphContext.profile || !graphContext.runtime) {
+                  throw new Error("Runtime prerequisites are missing");
+                }
+                const allMessages = await state.repository.listConversationMessages(conversationId);
+                const history = allMessages.filter(
+                  (message) => message.id !== userMessageIdForTurn(turnState.turnId),
+                );
+                try {
+                  const result = await state.agent.runTurn({
+                    profile: graphContext.profile,
+                    userMessage: turnState.input.normalizedText,
+                    history,
+                    ...(streamController.enabled
+                      ? {
+                          streamReply: {
+                            onPartial: async (text: string) => {
+                              turnState.output.lastRenderedChars = text.length;
+                              await streamController.emit(text);
+                            },
+                          },
+                        }
+                      : {}),
+                    context: {
+                      workspaceId: workspace.id,
+                      conversationId,
+                      turnId: turnState.turnId,
+                      nowIso: nowIso(),
+                      timezone: workspace.timezone,
+                      profileId: graphContext.profile.id,
+                      searchSettings: graphContext.runtime.searchSettings,
+                      runtime: graphContext.runtime,
+                    },
+                  });
+
+                  turnState.output.replyText = result.reply;
+                  turnState.budgets.stepsUsed = result.stepCount;
+                  turnState.budgets.toolCallsUsed = result.toolRuns.length;
+                  turnState.context.summaryCursor = result.summary ?? null;
+                  turnState.toolResults = result.toolRuns.map((toolRun) => ({
+                    callId: toolRun.id,
+                    toolId: toolRun.toolId,
+                    source: toolRun.source,
+                    input: toLooseJsonRecord(toolRun.input),
+                    output: JSON.parse(JSON.stringify(toolRun.output ?? null)) as LooseJsonValue,
+                    status: "completed",
+                    idempotencyKey: `tool:${turnState.turnId}:${toolRun.id}`,
+                    startedAt: nowIso(),
+                    finishedAt: nowIso(),
+                    error: null,
+                  }));
+                } catch (error) {
+                  if (isMissingSecretError(error)) {
+                    turnState.status = "aborted";
+                    turnState.error = {
+                      code: "SECRET_NOT_FOUND",
+                      message: error instanceof Error ? error.message : String(error),
+                      nodeId: "run_agent_core",
+                      retryable: false,
+                      raw: {},
+                    };
+                    turnState.output.replyText =
+                      "Provider API key is not configured. Open Mini App > Providers and save a valid API key.";
+                    turnState.recovery.resumeEligible = false;
+                    return "finalize_turn";
+                  }
+                  throw error;
+                }
+              },
+            },
+            persist_assistant_message: {
+              id: "persist_assistant_message",
+              run: async () => {
+                await persistAssistantArtifactsFromState({
+                  conversationId,
+                  stateSnapshot: {
+                    ...turnState,
+                    toolResults: [],
+                  },
+                });
+              },
+            },
+            persist_tool_runs: {
+              id: "persist_tool_runs",
+              run: async () => {
+                for (const toolResult of turnState.toolResults) {
+                  await appendTurnEvent({
+                    nodeId: "persist_tool_runs",
+                    eventType: "tool_started",
+                    attempt: 1,
+                    payload: {
+                      callId: toolResult.callId,
+                      toolId: toolResult.toolId,
+                    },
+                  });
+                  await state.repository.saveToolRun({
+                    id: toolRunIdForTurn(turnState.turnId, toolResult.callId),
+                    conversationId,
+                    turnId: turnState.turnId,
+                    toolId: toolResult.toolId,
+                    toolSource: toolResult.source,
+                    input: toolResult.input,
+                    output: toolResult.output,
+                    status: toolResult.status,
+                    durationMs:
+                      Date.parse(toolResult.finishedAt ?? toolResult.startedAt) -
+                      Date.parse(toolResult.startedAt),
+                    createdAt: toolResult.startedAt,
+                  });
+                  await appendTurnEvent({
+                    nodeId: "persist_tool_runs",
+                    eventType: toolResult.status === "failed" ? "tool_failed" : "tool_succeeded",
+                    attempt: 1,
+                    payload: {
+                      callId: toolResult.callId,
+                      toolId: toolResult.toolId,
+                    },
+                  });
+                }
+              },
+            },
+            finalize_turn: {
+              id: "finalize_turn",
+              run: async () => {
+                if (!graphContext.acquiredTurnId) {
+                  return;
+                }
+                await finalizeConversationTurn({
+                  conversationId,
+                  turnId: graphContext.acquiredTurnId,
+                  telegramChatId: String(payload.chatId),
+                  telegramUserId: String(payload.userId),
+                  stepCount: turnState.budgets.stepsUsed,
+                  compacted: Boolean(turnState.context.summaryCursor),
+                  toolCallCount: turnState.budgets.toolCallsUsed,
+                  status: turnState.status === "aborted"
+                    ? "aborted"
+                    : turnState.error
+                      ? "failed"
+                      : "completed",
+                  error: turnState.error?.message ?? null,
+                  stateSnapshotId: turnState.id,
+                  currentNode: turnState.currentNode,
+                  resumeEligible: false,
+                  lastEventSeq: eventSeq,
+                });
+                if (turnState.status === "running") {
+                  turnState.status = "succeeded";
+                }
+                turnState.recovery.resumeEligible = false;
+              },
+            },
+            emit_reply: {
+              id: "emit_reply",
+              run: async () => {
+                if (!turnState.output.replyText) {
+                  turnState.output.replyText =
+                    turnState.status === "aborted"
+                      ? "The request was cancelled before completion."
+                      : "The agent turn failed. Open the Mini App health page for details.";
+                }
+              },
+            },
+            fail_turn: {
+              id: "fail_turn",
+              run: async () => {
+                if (!turnState.error) {
+                  turnState.error = {
+                    code: "TURN_FAILED",
+                    message: "Unknown turn failure",
+                    nodeId: turnState.currentNode,
+                    retryable: false,
+                    raw: {},
+                  };
+                }
+                turnState.status = "failed";
+                turnState.recovery.resumeEligible = false;
+                if (graphContext.acquiredTurnId) {
+                  await finalizeConversationTurn({
+                    conversationId,
+                    turnId: graphContext.acquiredTurnId,
+                    telegramChatId: String(payload.chatId),
+                    telegramUserId: String(payload.userId),
+                    stepCount: turnState.budgets.stepsUsed,
+                    compacted: Boolean(turnState.context.summaryCursor),
+                    toolCallCount: turnState.budgets.toolCallsUsed,
+                    status: "failed",
+                    error: turnState.error.message,
+                    stateSnapshotId: turnState.id,
+                    currentNode: "fail_turn",
+                    resumeEligible: false,
+                    lastEventSeq: eventSeq,
+                  });
+                }
+                if (!turnState.output.replyText) {
+                  turnState.output.replyText =
+                    "The agent turn failed. Open the Mini App health page for details.";
+                }
+              },
+            },
+          },
+        });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown agent error";
-        if (isMissingSecretError(error)) {
-          logger.warn({ error, conversationId }, "Provider API key is not configured");
-          await finalizeConversationTurn({
-            conversationId,
-            turnId: acquired.turnId!,
-            telegramChatId: String(payload.chatId),
-            telegramUserId: String(payload.userId),
-            stepCount: 0,
-            compacted: false,
-            toolCallCount: 0,
-            error: message,
-          });
-          return "Provider API key is not configured. Open Mini App > Providers and save a valid API key.";
-        }
-        logger.error({ error, conversationId }, "Telegram turn failed");
-        await finalizeConversationTurn({
-          conversationId,
-          turnId: acquired.turnId!,
-          telegramChatId: String(payload.chatId),
-          telegramUserId: String(payload.userId),
-          stepCount: 0,
-          compacted: false,
-          toolCallCount: 0,
-          error: message,
+        logger.error({ error, conversationId, turnId: turnState.turnId }, "Turn graph execution failed");
+        turnState.status = "failed";
+        turnState.error = turnState.error ?? toTurnError({
+          error,
+          nodeId: turnState.currentNode,
+          code: "TURN_GRAPH_CRASHED",
         });
-        return "The agent turn failed. Open the Mini App health page for details.";
+        turnState.recovery.resumeEligible = false;
+        if (!turnState.output.replyText) {
+          turnState.output.replyText =
+            "The agent turn failed. Open the Mini App health page for details.";
+        }
+        await persistTurnState();
       } finally {
-        activeTurns.delete(conversationId);
+        activeTurnSlot.resolve();
+        if (activeTurns.get(conversationId) === activeTurnSlot) {
+          activeTurns.delete(conversationId);
+        }
+        const terminalEvent: TurnEventType = turnState.status === "failed" ||
+            turnState.status === "aborted"
+          ? "turn_failed"
+          : "turn_succeeded";
+        await appendTurnEvent({
+          nodeId: turnState.currentNode,
+          eventType: terminalEvent,
+          attempt: 1,
+          payload: {
+            status: turnState.status,
+            error: turnState.error?.message ?? null,
+          },
+        });
+        await persistTurnState();
       }
+
+      return turnState.output.replyText;
     },
   });
+
+  const recoverInterruptedTurns = async () => {
+    const runningTurns = await state.repository.listConversationTurns({ status: "running" });
+    for (const turn of runningTurns) {
+      const snapshot = await state.repository.getLatestTurnState(turn.id);
+      const conversation = await state.repository.getConversation(turn.conversationId);
+      const chatId = conversation?.telegramChatId ?? "0";
+      const userId = conversation?.telegramUserId ?? "0";
+      let seq = turn.lastEventSeq ?? 0;
+
+      const appendRecoveryEvent = async (eventType: TurnEventType, payload: Record<string, unknown>) => {
+        seq += 1;
+        await state.repository.appendTurnEvent({
+          id: createId("tevt"),
+          turnId: turn.id,
+          seq,
+          nodeId: snapshot?.currentNode ?? turn.currentNode ?? "unknown",
+          eventType,
+          attempt: 1,
+          payload: toLooseJsonRecord(payload),
+          occurredAt: nowIso(),
+        });
+      };
+
+      if (!snapshot) {
+        await finalizeConversationTurn({
+          conversationId: turn.conversationId,
+          turnId: turn.id,
+          telegramChatId: chatId,
+          telegramUserId: userId,
+          stepCount: turn.stepCount,
+          compacted: turn.compacted,
+          toolCallCount: turn.toolCallCount,
+          status: "failed",
+          error: "TURN_INTERRUPTED_NO_STATE",
+          currentNode: turn.currentNode ?? "unknown",
+          resumeEligible: false,
+          lastEventSeq: seq,
+        });
+        continue;
+      }
+
+      const recoveredAt = nowIso();
+      const recoveredState = TurnStateSchema.parse({
+        ...snapshot,
+        version: snapshot.version + 1,
+        updatedAt: recoveredAt,
+        recovery: {
+          ...snapshot.recovery,
+          resumeCount: snapshot.recovery.resumeCount + 1,
+          lastRecoveredAt: recoveredAt,
+        },
+      });
+      await state.repository.saveTurnStateSnapshot(recoveredState);
+
+      if (
+        !recoveredState.recovery.resumeEligible ||
+        TURN_GRAPH_NON_RESUMABLE_NODES.has(recoveredState.currentNode) ||
+        !TURN_GRAPH_RECOVERABLE_NODES.has(recoveredState.currentNode)
+      ) {
+        const failedState = TurnStateSchema.parse({
+          ...recoveredState,
+          status: "failed",
+          version: recoveredState.version + 1,
+          updatedAt: nowIso(),
+          error: recoveredState.error ?? {
+            code: "TURN_INTERRUPTED_NON_RESUMABLE",
+            message: "Turn interrupted at non-resumable node",
+            nodeId: recoveredState.currentNode,
+            retryable: false,
+            raw: {},
+          },
+          recovery: {
+            ...recoveredState.recovery,
+            resumeEligible: false,
+          },
+        });
+        await state.repository.saveTurnStateSnapshot(failedState);
+        await appendRecoveryEvent("turn_recovered", {
+          resumed: false,
+          reason: "non_resumable",
+          node: recoveredState.currentNode,
+        });
+        await appendRecoveryEvent("turn_failed", {
+          code: failedState.error?.code ?? "TURN_INTERRUPTED_NON_RESUMABLE",
+          message: failedState.error?.message ?? "Turn interrupted",
+        });
+        await finalizeConversationTurn({
+          conversationId: turn.conversationId,
+          turnId: turn.id,
+          telegramChatId: chatId,
+          telegramUserId: userId,
+          stepCount: failedState.budgets.stepsUsed,
+          compacted: Boolean(failedState.context.summaryCursor),
+          toolCallCount: failedState.budgets.toolCallsUsed,
+          status: "failed",
+          error: failedState.error?.message ?? "Turn interrupted",
+          stateSnapshotId: failedState.id,
+          currentNode: failedState.currentNode,
+          resumeEligible: false,
+          lastEventSeq: seq,
+        });
+        continue;
+      }
+
+      await appendRecoveryEvent("turn_recovered", {
+        resumed: true,
+        node: recoveredState.currentNode,
+      });
+      await persistAssistantArtifactsFromState({
+        conversationId: turn.conversationId,
+        stateSnapshot: recoveredState,
+      });
+      await finalizeConversationTurn({
+        conversationId: turn.conversationId,
+        turnId: turn.id,
+        telegramChatId: chatId,
+        telegramUserId: userId,
+        stepCount: recoveredState.budgets.stepsUsed,
+        compacted: Boolean(recoveredState.context.summaryCursor),
+        toolCallCount: recoveredState.budgets.toolCallsUsed,
+        status: recoveredState.error ? "failed" : "completed",
+        error: recoveredState.error?.message ?? null,
+        stateSnapshotId: recoveredState.id,
+        currentNode: "finalize_turn",
+        resumeEligible: false,
+        lastEventSeq: seq,
+      });
+      await appendRecoveryEvent(
+        recoveredState.error ? "turn_failed" : "turn_succeeded",
+        {
+          node: recoveredState.currentNode,
+        },
+      );
+    }
+  };
+
+  const pruneOldTurnEvents = async () => {
+    const cutoffIso = new Date(Date.now() - TURN_EVENT_RETENTION_MS).toISOString();
+    const removed = await state.repository.pruneTurnEventsOlderThan(cutoffIso);
+    if (removed > 0) {
+      logger.info({ removed, cutoffIso }, "Pruned old turn events");
+    }
+  };
+
+  await recoverInterruptedTurns();
+  await pruneOldTurnEvents();
 
   let webhookInfoCache:
     | {
@@ -2865,9 +3645,15 @@ export async function createApp(
       logger.error({ error }, "Background job tick failed");
     });
   }, options.backgroundPollMs ?? 5_000);
+  const turnEventPruner = setInterval(() => {
+    void pruneOldTurnEvents().catch((error) => {
+      logger.warn({ error }, "Failed to prune turn events");
+    });
+  }, 24 * 60 * 60 * 1000);
 
   app.addHook("onClose", async () => {
     clearInterval(backgroundWorker);
+    clearInterval(turnEventPruner);
     await mcpSupervisor.closeAll();
   });
 
@@ -3961,10 +4747,49 @@ export async function createApp(
     state.repository.listAuditEvents(100),
   );
 
+  app.get(
+    "/api/system/turns/:turnId/state",
+    { preHandler: requireOwner },
+    async (request, reply) => {
+      const { turnId } = request.params as { turnId: string };
+      const snapshot = await state.repository.getLatestTurnState(turnId);
+      if (!snapshot) {
+        return reply.code(404).send({ error: "Turn state not found" });
+      }
+      return snapshot;
+    },
+  );
+
+  app.get(
+    "/api/system/turns/:turnId/events",
+    { preHandler: requireOwner },
+    async (request) => {
+      const { turnId } = request.params as { turnId: string };
+      const query = request.query as {
+        cursorSeq?: string | number;
+        limit?: string | number;
+      };
+      const cursorSeq = query.cursorSeq === undefined
+        ? undefined
+        : Number(query.cursorSeq);
+      const limit = query.limit === undefined ? undefined : Number(query.limit);
+      return state.repository.listTurnEvents(turnId, {
+        ...(Number.isFinite(cursorSeq) ? { cursorSeq: Number(cursorSeq) } : {}),
+        ...(Number.isFinite(limit) ? { limit: Number(limit) } : {}),
+      });
+    },
+  );
+
   app.get("/api/system/health", { preHandler: requireOwner }, async (request) => {
     const jobs = await state.repository.listJobs();
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpServers = await state.repository.listMcpServers();
+    const allTurns = await state.repository.listConversationTurns({ limit: 200 });
+    const runningTurns = allTurns.filter((turn) => turn.status === "running");
+    const failedTurns = allTurns
+      .filter((turn) => turn.status === "failed")
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, 5);
     const expectedWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env, request);
     const webhookInfo = await readTelegramWebhookInfo();
     return {
@@ -3981,6 +4806,19 @@ export async function createApp(
       providerProfiles: (await state.repository.listProviderProfiles()).length,
       mcpServers: mcpServers.length,
       activeTurnLocks: await state.listActiveConversationLocks(),
+      graph: {
+        enabled: true,
+        runningTurns: runningTurns.length,
+        resumableTurns: runningTurns.filter((turn) => turn.resumeEligible).length,
+        stuckTurns: runningTurns.filter((turn) => !isIsoInFuture(turn.lockExpiresAt)).length,
+        recentTurnFailures: failedTurns.map((turn) => ({
+          turnId: turn.id,
+          conversationId: turn.conversationId,
+          error: turn.error,
+          currentNode: turn.currentNode,
+          updatedAt: turn.updatedAt,
+        })),
+      },
       jobs: {
         pending: jobs.filter((job) => job.status === "pending").length,
         running: jobs.filter((job) => job.status === "running").length,

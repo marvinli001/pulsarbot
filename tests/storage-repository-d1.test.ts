@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { InstallRecord, MemoryChunk } from "../packages/shared/src/index.js";
+import type {
+  InstallRecord,
+  MemoryChunk,
+  TurnEvent,
+  TurnState,
+} from "../packages/shared/src/index.js";
 import { D1AppRepository } from "../packages/storage/src/index.js";
 
 function makeInstallRecord(): InstallRecord {
@@ -25,6 +30,75 @@ function makeMemoryChunk(): MemoryChunk {
     metadata: {},
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function makeTurnState(): TurnState {
+  return {
+    id: "state_1",
+    turnId: "turn_1",
+    workspaceId: "workspace_1",
+    conversationId: "conversation_1",
+    graphVersion: "v1",
+    status: "running",
+    currentNode: "ingest_input",
+    version: 1,
+    input: {
+      updateId: 123,
+      chatId: 1,
+      threadId: null,
+      userId: 42,
+      username: "owner",
+      messageId: 9,
+      contentKind: "text",
+      normalizedText: "hello",
+      rawMetadata: {},
+    },
+    context: {
+      profileId: "agent_1",
+      timezone: "UTC",
+      nowIso: "2026-01-01T00:00:00.000Z",
+      runtimeSnapshot: {},
+      searchSettings: null,
+      historyWindow: 0,
+      summaryCursor: null,
+    },
+    budgets: {
+      maxPlanningSteps: 8,
+      maxToolCalls: 6,
+      maxTurnDurationMs: 30_000,
+      stepsUsed: 0,
+      toolCallsUsed: 0,
+      deadlineAt: "2026-01-01T00:00:30.000Z",
+    },
+    toolResults: [],
+    output: {
+      replyText: "",
+      telegramReplyMessageId: null,
+      streamingEnabled: false,
+      lastRenderedChars: 0,
+    },
+    error: null,
+    recovery: {
+      resumeEligible: true,
+      resumeCount: 0,
+      lastRecoveredAt: null,
+    },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function makeTurnEvent(): TurnEvent {
+  return {
+    id: "tevt_1",
+    turnId: "turn_1",
+    seq: 1,
+    nodeId: "ingest_input",
+    eventType: "node_started",
+    attempt: 1,
+    payload: {},
+    occurredAt: "2026-01-01T00:00:00.000Z",
   };
 }
 
@@ -96,6 +170,84 @@ describe("D1AppRepository", () => {
         "WHERE json_extract(data, '$.documentId') = ? AND json_extract(data, '$.workspaceId') = ?",
       ),
       ["document_1", "workspace_1"],
+    );
+  });
+
+  it("upserts turn state snapshots by id", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => []);
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+    const snapshot = makeTurnState();
+
+    await repository.saveTurnStateSnapshot(snapshot);
+
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      expect.stringContaining("INSERT INTO turn_state_snapshot (id, data) VALUES (?, ?)"),
+      [snapshot.id, JSON.stringify(snapshot)],
+    );
+  });
+
+  it("lists turn events by turn + cursor + limit in SQL", async () => {
+    const event = makeTurnEvent();
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => [{ data: JSON.stringify(event) }]);
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    const rows = await repository.listTurnEvents("turn_1", {
+      cursorSeq: 3,
+      limit: 25,
+    });
+
+    expect(rows).toEqual([event]);
+    expect(queryD1).toHaveBeenCalledWith(
+      "db_1",
+      expect.stringContaining("FROM turn_event"),
+      ["turn_1", 3, 25],
+    );
+  });
+
+  it("prunes turn events older than cutoff", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async (databaseId: string, sql: string) => {
+      void databaseId;
+      if (sql.includes("SELECT id FROM turn_event")) {
+        return [{ id: "tevt_1" }, { id: "tevt_2" }];
+      }
+      return [];
+    });
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    const count = await repository.pruneTurnEventsOlderThan("2026-01-08T00:00:00.000Z");
+
+    expect(count).toBe(2);
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM turn_event WHERE id = ?",
+      ["tevt_1"],
+    );
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM turn_event WHERE id = ?",
+      ["tevt_2"],
     );
   });
 });
