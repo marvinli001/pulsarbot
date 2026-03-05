@@ -147,7 +147,7 @@ export interface TelegramSettingsButtonConfig {
   onClick?: () => void;
 }
 
-const DEFAULT_THEME: Required<TelegramThemeParams> = {
+const DEFAULT_THEME_LIGHT: Required<TelegramThemeParams> = {
   bg_color: "#f5f0e5",
   secondary_bg_color: "#ffffff",
   text_color: "#0f172a",
@@ -164,6 +164,23 @@ const DEFAULT_THEME: Required<TelegramThemeParams> = {
   bottom_bar_bg_color: "#ffffff",
 };
 
+const DEFAULT_THEME_DARK: Required<TelegramThemeParams> = {
+  bg_color: "#0f131a",
+  secondary_bg_color: "#171d27",
+  text_color: "#f8fafc",
+  hint_color: "#94a3b8",
+  link_color: "#7dd3fc",
+  button_color: "#2ea6ff",
+  button_text_color: "#ffffff",
+  header_bg_color: "#0b1220",
+  accent_text_color: "#67e8f9",
+  section_bg_color: "#101826",
+  section_header_text_color: "#f8fafc",
+  subtitle_text_color: "#94a3b8",
+  destructive_text_color: "#fb7185",
+  bottom_bar_bg_color: "#0f172a",
+};
+
 const DEFAULT_INSETS: Required<TelegramInsets> = {
   top: 0,
   bottom: 0,
@@ -178,17 +195,31 @@ let mainButtonHandler: (() => void) | null = null;
 let backButtonHandler: (() => void) | null = null;
 let settingsButtonHandler: (() => void) | null = null;
 let resizeHandlerAttached = false;
+let colorSchemeMediaAttached = false;
+
+function getPreferredColorScheme(): TelegramColorScheme {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return "light";
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function themeDefaultsFor(colorScheme: TelegramColorScheme) {
+  return colorScheme === "dark" ? DEFAULT_THEME_DARK : DEFAULT_THEME_LIGHT;
+}
+
+const initialColorScheme = getPreferredColorScheme();
 
 let snapshot: TelegramMiniAppState = {
   isTelegram: false,
   isReady: false,
   platform: null,
   version: null,
-  colorScheme: "light",
+  colorScheme: initialColorScheme,
   isExpanded: true,
   viewportHeight: typeof window === "undefined" ? 0 : window.innerHeight,
   viewportStableHeight: typeof window === "undefined" ? 0 : window.innerHeight,
-  themeParams: DEFAULT_THEME,
+  themeParams: themeDefaultsFor(initialColorScheme),
   safeAreaInset: DEFAULT_INSETS,
   contentSafeAreaInset: DEFAULT_INSETS,
 };
@@ -240,43 +271,93 @@ function themeValue(
   return normalizeColor(params[key], fallback);
 }
 
+function hexToRgb(hex: string) {
+  const normalized = hex.length === 4
+    ? `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`
+    : hex;
+  const raw = normalized.slice(1);
+  const value = Number.parseInt(raw, 16);
+  return {
+    r: (value >> 16) & 0xff,
+    g: (value >> 8) & 0xff,
+    b: value & 0xff,
+  };
+}
+
+function srgbToLinear(channel: number) {
+  const normalized = channel / 255;
+  if (normalized <= 0.04045) {
+    return normalized / 12.92;
+  }
+  return ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+function relativeLuminance(hex: string) {
+  const { r, g, b } = hexToRgb(hex);
+  const lr = srgbToLinear(r);
+  const lg = srgbToLinear(g);
+  const lb = srgbToLinear(b);
+  return (0.2126 * lr) + (0.7152 * lg) + (0.0722 * lb);
+}
+
+function contrastRatio(background: string, foreground: string) {
+  const l1 = relativeLuminance(background);
+  const l2 = relativeLuminance(foreground);
+  const lighter = Math.max(l1, l2);
+  const darker = Math.min(l1, l2);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function pickReadableTextColor(background: string, preferred: string) {
+  const dark = "#0f172a";
+  const light = "#ffffff";
+  if (contrastRatio(background, preferred) >= 4.5) {
+    return preferred;
+  }
+  return contrastRatio(background, dark) >= contrastRatio(background, light)
+    ? dark
+    : light;
+}
+
 function applyThemeToDocument(
   colorScheme: TelegramColorScheme,
   params: TelegramThemeParams,
 ) {
   const webApp = hasRealTelegramSession(getWebApp()) ? getWebApp() : null;
-  const bg = themeValue(params, "bg_color", DEFAULT_THEME.bg_color);
+  const fallbackTheme = themeDefaultsFor(colorScheme);
+  const bg = themeValue(params, "bg_color", fallbackTheme.bg_color);
   const secondary = themeValue(
     params,
     "secondary_bg_color",
-    DEFAULT_THEME.secondary_bg_color,
+    fallbackTheme.secondary_bg_color,
   );
   const section = themeValue(
     params,
     "section_bg_color",
     secondary,
   );
-  const text = themeValue(params, "text_color", DEFAULT_THEME.text_color);
-  const hint = themeValue(params, "hint_color", DEFAULT_THEME.hint_color);
+  const text = themeValue(params, "text_color", fallbackTheme.text_color);
+  const hint = themeValue(params, "hint_color", fallbackTheme.hint_color);
   const header = themeValue(
     params,
     "header_bg_color",
-    colorScheme === "dark" ? secondary : DEFAULT_THEME.header_bg_color,
+    colorScheme === "dark" ? secondary : fallbackTheme.header_bg_color,
   );
   const button = themeValue(
     params,
     "button_color",
-    colorScheme === "dark" ? "#2ea6ff" : DEFAULT_THEME.button_color,
+    fallbackTheme.button_color,
   );
   const buttonText = themeValue(
     params,
     "button_text_color",
-    DEFAULT_THEME.button_text_color,
+    fallbackTheme.button_text_color,
   );
+  const headerText = pickReadableTextColor(header, buttonText);
   const accent = themeValue(
     params,
     "accent_text_color",
-    colorScheme === "dark" ? "#7dd3fc" : DEFAULT_THEME.accent_text_color,
+    fallbackTheme.accent_text_color,
   );
   const subtitle = themeValue(
     params,
@@ -286,7 +367,7 @@ function applyThemeToDocument(
   const destructive = themeValue(
     params,
     "destructive_text_color",
-    DEFAULT_THEME.destructive_text_color,
+    fallbackTheme.destructive_text_color,
   );
   const bottomBar = themeValue(
     params,
@@ -307,7 +388,7 @@ function applyThemeToDocument(
   setRootVar("--tg-secondary-bg-color", secondary);
   setRootVar("--tg-text-color", text);
   setRootVar("--tg-hint-color", hint);
-  setRootVar("--tg-link-color", themeValue(params, "link_color", DEFAULT_THEME.link_color));
+  setRootVar("--tg-link-color", themeValue(params, "link_color", fallbackTheme.link_color));
   setRootVar("--tg-button-color", button);
   setRootVar("--tg-button-text-color", buttonText);
   setRootVar("--tg-header-bg-color", header);
@@ -322,7 +403,7 @@ function applyThemeToDocument(
   setRootVar("--app-surface-soft", secondary);
   setRootVar("--app-border", border);
   setRootVar("--app-header-bg", header);
-  setRootVar("--app-header-text", buttonText);
+  setRootVar("--app-header-text", headerText);
   setRootVar("--app-muted-text", subtitle);
   setRootVar("--app-subtle-text", hint);
   setRootVar("--app-success-bg", colorScheme === "dark" ? "rgba(16,185,129,0.16)" : "#d1fae5");
@@ -331,6 +412,9 @@ function applyThemeToDocument(
   setRootVar("--app-warning-text", colorScheme === "dark" ? "#fbbf24" : "#b45309");
   setRootVar("--app-danger-bg", colorScheme === "dark" ? "rgba(244,63,94,0.18)" : "#ffe4e6");
   setRootVar("--app-danger-text", destructive);
+  setRootVar("--app-warning-soft", colorScheme === "dark" ? "rgba(245,158,11,0.16)" : "#fffbeb");
+  setRootVar("--app-warning-border", colorScheme === "dark" ? "rgba(251,191,36,0.36)" : "#fcd34d");
+  setRootVar("--app-warning-strong", colorScheme === "dark" ? "#fcd34d" : "#92400e");
   document.documentElement.dataset.telegramColorScheme = colorScheme;
   document.documentElement.style.colorScheme = colorScheme;
   const themeMeta = document.querySelector("meta[name='theme-color']");
@@ -373,13 +457,17 @@ function applyViewportToDocument(state: TelegramMiniAppState) {
 function updateSnapshot() {
   const webApp = getWebApp();
   const isTelegram = hasRealTelegramSession(webApp);
+  const colorScheme = isTelegram
+    ? webApp?.colorScheme ?? getPreferredColorScheme()
+    : getPreferredColorScheme();
+  const defaults = themeDefaultsFor(colorScheme);
 
   snapshot = {
     isTelegram,
     isReady: isTelegram && readyDispatched,
     platform: isTelegram ? webApp?.platform ?? null : null,
     version: isTelegram ? webApp?.version ?? null : null,
-    colorScheme: isTelegram ? webApp?.colorScheme ?? "light" : "light",
+    colorScheme,
     isExpanded: isTelegram ? webApp?.isExpanded ?? true : true,
     viewportHeight: Number((isTelegram ? webApp?.viewportHeight : undefined) ?? window.innerHeight),
     viewportStableHeight: Number(
@@ -387,7 +475,7 @@ function updateSnapshot() {
         window.innerHeight,
     ),
     themeParams: {
-      ...DEFAULT_THEME,
+      ...defaults,
       ...(isTelegram ? webApp?.themeParams ?? {} : {}),
     },
     safeAreaInset: normalizeInsets(isTelegram ? webApp?.safeAreaInset : undefined),
@@ -415,6 +503,25 @@ function attachWindowResizeFallback() {
   resizeHandlerAttached = true;
 }
 
+function attachColorSchemeFallback() {
+  if (
+    colorSchemeMediaAttached ||
+    typeof window === "undefined" ||
+    typeof window.matchMedia !== "function"
+  ) {
+    return;
+  }
+  const media = window.matchMedia("(prefers-color-scheme: dark)");
+  const handleChange = () => {
+    if (getWebApp()) {
+      return;
+    }
+    updateSnapshot();
+  };
+  media.addEventListener("change", handleChange);
+  colorSchemeMediaAttached = true;
+}
+
 export function initTelegramMiniApp() {
   if (initialized) {
     return;
@@ -424,6 +531,7 @@ export function initTelegramMiniApp() {
   const webApp = getWebApp();
   updateSnapshot();
   attachWindowResizeFallback();
+  attachColorSchemeFallback();
 
   if (!webApp) {
     return;
@@ -589,11 +697,12 @@ export function configureTelegramMainButton(
     return;
   }
 
-  const color = themeValue(snapshot.themeParams, "button_color", DEFAULT_THEME.button_color);
+  const fallbackTheme = themeDefaultsFor(snapshot.colorScheme);
+  const color = themeValue(snapshot.themeParams, "button_color", fallbackTheme.button_color);
   const textColor = themeValue(
     snapshot.themeParams,
     "button_text_color",
-    DEFAULT_THEME.button_text_color,
+    fallbackTheme.button_text_color,
   );
 
   if (mainButton.setParams) {

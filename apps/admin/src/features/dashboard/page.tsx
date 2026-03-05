@@ -36,6 +36,7 @@ function Page() {
     setActiveSection,
   } = useAdminUiStore();
   const requiresClosingConfirmation = activeSection !== "overview";
+  const headerMutedText = "color-mix(in srgb, var(--app-header-text) 72%, transparent)";
 
   useTelegramBackButton(
     activeSection !== "overview"
@@ -94,24 +95,24 @@ function Page() {
           <div className="min-w-0 flex-1">
             <p
               className="text-xs uppercase tracking-[0.24em]"
-              style={{ color: "var(--app-subtle-text)" }}
+              style={{ color: headerMutedText }}
             >
               Telegram Mini App
             </p>
             <h2 className="mt-2 break-words font-['Space_Grotesk',sans-serif] text-2xl font-semibold leading-tight sm:text-3xl">
               Pulsarbot Control Center
             </h2>
-            <p className="mt-2 text-sm" style={{ color: "var(--app-subtle-text)" }}>
+            <p className="mt-2 text-sm" style={{ color: headerMutedText }}>
               Owner: {session.data?.user?.username ?? session.data?.user?.userId ?? "Unknown"}
             </p>
-            <p className="mt-2 text-xs" style={{ color: "var(--app-subtle-text)" }}>
+            <p className="mt-2 text-xs" style={{ color: headerMutedText }}>
               {telegram.isTelegram
                 ? `Telegram ${telegram.platform ?? "unknown"} · v${telegram.version ?? "?"} · ${Math.round(telegram.viewportHeight)}px`
                 : "Browser preview mode"}
             </p>
           </div>
           <div
-            className="max-w-full rounded-2xl px-3 py-2 text-xs sm:rounded-full sm:px-4 sm:text-sm"
+            className="w-full rounded-2xl px-3 py-2 text-xs sm:ml-auto sm:w-auto sm:rounded-full sm:px-4 sm:text-sm"
             style={{
               background: "color-mix(in srgb, var(--app-header-text) 10%, transparent)",
               color: "var(--app-header-text)",

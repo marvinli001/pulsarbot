@@ -32,6 +32,9 @@
   --app-warning-text: #b45309;
   --app-danger-bg: #ffe4e6;
   --app-danger-text: #dc2626;
+  --app-warning-soft: #fffbeb;
+  --app-warning-border: #fcd34d;
+  --app-warning-strong: #92400e;
   --app-viewport-height: 100dvh;
   --app-viewport-stable-height: 100dvh;
   --tg-safe-area-inset-top: 0px;
@@ -91,6 +94,14 @@ body,
   color: var(--app-header-text) !important;
 }
 
+.text-rose-600 {
+  color: var(--app-danger-text) !important;
+}
+
+.text-amber-900 {
+  color: var(--app-warning-strong) !important;
+}
+
 .bg-white,
 .bg-white\/75,
 .bg-white\/80,
@@ -104,10 +115,18 @@ body,
   background-color: var(--app-header-bg) !important;
 }
 
+.bg-amber-50 {
+  background-color: var(--app-warning-soft) !important;
+}
+
 .border-slate-200,
 .border-slate-200\/80,
 .border-white\/60 {
   border-color: var(--app-border) !important;
+}
+
+.border-amber-200 {
+  border-color: var(--app-warning-border) !important;
 }
 
 .hover\:bg-slate-100:hover,
