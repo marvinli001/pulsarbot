@@ -61,6 +61,11 @@ function ensurePrivate(ctx: Context): boolean {
   return ctx.chat?.type === "private";
 }
 
+type ThreadReplyOptions = {
+  message_thread_id?: number;
+  direct_messages_topic_id?: number;
+};
+
 function parseThreadId(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -74,11 +79,134 @@ function parseThreadId(value: unknown): number | null {
   return null;
 }
 
-function readMessageThreadId(message: unknown): number | null {
-  if (!message || typeof message !== "object") {
-    return null;
+function parseChatId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
   }
-  return parseThreadId((message as Record<string, unknown>).message_thread_id);
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  return null;
+}
+
+function readThreadContext(message: unknown): {
+  threadId: number | null;
+  replyOptions: ThreadReplyOptions | undefined;
+} {
+  if (!message || typeof message !== "object") {
+    return {
+      threadId: null,
+      replyOptions: undefined,
+    };
+  }
+
+  const record = message as Record<string, unknown>;
+  const directMessagesTopicId = parseThreadId(record.direct_messages_topic_id);
+  if (directMessagesTopicId !== null) {
+    return {
+      threadId: directMessagesTopicId,
+      replyOptions: {
+        direct_messages_topic_id: directMessagesTopicId,
+      },
+    };
+  }
+
+  const messageThreadId = parseThreadId(record.message_thread_id);
+  return {
+    threadId: messageThreadId,
+    replyOptions: messageThreadId !== null
+      ? {
+          message_thread_id: messageThreadId,
+        }
+      : undefined,
+  };
+}
+
+function classifyMessageEventType(prefix: string, message: unknown): string {
+  if (!message || typeof message !== "object") {
+    return prefix;
+  }
+
+  const record = message as Record<string, unknown>;
+  if (typeof record.text === "string") {
+    return `${prefix}:text`;
+  }
+  if ("voice" in record) {
+    return `${prefix}:voice`;
+  }
+  if ("photo" in record) {
+    return `${prefix}:photo`;
+  }
+  if ("document" in record) {
+    return `${prefix}:document`;
+  }
+  if ("audio" in record) {
+    return `${prefix}:audio`;
+  }
+  return prefix;
+}
+
+function readUpdateContext(update: unknown): {
+  eventType: string;
+  chatId: number | null;
+  threadId: number | null;
+} {
+  if (!update || typeof update !== "object") {
+    return {
+      eventType: "unknown",
+      chatId: null,
+      threadId: null,
+    };
+  }
+
+  const record = update as Record<string, unknown>;
+  const extractFromMessage = (eventType: string, message: unknown) => {
+    const messageRecord =
+      message && typeof message === "object"
+        ? (message as Record<string, unknown>)
+        : null;
+    const chatId = messageRecord && typeof messageRecord.chat === "object"
+      ? parseChatId((messageRecord.chat as Record<string, unknown>).id)
+      : null;
+    const { threadId } = readThreadContext(message);
+    return {
+      eventType,
+      chatId,
+      threadId,
+    };
+  };
+
+  if ("message" in record) {
+    return extractFromMessage(
+      classifyMessageEventType("message", record.message),
+      record.message,
+    );
+  }
+
+  if ("edited_message" in record) {
+    return extractFromMessage(
+      classifyMessageEventType("edited_message", record.edited_message),
+      record.edited_message,
+    );
+  }
+
+  if ("callback_query" in record && record.callback_query && typeof record.callback_query === "object") {
+    const callbackQuery = record.callback_query as Record<string, unknown>;
+    return extractFromMessage(
+      typeof callbackQuery.data === "string" ? "callback_query:data" : "callback_query",
+      callbackQuery.message,
+    );
+  }
+
+  const fallbackType = Object.keys(record).find((key) => key !== "update_id") ?? "unknown";
+  return {
+    eventType: fallbackType,
+    chatId: null,
+    threadId: null,
+  };
 }
 
 async function dispatchMessage(args: {
@@ -93,19 +221,25 @@ async function dispatchMessage(args: {
     return;
   }
 
-  const threadId = readMessageThreadId(ctx.msg);
-  const placeholder = await ctx.reply(
-    "Thinking…",
-    threadId !== null ? { message_thread_id: threadId } : undefined,
-  );
+  const updateRecord = ctx.update as unknown as Record<string, unknown>;
+  const threadContext = readThreadContext(updateRecord.message ?? ctx.msg);
+  let placeholder;
+  try {
+    placeholder = await ctx.reply("Thinking…", threadContext.replyOptions);
+  } catch {
+    placeholder = await ctx.reply("Thinking…");
+  }
   const controller = createTelegramStreamController({
     ctx,
     placeholderMessageId: placeholder.message_id,
+    ...(threadContext.replyOptions
+      ? { replyOptions: threadContext.replyOptions }
+      : {}),
   });
   const reply = await onMessage(
     {
       chatId: ctx.chat!.id,
-      threadId,
+      threadId: threadContext.threadId,
       userId: ctx.from!.id,
       username: ctx.from?.username ?? undefined,
       messageId: ctx.msg?.message_id ?? null,
@@ -128,6 +262,7 @@ function normalizeTelegramError(error: unknown): string {
 export function createTelegramStreamController(args: {
   ctx: Context;
   placeholderMessageId: number;
+  replyOptions?: ThreadReplyOptions;
 }): TelegramResponseStreamController {
   let latestText = "";
   let lastRenderedText = "";
@@ -138,12 +273,12 @@ export function createTelegramStreamController(args: {
   const maxEdits = 30;
   const throttleMs = 800;
 
-  const flush = async (force = false) => {
+  const flush = async (force = false): Promise<boolean> => {
     if (closed || !latestText || latestText === lastRenderedText) {
-      return;
+      return true;
     }
     if (!force && editCount >= maxEdits) {
-      return;
+      return false;
     }
 
     try {
@@ -155,12 +290,14 @@ export function createTelegramStreamController(args: {
       lastRenderedText = latestText;
       lastFlushAt = Date.now();
       editCount += 1;
+      return true;
     } catch (error) {
       const message = normalizeTelegramError(error);
       if (!/message is not modified/i.test(message)) {
-        return;
+        return false;
       }
       lastRenderedText = latestText;
+      return true;
     }
   };
 
@@ -197,7 +334,15 @@ export function createTelegramStreamController(args: {
         timer = null;
       }
       latestText = finalText || latestText;
-      await flush(true);
+      const rendered = await flush(true);
+      if (!rendered && latestText) {
+        try {
+          await args.ctx.reply(latestText, args.replyOptions);
+          lastRenderedText = latestText;
+        } catch {
+          // Do not throw from finalize if Telegram rejects fallback send.
+        }
+      }
       closed = true;
     },
   };
@@ -233,15 +378,19 @@ export function createTelegramBot(args: {
     webhookState.lastThreadId = threadId;
   };
 
+  bot.use(async (ctx, next) => {
+    const context = readUpdateContext(ctx.update);
+    markUpdate(context.eventType, context.chatId, context.threadId);
+    await next();
+  });
+
   bot.command("start", async (ctx) => {
-    markUpdate("message:start", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     await ctx.reply(
       "Pulsarbot is online. Open the Telegram Mini App to configure providers, skills, and MCP servers.",
     );
   });
 
   bot.on("message:text", async (ctx) => {
-    markUpdate("message:text", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     await dispatchMessage({
       ctx,
       token: args.token,
@@ -255,7 +404,6 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:voice", async (ctx) => {
-    markUpdate("message:voice", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const metadata = await resolveFileMetadata(ctx, args.token, ctx.message.voice.file_id);
     await dispatchMessage({
       ctx,
@@ -274,7 +422,6 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:photo", async (ctx) => {
-    markUpdate("message:photo", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     if (!photo) {
       return;
@@ -298,7 +445,6 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:document", async (ctx) => {
-    markUpdate("message:document", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const document = ctx.message.document;
     const metadata = await resolveFileMetadata(ctx, args.token, document.file_id);
     await dispatchMessage({
@@ -319,7 +465,6 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:audio", async (ctx) => {
-    markUpdate("message:audio", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const audio = ctx.message.audio;
     const metadata = await resolveFileMetadata(ctx, args.token, audio.file_id);
     await dispatchMessage({
@@ -343,11 +488,6 @@ export function createTelegramBot(args: {
   });
 
   bot.on("edited_message:text", async (ctx) => {
-    markUpdate(
-      "edited_message:text",
-      ctx.chat?.id ?? null,
-      readMessageThreadId(ctx.editedMessage),
-    );
     await dispatchMessage({
       ctx,
       token: args.token,
@@ -363,8 +503,12 @@ export function createTelegramBot(args: {
   });
 
   bot.on("callback_query:data", async (ctx) => {
-    const threadId = readMessageThreadId(ctx.callbackQuery.message);
-    markUpdate("callback_query:data", ctx.chat?.id ?? null, threadId);
+    const updateRecord = ctx.update as unknown as Record<string, unknown>;
+    const callbackQuery =
+      updateRecord.callback_query && typeof updateRecord.callback_query === "object"
+        ? updateRecord.callback_query as Record<string, unknown>
+        : null;
+    const threadContext = readThreadContext(callbackQuery?.message ?? ctx.callbackQuery.message);
     if (!ensurePrivate(ctx)) {
       await ctx.answerCallbackQuery({
         text: "Private chat only.",
@@ -375,7 +519,7 @@ export function createTelegramBot(args: {
     const reply = await args.onMessage(
       {
         chatId: ctx.chat!.id,
-        threadId,
+        threadId: threadContext.threadId,
         userId: ctx.from.id,
         username: ctx.from.username ?? undefined,
         messageId: ctx.callbackQuery.message?.message_id ?? null,
@@ -390,14 +534,10 @@ export function createTelegramBot(args: {
       createDisabledTelegramStreamController(),
     );
     await ctx.answerCallbackQuery();
-    await ctx.reply(
-      reply,
-      threadId !== null ? { message_thread_id: threadId } : undefined,
-    );
+    await ctx.reply(reply, threadContext.replyOptions);
   });
 
   bot.on("my_chat_member", async (ctx) => {
-    markUpdate("my_chat_member", ctx.chat?.id ?? null, null);
     void ctx;
   });
 

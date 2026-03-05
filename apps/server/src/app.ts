@@ -156,6 +156,162 @@ function isMissingSecretError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Secret not found for scope:");
 }
 
+interface TelegramWebhookInfo {
+  url?: string;
+  has_custom_certificate?: boolean;
+  pending_update_count?: number;
+  ip_address?: string;
+  last_error_date?: number;
+  last_error_message?: string;
+  last_synchronization_error_date?: number;
+  max_connections?: number;
+  allowed_updates?: string[];
+}
+
+function normalizePublicBaseUrl(input: string | undefined): string | null {
+  if (!input) {
+    return null;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  try {
+    const url = new URL(candidate);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeWebhookUrlInput(input: string | undefined): string | null {
+  if (!input) {
+    return null;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    return new URL(trimmed).toString();
+  } catch {
+    const base = normalizePublicBaseUrl(trimmed);
+    if (!base) {
+      return null;
+    }
+    return new URL("/telegram/webhook", `${base}/`).toString();
+  }
+}
+
+function inferPublicBaseUrlFromRequest(request: FastifyRequest): string | null {
+  const forwardedProtoRaw = request.headers["x-forwarded-proto"];
+  const forwardedHostRaw = request.headers["x-forwarded-host"];
+  const hostRaw = request.headers.host;
+
+  const forwardedProto = Array.isArray(forwardedProtoRaw)
+    ? forwardedProtoRaw[0]
+    : forwardedProtoRaw;
+  const forwardedHost = Array.isArray(forwardedHostRaw)
+    ? forwardedHostRaw[0]
+    : forwardedHostRaw;
+  const host = Array.isArray(hostRaw) ? hostRaw[0] : hostRaw;
+
+  const proto = typeof forwardedProto === "string" && forwardedProto.trim()
+    ? forwardedProto.split(",")[0]!.trim()
+    : "https";
+  const hostValue = typeof forwardedHost === "string" && forwardedHost.trim()
+    ? forwardedHost.split(",")[0]!.trim()
+    : typeof host === "string" && host.trim()
+      ? host.trim()
+      : "";
+
+  if (!hostValue) {
+    return null;
+  }
+
+  return normalizePublicBaseUrl(`${proto}://${hostValue}`);
+}
+
+function resolveExpectedTelegramWebhookUrl(
+  env: ReturnType<typeof loadEnv>,
+  request: FastifyRequest | null = null,
+): string | null {
+  if (env.TELEGRAM_WEBHOOK_URL) {
+    try {
+      return new URL(env.TELEGRAM_WEBHOOK_URL).toString();
+    } catch {
+      return null;
+    }
+  }
+
+  const baseUrl =
+    normalizePublicBaseUrl(env.PUBLIC_BASE_URL) ??
+    normalizePublicBaseUrl(env.RAILWAY_STATIC_URL) ??
+    normalizePublicBaseUrl(env.RAILWAY_PUBLIC_DOMAIN) ??
+    (request ? inferPublicBaseUrlFromRequest(request) : null);
+  if (!baseUrl) {
+    return null;
+  }
+
+  try {
+    return new URL("/telegram/webhook", `${baseUrl}/`).toString();
+  } catch {
+    return null;
+  }
+}
+
+async function requestTelegramBotApi<T>(
+  token: string,
+  method: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      ...(init.headers ?? {}),
+    },
+    signal: init.signal ?? AbortSignal.timeout(6_000),
+  });
+  const payload = await response.json() as {
+    ok: boolean;
+    result?: T;
+    description?: string;
+  };
+
+  if (!response.ok || !payload.ok || typeof payload.result === "undefined") {
+    throw new Error(payload.description ?? `Telegram API ${method} failed`);
+  }
+
+  return payload.result;
+}
+
+async function getTelegramWebhookInfo(token: string): Promise<TelegramWebhookInfo> {
+  return requestTelegramBotApi<TelegramWebhookInfo>(token, "getWebhookInfo", {
+    method: "GET",
+  });
+}
+
+async function setTelegramWebhook(
+  token: string,
+  url: string,
+  dropPendingUpdates = false,
+): Promise<boolean> {
+  return requestTelegramBotApi<boolean>(token, "setWebhook", {
+    method: "POST",
+    body: JSON.stringify({
+      url,
+      drop_pending_updates: dropPendingUpdates,
+    }),
+  });
+}
+
 class RuntimeState {
   public repository: AppRepository = new InMemoryAppRepository();
   public readonly marketRoot = path.resolve(repoRootDir, "market");
@@ -2719,6 +2875,70 @@ export async function createApp(
     },
   });
 
+  let webhookInfoCache:
+    | {
+        fetchedAt: number;
+        info: TelegramWebhookInfo | null;
+        error: string | null;
+      }
+    | null = null;
+  const webhookDiagnosticsEnabled = Boolean(
+    state.env.TELEGRAM_WEBHOOK_URL ||
+      state.env.PUBLIC_BASE_URL ||
+      state.env.RAILWAY_PUBLIC_DOMAIN ||
+      state.env.RAILWAY_STATIC_URL,
+  );
+  const readTelegramWebhookInfo = async (force = false) => {
+    const now = Date.now();
+    if (!force && webhookInfoCache && now - webhookInfoCache.fetchedAt < 30_000) {
+      return webhookInfoCache;
+    }
+    if (!force && !webhookDiagnosticsEnabled) {
+      return {
+        fetchedAt: now,
+        info: null,
+        error: null,
+      };
+    }
+
+    try {
+      const info = await getTelegramWebhookInfo(state.env.TELEGRAM_BOT_TOKEN);
+      webhookInfoCache = {
+        fetchedAt: now,
+        info,
+        error: null,
+      };
+      return webhookInfoCache;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      webhookInfoCache = {
+        fetchedAt: now,
+        info: null,
+        error: message,
+      };
+      return webhookInfoCache;
+    }
+  };
+
+  const startupWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env);
+  if (startupWebhookUrl) {
+    void setTelegramWebhook(state.env.TELEGRAM_BOT_TOKEN, startupWebhookUrl).then(
+      async () => {
+        await readTelegramWebhookInfo(true);
+        logger.info({ webhookUrl: startupWebhookUrl }, "Telegram webhook synced on startup");
+      },
+      (error) => {
+        logger.warn(
+          {
+            webhookUrl: startupWebhookUrl,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to sync Telegram webhook on startup",
+        );
+      },
+    );
+  }
+
   const backgroundWorker = setInterval(() => {
     void processBackgroundJobs(10).catch((error) => {
       logger.error({ error }, "Background job tick failed");
@@ -3795,14 +4015,21 @@ export async function createApp(
     state.repository.listAuditEvents(100),
   );
 
-  app.get("/api/system/health", { preHandler: requireOwner }, async () => {
+  app.get("/api/system/health", { preHandler: requireOwner }, async (request) => {
     const jobs = await state.repository.listJobs();
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpServers = await state.repository.listMcpServers();
+    const expectedWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env, request);
+    const webhookInfo = await readTelegramWebhookInfo();
     return {
       time: nowIso(),
       mode: state.cloudflare ? "d1" : "bootstrap",
-      telegram: telegram.describeWebhookState(),
+      telegram: {
+        ...telegram.describeWebhookState(),
+        expectedWebhookUrl,
+        webhookInfo: webhookInfo.info,
+        webhookInfoError: webhookInfo.error,
+      },
       bootstrapState: await state.repository.getBootstrapState(),
       hasWorkspace: Boolean(await state.repository.getWorkspace()),
       providerProfiles: (await state.repository.listProviderProfiles()).length,
@@ -3829,6 +4056,48 @@ export async function createApp(
       cloudflare: await buildCloudflareHealth(state),
     };
   });
+
+  app.get("/api/system/telegram-webhook", { preHandler: requireOwner }, async (request) => {
+    const expectedWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env, request);
+    const webhookInfo = await readTelegramWebhookInfo(true);
+    return {
+      expectedWebhookUrl,
+      webhookInfo: webhookInfo.info,
+      webhookInfoError: webhookInfo.error,
+      local: telegram.describeWebhookState(),
+    };
+  });
+
+  app.post(
+    "/api/system/telegram-webhook/sync",
+    { preHandler: requireOwner },
+    async (request, reply) => {
+      const body = request.body as { url?: string; dropPendingUpdates?: boolean } | undefined;
+      const targetUrl = body?.url
+        ? normalizeWebhookUrlInput(body.url)
+        : resolveExpectedTelegramWebhookUrl(state.env, request);
+      if (!targetUrl) {
+        return reply.code(400).send({
+          ok: false,
+          error:
+            "Cannot determine webhook URL. Set TELEGRAM_WEBHOOK_URL or PUBLIC_BASE_URL, or pass body.url.",
+        });
+      }
+
+      await setTelegramWebhook(
+        state.env.TELEGRAM_BOT_TOKEN,
+        targetUrl,
+        body?.dropPendingUpdates ?? false,
+      );
+      const webhookInfo = await readTelegramWebhookInfo(true);
+      return {
+        ok: true,
+        url: targetUrl,
+        webhookInfo: webhookInfo.info,
+        webhookInfoError: webhookInfo.error,
+      };
+    },
+  );
 
   app.post("/telegram/webhook", async (request, reply) => telegram.handler(request, reply));
 

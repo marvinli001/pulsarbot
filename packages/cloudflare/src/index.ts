@@ -44,6 +44,8 @@ export interface VectorizeMatch {
   values?: number[];
 }
 
+export type VectorizeReturnMetadata = "none" | "indexed" | "all";
+
 export interface AiSearchResult {
   id?: string;
   score?: number;
@@ -61,6 +63,67 @@ export interface R2ObjectPayload {
 
 function toBody(body: string | Uint8Array) {
   return typeof body === "string" ? body : Buffer.from(body);
+}
+
+function sanitizeFiniteNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function sanitizeVector(values: unknown): number[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values.map((value) => sanitizeFiniteNumber(value));
+}
+
+function sanitizeJsonValue(value: unknown): unknown {
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeJsonValue(item));
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const sanitizedEntries = Object.entries(value).flatMap(([key, item]) => {
+    if (typeof item === "undefined" || typeof item === "function" || typeof item === "symbol") {
+      return [];
+    }
+    return [[key, sanitizeJsonValue(item)]];
+  });
+
+  return Object.fromEntries(sanitizedEntries);
+}
+
+function normalizeReturnMetadata(
+  value: boolean | VectorizeReturnMetadata | undefined,
+): VectorizeReturnMetadata {
+  if (value === true || typeof value === "undefined") {
+    return "all";
+  }
+  if (value === false) {
+    return "none";
+  }
+  return value;
 }
 
 export class CloudflareApiClient {
@@ -287,10 +350,20 @@ export class CloudflareApiClient {
     indexName: string;
     vectors: VectorizeVector[];
   }): Promise<void> {
+    const vectors = args.vectors.map((vector) => ({
+      id: String(vector.id),
+      values: sanitizeVector(vector.values),
+      ...(vector.metadata && typeof vector.metadata === "object"
+        ? {
+            metadata: sanitizeJsonValue(vector.metadata) as Record<string, unknown>,
+          }
+        : {}),
+    }));
+
     await this.request(`/vectorize/v2/indexes/${args.indexName}/upsert`, {
       method: "POST",
       body: JSON.stringify({
-        vectors: args.vectors,
+        vectors,
       }),
     });
   }
@@ -299,23 +372,37 @@ export class CloudflareApiClient {
     indexName: string;
     vector: number[];
     topK: number;
-    returnMetadata?: boolean;
+    returnMetadata?: boolean | VectorizeReturnMetadata;
     filter?: Record<string, unknown>;
   }): Promise<VectorizeMatch[]> {
+    const payload: Record<string, unknown> = {
+      vector: sanitizeVector(args.vector),
+      topK: Math.max(1, Math.trunc(sanitizeFiniteNumber(args.topK, 1))),
+      returnMetadata: normalizeReturnMetadata(args.returnMetadata),
+    };
+    if (args.filter && typeof args.filter === "object" && !Array.isArray(args.filter)) {
+      payload.filter = sanitizeJsonValue(args.filter);
+    }
+
     const result = await this.request<{
       matches?: VectorizeMatch[];
       count?: number;
     }>(`/vectorize/v2/indexes/${args.indexName}/query`, {
       method: "POST",
-      body: JSON.stringify({
-        vector: args.vector,
-        topK: args.topK,
-        returnMetadata: args.returnMetadata ?? true,
-        filter: args.filter,
-      }),
+      body: JSON.stringify(payload),
     });
 
-    return result.matches ?? [];
+    return (result.matches ?? []).map((match) => ({
+      ...match,
+      id: String(match.id),
+      score: sanitizeFiniteNumber(match.score),
+      ...(Array.isArray(match.values)
+        ? { values: sanitizeVector(match.values) }
+        : {}),
+      ...(match.metadata && typeof match.metadata === "object"
+        ? { metadata: sanitizeJsonValue(match.metadata) as Record<string, unknown> }
+        : {}),
+    }));
   }
 
   public async deleteVectors(args: {
