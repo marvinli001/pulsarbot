@@ -4,6 +4,7 @@ import type { TelegramInboundContent } from "@pulsarbot/shared";
 
 export interface TelegramUpdatePayload {
   chatId: number;
+  threadId: number | null;
   userId: number;
   username?: string | undefined;
   messageId: number | null;
@@ -60,6 +61,26 @@ function ensurePrivate(ctx: Context): boolean {
   return ctx.chat?.type === "private";
 }
 
+function parseThreadId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  return null;
+}
+
+function readMessageThreadId(message: unknown): number | null {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+  return parseThreadId((message as Record<string, unknown>).message_thread_id);
+}
+
 async function dispatchMessage(args: {
   ctx: Context;
   token: string;
@@ -72,7 +93,11 @@ async function dispatchMessage(args: {
     return;
   }
 
-  const placeholder = await ctx.reply("Thinking…");
+  const threadId = readMessageThreadId(ctx.msg);
+  const placeholder = await ctx.reply(
+    "Thinking…",
+    threadId !== null ? { message_thread_id: threadId } : undefined,
+  );
   const controller = createTelegramStreamController({
     ctx,
     placeholderMessageId: placeholder.message_id,
@@ -80,6 +105,7 @@ async function dispatchMessage(args: {
   const reply = await onMessage(
     {
       chatId: ctx.chat!.id,
+      threadId,
       userId: ctx.from!.id,
       username: ctx.from?.username ?? undefined,
       messageId: ctx.msg?.message_id ?? null,
@@ -187,28 +213,35 @@ export function createTelegramBot(args: {
     status: "ready";
     lastUpdateType: string | null;
     lastChatId: number | null;
+    lastThreadId: number | null;
   } = {
     updatedAt: nowIso(),
     status: "ready",
     lastUpdateType: null,
     lastChatId: null,
+    lastThreadId: null,
   };
 
-  const markUpdate = (eventType: string, chatId: number | null) => {
+  const markUpdate = (
+    eventType: string,
+    chatId: number | null,
+    threadId: number | null,
+  ) => {
     webhookState.updatedAt = nowIso();
     webhookState.lastUpdateType = eventType;
     webhookState.lastChatId = chatId;
+    webhookState.lastThreadId = threadId;
   };
 
   bot.command("start", async (ctx) => {
-    markUpdate("message:start", ctx.chat?.id ?? null);
+    markUpdate("message:start", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     await ctx.reply(
       "Pulsarbot is online. Open the Telegram Mini App to configure providers, skills, and MCP servers.",
     );
   });
 
   bot.on("message:text", async (ctx) => {
-    markUpdate("message:text", ctx.chat?.id ?? null);
+    markUpdate("message:text", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     await dispatchMessage({
       ctx,
       token: args.token,
@@ -222,7 +255,7 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:voice", async (ctx) => {
-    markUpdate("message:voice", ctx.chat?.id ?? null);
+    markUpdate("message:voice", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const metadata = await resolveFileMetadata(ctx, args.token, ctx.message.voice.file_id);
     await dispatchMessage({
       ctx,
@@ -241,7 +274,7 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:photo", async (ctx) => {
-    markUpdate("message:photo", ctx.chat?.id ?? null);
+    markUpdate("message:photo", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     if (!photo) {
       return;
@@ -265,7 +298,7 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:document", async (ctx) => {
-    markUpdate("message:document", ctx.chat?.id ?? null);
+    markUpdate("message:document", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const document = ctx.message.document;
     const metadata = await resolveFileMetadata(ctx, args.token, document.file_id);
     await dispatchMessage({
@@ -286,7 +319,7 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message:audio", async (ctx) => {
-    markUpdate("message:audio", ctx.chat?.id ?? null);
+    markUpdate("message:audio", ctx.chat?.id ?? null, readMessageThreadId(ctx.msg));
     const audio = ctx.message.audio;
     const metadata = await resolveFileMetadata(ctx, args.token, audio.file_id);
     await dispatchMessage({
@@ -310,7 +343,11 @@ export function createTelegramBot(args: {
   });
 
   bot.on("edited_message:text", async (ctx) => {
-    markUpdate("edited_message:text", ctx.chat?.id ?? null);
+    markUpdate(
+      "edited_message:text",
+      ctx.chat?.id ?? null,
+      readMessageThreadId(ctx.editedMessage),
+    );
     await dispatchMessage({
       ctx,
       token: args.token,
@@ -326,7 +363,8 @@ export function createTelegramBot(args: {
   });
 
   bot.on("callback_query:data", async (ctx) => {
-    markUpdate("callback_query:data", ctx.chat?.id ?? null);
+    const threadId = readMessageThreadId(ctx.callbackQuery.message);
+    markUpdate("callback_query:data", ctx.chat?.id ?? null, threadId);
     if (!ensurePrivate(ctx)) {
       await ctx.answerCallbackQuery({
         text: "Private chat only.",
@@ -337,6 +375,7 @@ export function createTelegramBot(args: {
     const reply = await args.onMessage(
       {
         chatId: ctx.chat!.id,
+        threadId,
         userId: ctx.from.id,
         username: ctx.from.username ?? undefined,
         messageId: ctx.callbackQuery.message?.message_id ?? null,
@@ -351,11 +390,14 @@ export function createTelegramBot(args: {
       createDisabledTelegramStreamController(),
     );
     await ctx.answerCallbackQuery();
-    await ctx.reply(reply);
+    await ctx.reply(
+      reply,
+      threadId !== null ? { message_thread_id: threadId } : undefined,
+    );
   });
 
   bot.on("my_chat_member", async (ctx) => {
-    markUpdate("my_chat_member", ctx.chat?.id ?? null);
+    markUpdate("my_chat_member", ctx.chat?.id ?? null, null);
     void ctx;
   });
 

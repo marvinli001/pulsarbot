@@ -1197,6 +1197,7 @@ function normalizeTelegramPayload(
     | TelegramUpdatePayload
     | {
         chatId: number;
+        threadId?: number | null;
         userId: number;
         username?: string;
         text?: string;
@@ -1204,11 +1205,15 @@ function normalizeTelegramPayload(
       },
 ): TelegramUpdatePayload {
   if ("content" in payload && payload.content) {
-    return payload;
+    return {
+      ...payload,
+      threadId: payload.threadId ?? null,
+    };
   }
 
   return {
     chatId: payload.chatId,
+    threadId: payload.threadId ?? null,
     userId: payload.userId,
     username: payload.username,
     messageId: payload.messageId ?? null,
@@ -2564,7 +2569,9 @@ export async function createApp(
         return "This Pulsarbot instance only responds to the configured owner.";
       }
 
-      const conversationId = `telegram:${payload.chatId}`;
+      const conversationId = payload.threadId === null
+        ? `telegram:${payload.chatId}`
+        : `telegram:${payload.chatId}:thread:${payload.threadId}`;
       if (activeTurns.has(conversationId)) {
         return "A previous agent turn is still running for this chat. Please try again in a moment.";
       }
@@ -2611,6 +2618,7 @@ export async function createApp(
           telegramMessageId: payload.messageId ? String(payload.messageId) : null,
           metadata: {
             ...payload.content.metadata,
+            threadId: payload.threadId,
             ...(document ? { documentId: document.id } : {}),
           },
           createdAt: nowIso(),

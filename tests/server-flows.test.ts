@@ -346,6 +346,7 @@ const fakeTelegramFactory = ({ onMessage }: {
   onMessage: (
     payload: {
       chatId: number;
+      threadId: number | null;
       userId: number;
       username?: string;
       messageId: number | null;
@@ -362,8 +363,11 @@ const fakeTelegramFactory = ({ onMessage }: {
     const body = request.body ?? {};
     const message = body.message ?? body;
     const streamed: string[] = [];
+    const rawThreadId = message.message_thread_id ?? body.messageThreadId ?? body.threadId;
+    const parsedThreadId = Number(rawThreadId);
     const response = await onMessage({
       chatId: Number(message.chat?.id ?? body.chatId ?? 1),
+      threadId: Number.isFinite(parsedThreadId) ? Math.trunc(parsedThreadId) : null,
       username: message.from?.username ?? body.username,
       userId: Number(message.from?.id ?? body.userId ?? 1),
       messageId: Number(message.message_id ?? body.messageId ?? 1),
@@ -1336,6 +1340,95 @@ describe("server flows", () => {
       });
       return response.json<Record<string, any>>().activeTurnLocks.length === 0;
     }, 5_000, 50);
+
+    await appState.app.close();
+  });
+
+  it("allows concurrent turns for different Telegram threads in the same chat", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const slowProviderInvoker = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderInvocationInput;
+      }): Promise<ProviderInvocationResult> => {
+        void args.profile;
+        void args.apiKey;
+        const messages = args.input.messages;
+        const system = messages.find((message) => message.role === "system")?.content ?? "";
+        const user = messages.find((message) => message.role === "user")?.content ?? "";
+        const hasToolResult = messages.some((message) => message.role === "tool");
+
+        if (system.includes("Return strict JSON")) {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return {
+            text: JSON.stringify({
+              type: "final_response",
+              content: `Echo: ${user}`,
+            }),
+            raw: {},
+          };
+        }
+
+        if (!hasToolResult) {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+
+        return {
+          text: `Echo: ${user || "done"}`,
+          raw: {},
+        };
+      },
+    );
+
+    const appState = await bootstrapApp(dataDir, {
+      providerInvoker: slowProviderInvoker,
+      backgroundPollMs: 50,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const firstTurn = appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "thread one",
+          message_thread_id: 1001,
+          chat: { id: 7002 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const secondTurn = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "thread two",
+          message_thread_id: 1002,
+          chat: { id: 7002 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(secondTurn.statusCode).toBe(200);
+    expect(secondTurn.json()).toMatchObject({
+      ok: true,
+      response: "Echo: thread two",
+    });
+
+    const completedTurn = await firstTurn;
+    expect(completedTurn.statusCode).toBe(200);
+    expect(completedTurn.json()).toMatchObject({
+      ok: true,
+      response: "Echo: thread one",
+    });
 
     await appState.app.close();
   });
