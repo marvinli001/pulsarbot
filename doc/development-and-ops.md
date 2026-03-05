@@ -59,7 +59,8 @@ npm exec --yes pnpm@10.6.3 --filter @pulsarbot/admin dev
 当前仓库已经提供：
 
 - `infra/docker/Dockerfile`
-- `infra/railway/railway.json`
+- `railway.json`（主配置）
+- `infra/railway/railway.json`（镜像）
 
 `railway.json` 当前的关键行为：
 

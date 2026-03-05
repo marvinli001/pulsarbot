@@ -47,7 +47,7 @@
 3. 点击该变更右侧的 `x` 丢弃
 4. 只保留 `@pulsarbot/server` 再 Deploy
 
-因为当前仓库已经在 `infra/railway/railway.json` 指定了部署入口，且 `infra/docker/Dockerfile` 会构建整个 monorepo，再由 `server` 对外提供 `/miniapp/`。
+因为当前仓库已经在根目录 `railway.json`（并保留 `infra/railway/railway.json` 镜像）指定了部署入口，且 `infra/docker/Dockerfile` 会构建整个 monorepo，再由 `server` 对外提供 `/miniapp/`。
 
 ### 3.2.1 能否通过 `railway.json` 强制“只创建一个服务”？
 
@@ -66,27 +66,27 @@
 
 ### 3.2.2 用代码配置 watch path（让 admin/ui 改动也触发 server 部署）
 
-当前仓库已在 `infra/railway/railway.json` 加入 `build.watchPatterns`，包含：
+当前仓库已在根目录 `railway.json` 加入 `build.watchPatterns`（使用相对路径，无前导 `/`），包含：
 
-- `/apps/server/**`
-- `/apps/admin/**`
-- `/packages/**`
-- `/market/**`
-- `/infra/docker/**`
-- `/infra/railway/**`
-- `/package.json`
-- `/pnpm-lock.yaml`
-- `/pnpm-workspace.yaml`
-- `/turbo.json`
-- `/tsconfig.base.json`
+- `apps/**`
+- `packages/**`
+- `market/**`
+- `infra/docker/**`
+- `infra/railway/**`
+- `package.json`
+- `pnpm-lock.yaml`
+- `pnpm-workspace.yaml`
+- `turbo.json`
+- `tsconfig.base.json`
 
 这意味着你改 Mini App UI（`apps/admin/**`）或共享包（`packages/**`）时，`@pulsarbot/server` 也会触发 build/deploy。
 
 如果仍看到 `No deployment needed - watched paths not modified`，通常是服务没有读取到这个配置文件。请在 Railway 服务里确认：
 
 1. 已启用 Config as Code；
-2. 配置文件路径是 `infra/railway/railway.json`（不是默认空值）；
-3. 保存后手动点一次 `Deploy latest commit` 让新规则生效。
+2. 若用 Railway 自动发现，优先使用根目录 `railway.json`；
+3. 若你强制写了 Config as Code 路径，确保它指向 `railway.json` 或 `infra/railway/railway.json`；
+4. 保存后手动点一次 `Deploy latest commit` 让新规则生效。
 
 ### 3.3 `@pulsarbot/server` 环境变量
 

@@ -454,16 +454,25 @@ export function Sidebar() {
         </nav>
       </div>
       <div
-        className="fixed inset-x-0 bottom-0 z-40 border-t border-slate-200 bg-white/95 px-2 py-2 shadow-[0_-12px_32px_rgba(15,23,42,0.08)] backdrop-blur xl:hidden"
+        className="fixed inset-x-0 bottom-0 z-40 overflow-hidden border-t border-slate-200 bg-white/95 px-2 py-2 shadow-[0_-12px_32px_rgba(15,23,42,0.08)] backdrop-blur xl:hidden"
         style={{
           background: "color-mix(in srgb, var(--tg-bottom-bar-bg-color) 92%, transparent)",
           borderColor: "var(--app-border)",
           paddingBottom: "calc(0.5rem + var(--app-safe-area-bottom))",
-          paddingLeft: "calc(0.5rem + var(--app-safe-area-left))",
-          paddingRight: "calc(0.5rem + var(--app-safe-area-right))",
+          paddingLeft: "0.5rem",
+          paddingRight: "0.5rem",
+          maxWidth: "100vw",
+          overflowX: "clip",
         }}
       >
-        <div className="flex gap-1 overflow-x-auto">
+        <div
+          className="flex min-w-0 max-w-full gap-1 overflow-x-auto"
+          style={{
+            WebkitOverflowScrolling: "touch",
+            overscrollBehaviorX: "contain",
+            touchAction: "pan-x",
+          }}
+        >
           {navigation.map((item) => {
             const Icon = item.icon;
             const active = item.id === activeSection;

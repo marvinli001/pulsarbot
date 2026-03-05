@@ -1,4 +1,8 @@
-import { useEffect, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useRef,
+  useSyncExternalStore,
+} from "react";
 
 type TelegramColorScheme = "light" | "dark";
 
@@ -567,6 +571,13 @@ export function configureTelegramMainButton(
     return;
   }
 
+  const suppressOnIos = snapshot.platform === "ios";
+  if (suppressOnIos) {
+    mainButton.hideProgress();
+    mainButton.hide();
+    return;
+  }
+
   if (mainButtonHandler) {
     mainButton.offClick(mainButtonHandler);
     mainButtonHandler = null;
@@ -632,46 +643,108 @@ export function configureTelegramClosingConfirmation(enabled: boolean) {
 }
 
 export function useTelegramBackButton(config: TelegramBackButtonConfig | null) {
+  const onClickRef = useRef<TelegramBackButtonConfig["onClick"]>(config?.onClick);
+  onClickRef.current = config?.onClick;
+
   useEffect(() => {
-    configureTelegramBackButton(config);
-    return () => {
+    if (!config?.isVisible) {
       configureTelegramBackButton(null);
-    };
-  }, [config?.isVisible, config?.onClick]);
+      return;
+    }
+    const onClick = onClickRef.current
+      ? () => {
+          onClickRef.current?.();
+        }
+      : null;
+    configureTelegramBackButton({
+      isVisible: true,
+      ...(onClick ? { onClick } : {}),
+    });
+  }, [config?.isVisible]);
+
+  useEffect(
+    () => () => {
+      configureTelegramBackButton(null);
+    },
+    [],
+  );
 }
 
 export function useTelegramSettingsButton(
   config: TelegramSettingsButtonConfig | null,
 ) {
+  const onClickRef = useRef<TelegramSettingsButtonConfig["onClick"]>(config?.onClick);
+  onClickRef.current = config?.onClick;
+
   useEffect(() => {
-    configureTelegramSettingsButton(config);
-    return () => {
+    if (!config?.isVisible) {
       configureTelegramSettingsButton(null);
-    };
-  }, [config?.isVisible, config?.onClick]);
+      return;
+    }
+    const onClick = onClickRef.current
+      ? () => {
+          onClickRef.current?.();
+        }
+      : null;
+    configureTelegramSettingsButton({
+      isVisible: true,
+      ...(onClick ? { onClick } : {}),
+    });
+  }, [config?.isVisible]);
+
+  useEffect(
+    () => () => {
+      configureTelegramSettingsButton(null);
+    },
+    [],
+  );
 }
 
 export function useTelegramMainButton(config: TelegramMainButtonConfig | null) {
+  const onClickRef = useRef<TelegramMainButtonConfig["onClick"]>(config?.onClick);
+  onClickRef.current = config?.onClick;
+
   useEffect(() => {
-    configureTelegramMainButton(config);
-    return () => {
+    if (!config) {
       configureTelegramMainButton(null);
-    };
+      return;
+    }
+
+    const onClick = onClickRef.current
+      ? () => {
+          onClickRef.current?.();
+        }
+      : null;
+
+    configureTelegramMainButton({
+      ...config,
+      ...(onClick ? { onClick } : {}),
+    });
   }, [
     config?.text,
     config?.isVisible,
     config?.isEnabled,
     config?.isProgressVisible,
     config?.hasShineEffect,
-    config?.onClick,
   ]);
+
+  useEffect(
+    () => () => {
+      configureTelegramMainButton(null);
+    },
+    [],
+  );
 }
 
 export function useTelegramClosingConfirmation(enabled: boolean) {
   useEffect(() => {
     configureTelegramClosingConfirmation(enabled);
-    return () => {
-      configureTelegramClosingConfirmation(false);
-    };
   }, [enabled]);
+
+  useEffect(
+    () => () => {
+      configureTelegramClosingConfirmation(false);
+    },
+    [],
+  );
 }

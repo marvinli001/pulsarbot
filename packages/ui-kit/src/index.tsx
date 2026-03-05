@@ -22,6 +22,7 @@ export function AppShell({
         minHeight: "var(--app-viewport-stable-height, 100dvh)",
         background: "var(--app-shell-bg)",
         color: "var(--tg-text-color)",
+        overflowX: "clip",
       }}
     >
       <div
@@ -29,9 +30,10 @@ export function AppShell({
         style={{
           minHeight: "var(--app-viewport-stable-height, 100dvh)",
           paddingTop: "calc(1rem + var(--app-safe-area-top))",
-          paddingRight: "calc(1rem + var(--app-safe-area-right))",
           paddingBottom: "calc(7rem + var(--app-safe-area-bottom))",
-          paddingLeft: "calc(1rem + var(--app-safe-area-left))",
+          paddingRight: "1rem",
+          paddingLeft: "1rem",
+          overflowX: "clip",
         }}
       >
         <div className="min-w-0 xl:hidden">{sidebar}</div>

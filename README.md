@@ -115,7 +115,7 @@ npm exec --yes pnpm@10.6.3 test:e2e
 
 ## 部署
 
-- Railway 入口配置位于 `infra/railway/railway.json`
+- Railway 入口配置位于根目录 `railway.json`（`infra/railway/railway.json` 为镜像）
 - Docker 构建入口位于 `infra/docker/Dockerfile`
 - 生产环境建议将持久化目录挂载到 `/data`
 - `DATA_DIR` 主要承载缓存、MCP 日志、导出暂存与临时文件
