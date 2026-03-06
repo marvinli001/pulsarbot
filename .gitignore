@@ -12,3 +12,7 @@ apps/server/dist
 data
 playwright-report
 test-results
+PLAN.md
+PLAN-1.md
+PLAN-2.md
+PLAN-agentflow improve as langgraph like.md
