@@ -1,67 +1,111 @@
 # 常见问题与排障
 
-这份文档汇总当前仓库在本地联调和部署时最常见的问题。
+这份文档汇总 Pulsarbot 在本地联调、Railway 部署和运行时最常见的问题。
 
 ## 1. 管理台提示 access token 无效
 
 排查顺序：
 
 1. 确认输入的是服务端启动时使用的 `PULSARBOT_ACCESS_TOKEN`
-2. 确认没有在不同终端里混用旧值和新值
-3. 如果做过 secret rewrap，确认服务端已经使用新的 access token 重启
+2. 确认没有在不同终端或不同 Railway 服务里混用旧值和新值
+3. 如果刚做过 `rewrap secrets`，确认服务端已经使用新的 access token 重启
 
 ## 2. 本地打开 `apps/admin` 的 Vite 页面后 API 请求失败
 
 原因通常是：
 
-- 当前 `apps/admin/vite.config.ts` 只有端口配置
-- `apiFetch` 使用的是相对路径
-- 没有默认 API 代理
+- 当前 `apps/admin` 默认没有 API 代理
+- 管理台请求使用相对路径
+- 单独跑 `apps/admin` 时并没有同域 API
 
 建议：
 
 - 完整联调时使用 `apps/server` 提供的 `/miniapp/`
 - 单跑 Vite 时，把它当成纯前端开发模式
 
-## 3. Cloudflare 已连接，但记忆、文档或导出无法写入 R2
+## 3. Railway 导入仓库后自动出现两个服务
 
-通常是因为只配置了控制面凭证，没有配置 R2 数据面凭证。
+这是 monorepo 自动识别带来的常见现象。当前项目的推荐做法是：
+
+- 保留 `@pulsarbot/server`
+- 删除或停用 `@pulsarbot/admin`
+
+原因：
+
+- `apps/server` 已经托管 `/miniapp/`
+- webhook 和 API 也都在同一个服务里
+- 单独部署 admin 只会增加变量、域名和日志的维护复杂度
+
+完整处理方式见 [Railway + Telegram Mini App 部署指南](../DEPLOY_RAILWAY_TELEGRAM_MINIAPP.md)。
+
+## 4. 部署后 `/healthz` 失败，服务反复重启
+
+优先检查当前部署服务里是否真的配置了以下变量：
+
+- `TELEGRAM_BOT_TOKEN`
+- `PULSARBOT_ACCESS_TOKEN`
+
+当前服务在缺少必需环境变量时会直接启动失败。
+
+## 5. Bot 不回消息
+
+按这个顺序检查：
+
+1. webhook URL 是否指向 `https://<your-domain>/telegram/webhook`
+2. `GET /api/system/telegram-webhook` 返回的预期地址和实际地址是否一致
+3. 是否已经执行 `setWebhook` 或调用 `/api/system/telegram-webhook/sync`
+4. Provider 是否通过测试
+5. 当前 active profile 是否有效
+6. Railway 或本地服务日志里是否有 4xx / 5xx
+
+## 6. Cloudflare 已连接，但记忆、文档或导出无法写入 R2
+
+常见原因是只配置了控制面凭证，没有配置 R2 数据面凭证。
 
 需要补齐：
 
 - `r2AccessKeyId`
 - `r2SecretAccessKey`
 
-没有这两个字段时，R2 对象读写不会真正可用。
-
-## 4. Provider 保存后仍然无法正常对话
+## 7. Provider 保存后仍然无法正常对话
 
 优先检查：
 
-1. `Providers` 面板中的 API Key、模型、能力开关是否正确
+1. API Key、模型、能力开关是否正确
 2. `POST /api/providers/:id/test` 是否通过
-3. `Profiles` 中使用的是否就是刚配置好的 provider
+3. `Profiles` 使用的是否就是刚配置好的 provider
 4. `Workspace` 中当前 active profile 是否正确
+5. 模型是否真的支持你启用的 vision / audio / document 能力
 
-## 5. MCP Server 测试失败
+## 8. MCP Provider 拉取目录失败或无法添加 server
 
 检查点：
 
-- `stdio` 模式下的命令、参数、环境变量是否正确
-- `streamable_http` 模式下的 URL 与 Header 是否正确
-- 目标 MCP 服务是否真的在线
-- `GET /api/mcp/servers/:id/logs` 是否有错误输出
+1. MCP provider 的 API Key 是否保存成功
+2. `POST /api/mcp/providers/:id/fetch` 是否返回错误
+3. provider catalog 中的目标 server 是否仍存在
+4. 当前条目是否为 `streamable_http`，因为 provider 导入目前只支持这种协议
 
-## 6. Document 或 Job 一直卡住
+## 9. MCP Server 测试失败
 
-建议：
+检查点：
 
-1. 查看 `GET /api/jobs`
-2. 如果 job 已经失败，调用 `POST /api/jobs/:id/retry`
-3. 如果 document 抽取失败，调用 `POST /api/documents/:id/re-extract`
-4. 如果索引状态不对，调用 `POST /api/documents/:id/reindex` 或 `POST /api/memory/reindex`
+1. `stdio` 模式下的命令、参数、环境变量是否正确
+2. `streamable_http` 模式下的 URL 与 Header 是否正确
+3. 目标 MCP 服务是否真的在线
+4. `GET /api/mcp/servers/:id/logs` 是否有错误输出
 
-## 7. 导出或导入失败
+## 10. Documents 或 Jobs 一直卡住
+
+建议顺序：
+
+1. 查看 `GET /api/documents`
+2. 查看 `GET /api/jobs`
+3. 如果 job 失败，调用 `POST /api/jobs/:id/retry`
+4. 如果 document 抽取失败，调用 `POST /api/documents/:id/re-extract`
+5. 如果索引异常，调用 `POST /api/documents/:id/reindex` 或 `POST /api/memory/reindex`
+
+## 11. 导出或导入失败
 
 常见原因：
 
@@ -75,20 +119,29 @@
 - `GET /api/system/logs`
 - `GET /api/system/health`
 
-## 8. 如何确认运行时到底启用了哪些能力
+## 12. 如何确认当前实例还在 bootstrap 阶段还是已经进入 D1 模式
+
+查看以下任一入口：
+
+- 管理台 `Health` 面板
+- `GET /api/system/health`
+
+返回里的 `mode` 会显示当前是 `bootstrap` 还是 `d1`。
+
+## 13. 如何确认运行时到底启用了哪些能力
 
 最直接的方法：
 
-- 打开管理台对应 profile 的 runtime preview
+- 在管理台查看 `Runtime Preview`
 - 或请求 `GET /api/runtime/preview?agentProfileId=<id>`
 
-这比只看 install 或 profile 配置更可靠，因为它反映的是最终运行时装配结果。
+这比只看 install 记录或 profile 配置更可靠，因为它反映的是最终运行时装配结果。
 
-## 9. 如何判断当前实例还在 bootstrap 阶段还是已经进入 D1 模式
+## 14. 为什么从浏览器直接打开 Mini App 也能用
 
-查看：
+这是开发模式下的便利行为。`NODE_ENV=development` 或 `test` 时，管理台允许本地调试用户回退，因此你不必每次都从 Telegram 内部打开。
 
-- 管理台 `Health` 面板
-- 或 `GET /api/system/health`
+但要注意：
 
-返回里的 `mode` 会显示当前是 `bootstrap` 还是 `d1`。
+- 这只适合本地开发和 UI 联调
+- 真正的 owner 绑定、Telegram 登录态和 Bot 私聊消息链路仍应以 Telegram 内实际行为为准

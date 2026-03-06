@@ -233,10 +233,10 @@ export const providerKindTemplates: Record<
   anthropic: {
     label: "Anthropic Provider",
     apiBaseUrl: "https://api.anthropic.com/v1",
-    defaultModel: "claude-sonnet-4-5",
-    visionModel: "claude-sonnet-4-5",
+    defaultModel: "claude-sonnet-4-6",
+    visionModel: "claude-sonnet-4-6",
     audioModel: "",
-    documentModel: "claude-sonnet-4-5",
+    documentModel: "claude-sonnet-4-6",
     visionEnabled: true,
     audioInputEnabled: false,
     documentInputEnabled: true,

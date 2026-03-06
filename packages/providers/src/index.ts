@@ -4,6 +4,7 @@ import {
   type ProviderKind,
   type LooseJsonValue,
   type ProviderProfile,
+  type ReasoningLevel,
 } from "@pulsarbot/shared";
 
 export interface ProviderMessage {
@@ -33,6 +34,41 @@ export type ProviderToolChoice =
       toolId: string;
     };
 
+export interface AnthropicNativeToolDefinition {
+  name: string;
+  type: string;
+  [key: string]: LooseJsonValue | undefined;
+}
+
+export interface AnthropicMcpServerDefinition {
+  type: "url";
+  url: string;
+  name: string;
+  [key: string]: LooseJsonValue | undefined;
+}
+
+export interface AnthropicToolChoiceOverride {
+  type: "auto" | "any" | "none" | "tool";
+  name?: string;
+}
+
+export interface AnthropicOutputConfig {
+  effort?: "low" | "medium" | "high" | "max";
+  format?: Record<string, LooseJsonValue>;
+}
+
+export interface AnthropicRequestOptions {
+  betas?: string[];
+  tools?: AnthropicNativeToolDefinition[];
+  mcpServers?: AnthropicMcpServerDefinition[];
+  contextManagement?: Record<string, LooseJsonValue>;
+  container?: string | Record<string, LooseJsonValue>;
+  metadata?: Record<string, string>;
+  serviceTier?: "auto" | "standard_only";
+  outputConfig?: AnthropicOutputConfig;
+  toolChoice?: AnthropicToolChoiceOverride;
+}
+
 export interface ProviderInvocationInput {
   model?: string;
   messages: ProviderMessage[];
@@ -40,6 +76,9 @@ export interface ProviderInvocationInput {
   jsonMode?: boolean;
   tools?: ProviderToolDefinition[];
   toolChoice?: ProviderToolChoice;
+  providerOptions?: {
+    anthropic?: AnthropicRequestOptions;
+  };
 }
 
 export interface ProviderInvocationResult {
@@ -222,12 +261,12 @@ function normalizeOpenAiToolChoice(
 
 function normalizeAnthropicToolChoice(
   value: ProviderToolChoice | undefined,
-): { type: "auto" | "any" | "tool"; name?: string } | undefined {
+): AnthropicToolChoiceOverride | undefined {
   if (!value || value === "auto") {
     return { type: "auto" };
   }
   if (value === "none") {
-    return undefined;
+    return { type: "none" };
   }
   return {
     type: "tool",
@@ -258,6 +297,37 @@ function anthropicToolDefinitions(input: ProviderInvocationInput) {
     description: tool.description,
     input_schema: tool.inputSchema,
   }));
+}
+
+function anthropicRequestTools(
+  profile: ProviderProfile,
+  input: ProviderInvocationInput,
+): Array<Record<string, unknown>> | undefined {
+  const nativeTools = resolveAnthropicRequestOptions(input)?.tools ?? [];
+  const customTools =
+    input.tools?.length && profile.toolCallingEnabled
+      ? anthropicToolDefinitions(input) ?? []
+      : [];
+  const combined = [...customTools, ...nativeTools];
+  return combined.length > 0 ? combined : undefined;
+}
+
+function anthropicResolvedToolChoice(
+  profile: ProviderProfile,
+  input: ProviderInvocationInput,
+): AnthropicToolChoiceOverride | undefined {
+  const requestOptions = resolveAnthropicRequestOptions(input);
+  if (requestOptions?.toolChoice) {
+    return requestOptions.toolChoice;
+  }
+  const hasAnyTools = Boolean(
+    (input.tools?.length && profile.toolCallingEnabled) ||
+      requestOptions?.tools?.length,
+  );
+  if (!hasAnyTools) {
+    return undefined;
+  }
+  return normalizeAnthropicToolChoice(input.toolChoice);
 }
 
 function geminiToolDeclarations(input: ProviderInvocationInput) {
@@ -1036,6 +1106,122 @@ function normalizeModelForProvider(
   }
 }
 
+function normalizeAnthropicModelId(model: string): string {
+  return model.trim().toLowerCase();
+}
+
+function isAnthropicSonnet46Model(model: string): boolean {
+  const normalized = normalizeAnthropicModelId(model);
+  return /^claude-sonnet-4-6([-.].+)?$/.test(normalized);
+}
+
+function isAnthropicOpus46Model(model: string): boolean {
+  const normalized = normalizeAnthropicModelId(model);
+  return /^claude-opus-4-6([-.].+)?$/.test(normalized);
+}
+
+function isAnthropicOpus45Model(model: string): boolean {
+  const normalized = normalizeAnthropicModelId(model);
+  return /^claude-opus-4-5([-.].+)?$/.test(normalized);
+}
+
+function anthropicSupportsAdaptiveThinking(model: string): boolean {
+  return isAnthropicSonnet46Model(model) || isAnthropicOpus46Model(model);
+}
+
+function anthropicSupportsEffort(model: string): boolean {
+  return anthropicSupportsAdaptiveThinking(model) || isAnthropicOpus45Model(model);
+}
+
+function anthropicThinkingBudget(profile: ProviderProfile): number | undefined {
+  if (!profile.reasoningEnabled || profile.reasoningLevel === "off") {
+    return undefined;
+  }
+  return profile.thinkingBudget ??
+    (profile.reasoningLevel === "high"
+      ? 2048
+      : profile.reasoningLevel === "medium"
+      ? 1024
+      : 512);
+}
+
+function anthropicOutputEffort(
+  profile: ProviderProfile,
+  model: string,
+  override?: AnthropicOutputConfig["effort"],
+): AnthropicOutputConfig["effort"] | undefined {
+  if (override) {
+    return override;
+  }
+  if (!profile.reasoningEnabled || profile.reasoningLevel === "off") {
+    return undefined;
+  }
+  if (!anthropicSupportsEffort(model)) {
+    return undefined;
+  }
+  return profile.reasoningLevel as Exclude<ReasoningLevel, "off">;
+}
+
+function anthropicJsonObjectFormat(): Record<string, LooseJsonValue> {
+  return {
+    type: "json_schema",
+    name: "json_output",
+    schema: {
+      type: "object",
+      additionalProperties: true,
+    },
+  };
+}
+
+function splitHeaderValues(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function mergeAnthropicBetaHeaderValue(values: Array<string | string[] | undefined>): string | undefined {
+  const deduped = new Set<string>();
+  for (const value of values) {
+    const items = Array.isArray(value)
+      ? value.flatMap((entry) => splitHeaderValues(entry))
+      : splitHeaderValues(value);
+    for (const item of items) {
+      deduped.add(item);
+    }
+  }
+  return deduped.size > 0 ? [...deduped].join(",") : undefined;
+}
+
+function buildAnthropicJsonHeaders(
+  profile: ProviderProfile,
+  apiKey: string,
+  betaHeaders?: string[],
+): Record<string, string> {
+  const mergedBeta = mergeAnthropicBetaHeaderValue([
+    typeof profile.headers["anthropic-beta"] === "string"
+      ? profile.headers["anthropic-beta"]
+      : undefined,
+    betaHeaders,
+  ]);
+  return compactHeaders({
+    "content-type": "application/json",
+    ...profile.headers,
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    ...(mergedBeta ? { "anthropic-beta": mergedBeta } : {}),
+  });
+}
+
+function resolveAnthropicRequestOptions(
+  input: ProviderInvocationInput,
+): AnthropicRequestOptions | undefined {
+  return input.providerOptions?.anthropic;
+}
+
 function resolveTaskModel(
   profile: ProviderProfile,
   task: "chat" | ProviderMediaCapability,
@@ -1404,6 +1590,8 @@ function providerSupportsDocumentInput(args: {
 }): boolean {
   switch (args.profile.kind) {
     case "anthropic":
+      return isPdfInput(args.mimeType, args.fileName) ||
+        isTextDocumentInput(args.mimeType, args.fileName);
     case "gemini":
       return isPdfInput(args.mimeType, args.fileName);
     case "openrouter":
@@ -1587,16 +1775,13 @@ function buildAnthropicMediaRequest(
   input: ProviderMediaInvocationInput,
 ): ProviderMediaRequestPreview | null {
   const baseUrl = profile.apiBaseUrl || defaultBaseUrl(profile.kind);
-  const headers = {
-    "x-api-key": apiKey,
-    "anthropic-version": "2023-06-01",
-  };
+  const title = input.fileName?.trim() || "Document";
 
   switch (input.kind) {
     case "image":
       return {
         url: `${baseUrl}/messages`,
-        headers: mergeJsonHeaders(profile, headers),
+        headers: buildAnthropicJsonHeaders(profile, apiKey),
         body: {
           model: resolveTaskModel(profile, "vision"),
           messages: [
@@ -1620,15 +1805,46 @@ function buildAnthropicMediaRequest(
         },
       };
     case "document":
-      if (!isPdfInput(input.mimeType, input.fileName)) {
+      if (
+        !providerSupportsDocumentInput({
+          profile,
+          mimeType: input.mimeType,
+          fileName: input.fileName,
+        })
+      ) {
         return null;
+      }
+      if (isPdfInput(input.mimeType, input.fileName)) {
+        return {
+          url: `${baseUrl}/messages`,
+          headers: buildAnthropicJsonHeaders(profile, apiKey, ["pdfs-2024-09-25"]),
+          body: {
+            model: resolveTaskModel(profile, "document"),
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "document",
+                    title,
+                    source: {
+                      type: "base64",
+                      media_type: "application/pdf",
+                      data: toBase64(input.rawBody),
+                    },
+                  },
+                  { type: "text", text: input.prompt },
+                ],
+              },
+            ],
+            max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+            ...profile.extraBody,
+          },
+        };
       }
       return {
         url: `${baseUrl}/messages`,
-        headers: mergeJsonHeaders(profile, {
-          ...headers,
-          "anthropic-beta": "pdfs-2024-09-25",
-        }),
+        headers: buildAnthropicJsonHeaders(profile, apiKey),
         body: {
           model: resolveTaskModel(profile, "document"),
           messages: [
@@ -1637,10 +1853,11 @@ function buildAnthropicMediaRequest(
               content: [
                 {
                   type: "document",
+                  title,
                   source: {
-                    type: "base64",
-                    media_type: "application/pdf",
-                    data: toBase64(input.rawBody),
+                    type: "text",
+                    media_type: "text/plain",
+                    data: new TextDecoder().decode(input.rawBody),
                   },
                 },
                 { type: "text", text: input.prompt },
@@ -1917,6 +2134,92 @@ function buildBailianMediaRequest(
   }
 }
 
+function parseJsonRecord(value: string): Record<string, LooseJsonValue> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, LooseJsonValue>;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function anthropicSearchResultText(record: Record<string, LooseJsonValue>): string {
+  const parts = [
+    typeof record.snippet === "string" ? record.snippet : null,
+    typeof record.content === "string" ? record.content : null,
+    typeof record.text === "string" ? record.text : null,
+  ].filter((part): part is string => Boolean(part && part.trim()));
+  return parts.join("\n\n").trim();
+}
+
+function anthropicSearchResultBlock(
+  value: Record<string, LooseJsonValue>,
+): Record<string, LooseJsonValue> | null {
+  const source = typeof value.url === "string"
+    ? value.url
+    : typeof value.source === "string"
+    ? value.source
+    : "";
+  if (!source) {
+    return null;
+  }
+  const title = typeof value.title === "string" && value.title.trim()
+    ? value.title.trim()
+    : source;
+  const text = anthropicSearchResultText(value) || title;
+  return {
+    type: "search_result",
+    title,
+    source,
+    citations: {
+      enabled: true,
+    },
+    content: [
+      {
+        type: "text",
+        text,
+      },
+    ],
+  };
+}
+
+function anthropicSearchResultBlocksFromToolPayload(
+  value: Record<string, LooseJsonValue>,
+): Array<Record<string, LooseJsonValue>> {
+  const resultList = Array.isArray(value.results)
+    ? value.results.flatMap((item) =>
+      item && typeof item === "object" && !Array.isArray(item)
+        ? [(item as Record<string, LooseJsonValue>)]
+        : []
+    )
+    : [];
+  if (resultList.length > 0) {
+    return resultList.flatMap((item) => {
+      const block = anthropicSearchResultBlock(item);
+      return block ? [block] : [];
+    });
+  }
+  const singleBlock = anthropicSearchResultBlock(value);
+  return singleBlock ? [singleBlock] : [];
+}
+
+function buildAnthropicToolResultContent(
+  content: string,
+): string | Array<Record<string, LooseJsonValue>> {
+  const parsed = parseJsonRecord(content);
+  if (!parsed) {
+    return content;
+  }
+  const searchResultBlocks = anthropicSearchResultBlocksFromToolPayload(parsed);
+  if (searchResultBlocks.length > 0) {
+    return searchResultBlocks;
+  }
+  return content;
+}
+
 function messageToAnthropicShape(
   message: ProviderMessage,
 ): { role: "user" | "assistant"; content: string | Array<Record<string, unknown>> } | null {
@@ -1936,7 +2239,7 @@ function messageToAnthropicShape(
         {
           type: "tool_result",
           tool_use_id: message.toolCallId ?? "",
-          content: message.content,
+          content: buildAnthropicToolResultContent(message.content),
         },
       ],
     };
@@ -1972,6 +2275,79 @@ function messageToAnthropicShape(
     content: blocks.length === 1 && blocks[0]?.type === "text"
       ? String(blocks[0].text ?? "")
       : blocks,
+  };
+}
+
+function anthropicAutoBetaHeaders(args: {
+  profile: ProviderProfile;
+  model: string;
+  input: ProviderInvocationInput;
+}): string[] {
+  const requestOptions = resolveAnthropicRequestOptions(args.input);
+  const betaHeaders = [...(requestOptions?.betas ?? [])];
+  if (requestOptions?.contextManagement) {
+    betaHeaders.push("context-management-2025-06-27");
+  }
+  if (requestOptions?.mcpServers?.length) {
+    betaHeaders.push("mcp-client-2025-11-20");
+  }
+  if (
+    isAnthropicSonnet46Model(args.model) &&
+    args.profile.reasoningEnabled &&
+    args.profile.reasoningLevel !== "off" &&
+    args.profile.thinkingBudget !== null &&
+    Boolean(
+      (args.input.tools?.length && args.profile.toolCallingEnabled) ||
+        requestOptions?.tools?.length ||
+        requestOptions?.mcpServers?.length,
+    )
+  ) {
+    betaHeaders.push("interleaved-thinking-2025-05-14");
+  }
+  return betaHeaders;
+}
+
+function buildAnthropicThinking(
+  profile: ProviderProfile,
+  model: string,
+): Record<string, unknown> | undefined {
+  if (!profile.reasoningEnabled || profile.reasoningLevel === "off") {
+    return undefined;
+  }
+  if (anthropicSupportsAdaptiveThinking(model) && profile.thinkingBudget === null) {
+    return {
+      type: "adaptive",
+    };
+  }
+  const budgetTokens = anthropicThinkingBudget(profile);
+  if (!budgetTokens) {
+    return undefined;
+  }
+  return {
+    type: "enabled",
+    budget_tokens: budgetTokens,
+  };
+}
+
+function buildAnthropicOutputConfig(
+  profile: ProviderProfile,
+  input: ProviderInvocationInput,
+  model: string,
+): Record<string, unknown> | undefined {
+  const requestOptions = resolveAnthropicRequestOptions(input);
+  const format = requestOptions?.outputConfig?.format ??
+    (wantsJsonMode(profile, input) ? anthropicJsonObjectFormat() : undefined);
+  const effort = anthropicOutputEffort(
+    profile,
+    model,
+    requestOptions?.outputConfig?.effort,
+  );
+  if (!format && !effort) {
+    return undefined;
+  }
+  return {
+    ...(effort ? { effort } : {}),
+    ...(format ? { format } : {}),
   };
 }
 
@@ -2034,14 +2410,18 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
   anthropic: {
     kind: "anthropic",
     buildRequest(profile, apiKey, input) {
+      const model = input.model ?? profile.defaultModel;
+      const requestOptions = resolveAnthropicRequestOptions(input);
+      const betaHeaders = anthropicAutoBetaHeaders({
+        profile,
+        model,
+        input,
+      });
       return {
         url: `${profile.apiBaseUrl || defaultBaseUrl(profile.kind)}/messages`,
-        headers: mergeJsonHeaders(profile, {
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-        }),
+        headers: buildAnthropicJsonHeaders(profile, apiKey, betaHeaders),
         body: {
-          model: input.model ?? profile.defaultModel,
+          model,
           system: input.messages
             .filter((message) => message.role === "system")
             .map((message) => message.content)
@@ -2053,27 +2433,16 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
             ): message is { role: "user" | "assistant"; content: string | Array<Record<string, unknown>> } =>
               Boolean(message)
             ),
-          tools:
-            input.tools?.length && profile.toolCallingEnabled
-              ? anthropicToolDefinitions(input)
-              : undefined,
-          tool_choice:
-            input.tools?.length && profile.toolCallingEnabled
-              ? normalizeAnthropicToolChoice(input.toolChoice)
-              : undefined,
+          tools: anthropicRequestTools(profile, input),
+          tool_choice: anthropicResolvedToolChoice(profile, input),
+          mcp_servers: requestOptions?.mcpServers,
+          context_management: requestOptions?.contextManagement,
+          container: requestOptions?.container,
+          metadata: requestOptions?.metadata,
+          service_tier: requestOptions?.serviceTier,
           max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
-          thinking:
-            profile.reasoningEnabled && profile.reasoningLevel !== "off"
-              ? {
-                  type: "enabled",
-                  budget_tokens: profile.thinkingBudget ??
-                    (profile.reasoningLevel === "high"
-                      ? 2048
-                      : profile.reasoningLevel === "medium"
-                      ? 1024
-                      : 512),
-                }
-              : undefined,
+          thinking: buildAnthropicThinking(profile, model),
+          output_config: buildAnthropicOutputConfig(profile, input, model),
           ...buildSamplingOptions(profile),
           ...profile.extraBody,
         },

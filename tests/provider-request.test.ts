@@ -173,16 +173,30 @@ describe("provider request preview", () => {
 
   it("builds an Anthropic payload with thinking enabled", () => {
     const preview = createProviderRequestPreview({
-      profile: profile("anthropic"),
+      profile: profile("anthropic", {
+        defaultModel: "claude-sonnet-4-6",
+      }),
       apiKey: "anthropic-key",
       input: {
+        jsonMode: true,
         messages: [{ role: "user", content: "Hello" }],
       },
     });
 
     expect(preview.url).toContain("/messages");
     expect(preview.headers["x-api-key"]).toBe("anthropic-key");
-    expect(preview.body.thinking).toBeTruthy();
+    expect(preview.body.thinking).toEqual({ type: "adaptive" });
+    expect(preview.body.output_config).toEqual({
+      effort: "medium",
+      format: {
+        type: "json_schema",
+        name: "json_output",
+        schema: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+    });
   });
 
   it("builds an OpenAI responses payload for native tool calling", () => {
@@ -267,7 +281,10 @@ describe("provider request preview", () => {
 
   it("builds an Anthropic payload for native tool calling", () => {
     const preview = createProviderRequestPreview({
-      profile: profile("anthropic"),
+      profile: profile("anthropic", {
+        defaultModel: "claude-sonnet-4-6",
+        thinkingBudget: 2048,
+      }),
       apiKey: "anthropic-key",
       input: {
         messages: [{ role: "user", content: "Find docs" }],
@@ -299,6 +316,162 @@ describe("provider request preview", () => {
       },
     ]);
     expect(preview.body.tool_choice).toEqual({ type: "auto" });
+    expect(preview.body.thinking).toEqual({
+      type: "enabled",
+      budget_tokens: 2048,
+    });
+    expect(preview.headers["anthropic-beta"]).toContain(
+      "interleaved-thinking-2025-05-14",
+    );
+  });
+
+  it("builds an Anthropic payload with tool_choice none, native tools, and mcp options", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("anthropic", {
+        defaultModel: "claude-sonnet-4-6",
+      }),
+      apiKey: "anthropic-key",
+      input: {
+        messages: [{ role: "user", content: "Find docs" }],
+        tools: [
+          {
+            id: "search_web",
+            description: "Search the web",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+        ],
+        toolChoice: "none",
+        providerOptions: {
+          anthropic: {
+            betas: ["fine-grained-tool-streaming-2025-05-14"],
+            tools: [
+              {
+                type: "web_search_20250305",
+                name: "web_search",
+                max_uses: 2,
+              },
+            ],
+            mcpServers: [
+              {
+                type: "url",
+                url: "https://mcp.example.com",
+                name: "remote-search",
+              },
+            ],
+            contextManagement: {
+              clear_tool_uses_20250919: {
+                trigger: "auto",
+              },
+            },
+            serviceTier: "auto",
+          },
+        },
+      },
+    });
+
+    expect(preview.headers["anthropic-beta"]).toContain(
+      "fine-grained-tool-streaming-2025-05-14",
+    );
+    expect(preview.headers["anthropic-beta"]).toContain(
+      "context-management-2025-06-27",
+    );
+    expect(preview.headers["anthropic-beta"]).toContain("mcp-client-2025-11-20");
+    expect(preview.body.tools).toEqual([
+      {
+        name: "search_web",
+        description: "Search the web",
+        input_schema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      },
+      {
+        type: "web_search_20250305",
+        name: "web_search",
+        max_uses: 2,
+      },
+    ]);
+    expect(preview.body.tool_choice).toEqual({ type: "none" });
+    expect(preview.body.mcp_servers).toEqual([
+      {
+        type: "url",
+        url: "https://mcp.example.com",
+        name: "remote-search",
+      },
+    ]);
+    expect(preview.body.context_management).toEqual({
+      clear_tool_uses_20250919: {
+        trigger: "auto",
+      },
+    });
+    expect(preview.body.service_tier).toBe("auto");
+  });
+
+  it("maps Anthropic tool results into search_result blocks for citations", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("anthropic"),
+      apiKey: "anthropic-key",
+      input: {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [
+              {
+                id: "toolu_1",
+                toolId: "search_web",
+                input: { query: "CoserLab" },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            toolCallId: "toolu_1",
+            content: JSON.stringify({
+              query: "CoserLab",
+              results: [
+                {
+                  title: "CoserLab",
+                  url: "https://coserlab.io/",
+                  snippet: "CoserLab official site.",
+                },
+              ],
+            }),
+          },
+        ],
+      },
+    });
+
+    expect(preview.body.messages[1]).toEqual({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_1",
+          content: [
+            {
+              type: "search_result",
+              title: "CoserLab",
+              source: "https://coserlab.io/",
+              citations: {
+                enabled: true,
+              },
+              content: [
+                {
+                  type: "text",
+                  text: "CoserLab official site.",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
   });
 
   it("builds an OpenRouter responses payload for native tool calling and reasoning", () => {
@@ -807,7 +980,7 @@ describe("provider media request preview", () => {
   it("builds an Anthropic PDF payload with the beta header", () => {
     const preview = createProviderMediaRequestPreview({
       profile: profile("anthropic", {
-        documentModel: "claude-sonnet-4-5",
+        documentModel: "claude-sonnet-4-6",
       }),
       apiKey: "anthropic-key",
       input: {
@@ -824,9 +997,39 @@ describe("provider media request preview", () => {
     expect(preview?.headers["anthropic-beta"]).toBe("pdfs-2024-09-25");
     expect(body.messages[0].content[0]).toMatchObject({
       type: "document",
+      title: "memo.pdf",
       source: {
         type: "base64",
         media_type: "application/pdf",
+      },
+    });
+  });
+
+  it("builds an Anthropic plain-text document payload", () => {
+    const preview = createProviderMediaRequestPreview({
+      profile: profile("anthropic", {
+        documentModel: "claude-sonnet-4-6",
+      }),
+      apiKey: "anthropic-key",
+      input: {
+        kind: "document",
+        prompt: "Summarize this note.",
+        rawBody: new TextEncoder().encode("Alpha project notes"),
+        mimeType: "text/plain; charset=utf-8",
+        fileName: "notes.txt",
+      },
+    });
+
+    const body = preview?.body as Record<string, any>;
+    expect(preview?.url).toContain("/messages");
+    expect(preview?.headers["anthropic-beta"]).toBeUndefined();
+    expect(body.messages[0].content[0]).toEqual({
+      type: "document",
+      title: "notes.txt",
+      source: {
+        type: "text",
+        media_type: "text/plain",
+        data: "Alpha project notes",
       },
     });
   });
@@ -967,6 +1170,12 @@ describe("provider media request preview", () => {
       supportsProviderCapability(profile("anthropic"), "document", {
         mimeType: "application/pdf",
         fileName: "notes.pdf",
+      }),
+    ).toBe(true);
+    expect(
+      supportsProviderCapability(profile("anthropic"), "document", {
+        mimeType: "text/plain",
+        fileName: "notes.txt",
       }),
     ).toBe(true);
     expect(
