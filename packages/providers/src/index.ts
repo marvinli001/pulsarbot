@@ -88,7 +88,7 @@ export interface AgentProviderAdapter {
 }
 
 const logger = createLogger({ name: "providers" });
-const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
+const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
 const PROVIDER_MAX_RETRIES = 2;
 const PROVIDER_RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
 
@@ -1142,10 +1142,12 @@ async function performProviderFetch(args: {
   url: string;
   init: RequestInit;
   model: string;
+  timeoutMs?: number | undefined;
 }): Promise<Response> {
+  const timeoutMs = Math.max(1, args.timeoutMs ?? DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS);
   for (let attempt = 0; attempt <= PROVIDER_MAX_RETRIES; attempt += 1) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), PROVIDER_REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const response = await fetch(args.url, {
@@ -1179,7 +1181,7 @@ async function performProviderFetch(args: {
       if (isAbortLikeError(error)) {
         throw new AppError(
           "PROVIDER_REQUEST_TIMEOUT",
-          `Provider request timed out after ${PROVIDER_REQUEST_TIMEOUT_MS}ms (${args.profile.kind} ${args.model})`,
+          `Provider request timed out after ${timeoutMs}ms (${args.profile.kind} ${args.model})`,
           504,
         );
       }
@@ -2414,6 +2416,7 @@ export async function invokeProvider(args: {
   profile: ProviderProfile;
   apiKey: string;
   input: ProviderInvocationInput;
+  timeoutMs?: number | undefined;
 }): Promise<ProviderInvocationResult> {
   const adapter = getProviderAdapter(args.profile.kind);
   const preview = adapter.buildRequest(args.profile, args.apiKey, args.input);
@@ -2433,6 +2436,7 @@ export async function invokeProvider(args: {
       headers: preview.headers,
       body: JSON.stringify(preview.body),
     },
+    timeoutMs: args.timeoutMs,
   });
 
   if (!response.ok) {
@@ -2452,6 +2456,7 @@ export async function* invokeProviderStream(args: {
   profile: ProviderProfile;
   apiKey: string;
   input: ProviderInvocationInput;
+  timeoutMs?: number | undefined;
 }): AsyncGenerator<ProviderStreamChunk> {
   if (!supportsProviderTextStreaming(args.profile)) {
     throw new AppError(
@@ -2481,6 +2486,7 @@ export async function* invokeProviderStream(args: {
       headers: preview.headers,
       body: JSON.stringify(preview.body),
     },
+    timeoutMs: args.timeoutMs,
   });
 
   if (!response.ok) {
@@ -2573,19 +2579,27 @@ async function invokeBailianDocumentMedia(args: {
   profile: ProviderProfile;
   apiKey: string;
   input: ProviderMediaInvocationInput;
+  timeoutMs?: number | undefined;
 }): Promise<ProviderInvocationResult> {
   const { profile, apiKey, input } = args;
   const compatibleBaseUrl = dashscopeCompatibleBaseUrl(profile);
+  const model = resolveTaskModel(profile, "document");
   const form = new FormData();
   form.set("purpose", "file-extract");
   form.set("file", toBlob(input.rawBody, input.mimeType), input.fileName ?? "document");
 
-  const uploadResponse = await fetch(`${compatibleBaseUrl}/files`, {
-    method: "POST",
-    headers: mergeFormHeaders(profile, {
-      Authorization: `Bearer ${apiKey}`,
-    }),
-    body: form,
+  const uploadResponse = await performProviderFetch({
+    profile,
+    url: `${compatibleBaseUrl}/files`,
+    model,
+    init: {
+      method: "POST",
+      headers: mergeFormHeaders(profile, {
+        Authorization: `Bearer ${apiKey}`,
+      }),
+      body: form,
+    },
+    timeoutMs: args.timeoutMs,
   });
 
   if (!uploadResponse.ok) {
@@ -2608,27 +2622,33 @@ async function invokeBailianDocumentMedia(args: {
   }
 
   try {
-    const response = await fetch(`${compatibleBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: mergeJsonHeaders(profile, {
-        Authorization: `Bearer ${apiKey}`,
-      }),
-      body: JSON.stringify({
-        model: resolveTaskModel(profile, "document"),
-        messages: [
-          {
-            role: "system",
-            content: `fileid://${fileId}`,
-          },
-          {
-            role: "user",
-            content: input.prompt,
-          },
-        ],
-        max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
-        stream: false,
-        ...profile.extraBody,
-      }),
+    const response = await performProviderFetch({
+      profile,
+      url: `${compatibleBaseUrl}/chat/completions`,
+      model,
+      init: {
+        method: "POST",
+        headers: mergeJsonHeaders(profile, {
+          Authorization: `Bearer ${apiKey}`,
+        }),
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: `fileid://${fileId}`,
+            },
+            {
+              role: "user",
+              content: input.prompt,
+            },
+          ],
+          max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+          stream: false,
+          ...profile.extraBody,
+        }),
+      },
+      timeoutMs: args.timeoutMs,
     });
 
     if (!response.ok) {
@@ -2657,6 +2677,7 @@ export async function invokeProviderMedia(args: {
   profile: ProviderProfile;
   apiKey: string;
   input: ProviderMediaInvocationInput;
+  timeoutMs?: number | undefined;
 }): Promise<ProviderInvocationResult | null> {
   if (args.profile.kind === "bailian" && args.input.kind === "document") {
     if (!providerSupportsDocumentInput({
@@ -2674,10 +2695,23 @@ export async function invokeProviderMedia(args: {
     return null;
   }
 
-  const response = await fetch(preview.url, {
-    method: "POST",
-    headers: preview.headers,
-    body: preview.body instanceof FormData ? preview.body : JSON.stringify(preview.body),
+  const response = await performProviderFetch({
+    profile: args.profile,
+    url: preview.url,
+    model: resolveTaskModel(
+      args.profile,
+      args.input.kind === "image"
+        ? "vision"
+        : args.input.kind === "audio"
+        ? "audio"
+        : "document",
+    ),
+    init: {
+      method: "POST",
+      headers: preview.headers,
+      body: preview.body instanceof FormData ? preview.body : JSON.stringify(preview.body),
+    },
+    timeoutMs: args.timeoutMs,
   });
 
   if (!response.ok) {

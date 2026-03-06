@@ -9,6 +9,7 @@ import {
 import type { ProviderProfile } from "../packages/shared/src/index.js";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -137,6 +138,37 @@ describe("provider request preview", () => {
 
     expect(result.text).toBe("OK");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the caller-provided timeout for provider requests", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+      async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          }, { once: true });
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const resultPromise = invokeProvider({
+      profile: profile("openai"),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Hello" }],
+      },
+      timeoutMs: 40_000,
+    });
+    const expectation = expect(resultPromise).rejects.toThrow(
+      "Provider request timed out after 40000ms",
+    );
+
+    await vi.advanceTimersByTimeAsync(40_000);
+
+    await expectation;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("builds an Anthropic payload with thinking enabled", () => {

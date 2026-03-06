@@ -1369,7 +1369,7 @@ describe("server flows", () => {
     );
   });
 
-  it("fetches Bailian MCP provider servers with an API key and adds supported entries to MCP servers", async () => {
+  it("fetches Bailian MCP provider servers with an API key, upgrades standard SSE endpoints, and rejects unsupported ones", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
 
@@ -1382,7 +1382,7 @@ describe("server flows", () => {
         return new Response(
           JSON.stringify({
             success: true,
-            total: 2,
+            total: 3,
             data: [
               {
                 id: "web-search",
@@ -1393,10 +1393,18 @@ describe("server flows", () => {
                 active: true,
               },
               {
+                id: "tavily-ai",
+                name: "Tavily",
+                description: "Standard Bailian SSE MCP",
+                operationalUrl: "https://dashscope.aliyuncs.com/api/v1/mcps/tavily-ai/sse",
+                type: "sse",
+                active: true,
+              },
+              {
                 id: "legacy-sse",
                 name: "Legacy SSE",
-                description: "Unsupported SSE MCP",
-                operationalUrl: "https://dashscope.aliyuncs.com/api/v1/mcps/legacy-sse/sse",
+                description: "Unsupported non-standard SSE MCP",
+                operationalUrl: "https://dashscope.aliyuncs.com/legacy/legacy-sse/sse",
                 type: "sse",
                 active: true,
               },
@@ -1451,7 +1459,14 @@ describe("server flows", () => {
             protocol: "streamable_http",
           }),
           expect.objectContaining({
+            remoteId: "tavily-ai",
+            serverId: "mcp_bailian_tavily-ai",
+            operationalUrl: "https://dashscope.aliyuncs.com/api/v1/mcps/tavily-ai/mcp",
+            protocol: "streamable_http",
+          }),
+          expect.objectContaining({
             remoteId: "legacy-sse",
+            operationalUrl: "https://dashscope.aliyuncs.com/legacy/legacy-sse/sse",
             protocol: "sse",
           }),
         ],
@@ -1476,6 +1491,26 @@ describe("server flows", () => {
         transport: "streamable_http",
       });
 
+      const addTavily = await appState.app.inject({
+        method: "POST",
+        url: `/api/mcp/providers/${providerId}/servers`,
+        headers: {
+          cookie: appState.cookie,
+        },
+        payload: {
+          remoteId: "tavily-ai",
+        },
+      });
+      expect(addTavily.statusCode).toBe(200);
+      expect(addTavily.json<Record<string, any>>()).toMatchObject({
+        id: "mcp_bailian_tavily-ai",
+        source: "provider",
+        providerId,
+        providerKind: "bailian",
+        transport: "streamable_http",
+        url: "https://dashscope.aliyuncs.com/api/v1/mcps/tavily-ai/mcp",
+      });
+
       const profilesResponse = await appState.app.inject({
         method: "GET",
         url: "/api/agent-profiles",
@@ -1487,7 +1522,7 @@ describe("server flows", () => {
         .json<Array<Record<string, any>>>()
         .find((item) => item.label === "balanced");
       expect(balancedProfile?.enabledMcpServerIds).toEqual(
-        expect.arrayContaining(["mcp_bailian_web-search"]),
+        expect.arrayContaining(["mcp_bailian_web-search", "mcp_bailian_tavily-ai"]),
       );
 
       const addUnsupported = await appState.app.inject({
@@ -1516,6 +1551,12 @@ describe("server flows", () => {
             id: "mcp_bailian_web-search",
             source: "provider",
             providerId,
+          }),
+          expect.objectContaining({
+            id: "mcp_bailian_tavily-ai",
+            source: "provider",
+            providerId,
+            url: "https://dashscope.aliyuncs.com/api/v1/mcps/tavily-ai/mcp",
           }),
         ]),
       );

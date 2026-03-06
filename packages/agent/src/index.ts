@@ -54,6 +54,7 @@ export interface AgentExecutionServices {
     profile: ProviderProfile;
     apiKey: string;
     input: ProviderInvocationInput;
+    timeoutMs?: number | undefined;
   }): Promise<ProviderInvocationResult>;
 }
 
@@ -281,6 +282,10 @@ export class AgentRuntime {
 
     if (snapshot.softExceeded || snapshot.hardExceeded) {
       compacted = true;
+      const summaryTimeoutMs = this.operationTimeoutMs(
+        effectiveMaxToolDurationMs,
+        turnDeadlineAt,
+      );
       summary = await this.withOperationTimeout(
         () =>
           this.generateSummary({
@@ -289,8 +294,9 @@ export class AgentRuntime {
             memory,
             input,
             providerInvoker,
+            timeoutMs: summaryTimeoutMs,
           }),
-        this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
+        summaryTimeoutMs,
         "AGENT_SUMMARY_TIMEOUT",
         "Conversation compaction timed out",
       );
@@ -355,6 +361,10 @@ When enough information is available, respond directly with the user-facing answ
     for (let step = 0; step < input.profile.maxPlanningSteps; step += 1) {
       stepsUsed = step + 1;
       if (useNativeToolCalling) {
+        const plannerTimeoutMs = this.operationTimeoutMs(
+          effectiveMaxToolDurationMs,
+          turnDeadlineAt,
+        );
         const providerResult = await this.withOperationTimeout(
           () =>
             providerInvoker({
@@ -366,8 +376,9 @@ When enough information is available, respond directly with the user-facing answ
                 toolChoice:
                   toolRuns.length >= input.profile.maxToolCalls ? "none" : "auto",
               },
+              timeoutMs: plannerTimeoutMs,
             }),
-          this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
+          plannerTimeoutMs,
           "AGENT_PROVIDER_TIMEOUT",
           "Planner model timed out",
         );
@@ -477,6 +488,10 @@ Rules:
         },
       ];
 
+      const plannerTimeoutMs = this.operationTimeoutMs(
+        effectiveMaxToolDurationMs,
+        turnDeadlineAt,
+      );
       const action = parsePlannerAction(
         (
           await this.withOperationTimeout(
@@ -488,8 +503,9 @@ Rules:
                   messages: planningMessages,
                   jsonMode: true,
                 },
+                timeoutMs: plannerTimeoutMs,
               }),
-            this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
+            plannerTimeoutMs,
             "AGENT_PROVIDER_TIMEOUT",
             "Planner model timed out",
           )
@@ -520,6 +536,10 @@ Rules:
 
       if (action.type === "compact_now") {
         compacted = true;
+        const summaryTimeoutMs = this.operationTimeoutMs(
+          effectiveMaxToolDurationMs,
+          turnDeadlineAt,
+        );
         summary = await this.withOperationTimeout(
           () =>
             this.generateSummary({
@@ -528,8 +548,9 @@ Rules:
               memory,
               input,
               providerInvoker,
+              timeoutMs: summaryTimeoutMs,
             }),
-          this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
+          summaryTimeoutMs,
           "AGENT_SUMMARY_TIMEOUT",
           "Conversation compaction timed out",
         );
@@ -587,6 +608,10 @@ Rules:
 
     if (useNativeToolCalling) {
       try {
+        const finalProviderTimeoutMs = this.operationTimeoutMs(
+          effectiveMaxToolDurationMs,
+          turnDeadlineAt,
+        );
         const finalProviderReply = await this.withOperationTimeout(
           () =>
             providerInvoker({
@@ -597,8 +622,9 @@ Rules:
                 tools: nativeToolDefinitions,
                 toolChoice: "none",
               },
+              timeoutMs: finalProviderTimeoutMs,
             }),
-          this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
+          finalProviderTimeoutMs,
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         );
@@ -690,6 +716,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
     memory: MemoryStoreLike;
     input: AgentTurnInput;
     providerInvoker: NonNullable<AgentExecutionServices["invokeProvider"]> | typeof invokeProvider;
+    timeoutMs: number;
   }): Promise<string> {
     const compacted = args.memory.compactTranscript(args.transcript);
     if (!args.backgroundProvider) {
@@ -714,6 +741,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
           ],
           maxOutputTokens: 1024,
         },
+        timeoutMs: args.timeoutMs,
       });
       return response.text || compacted;
     } catch {
@@ -828,11 +856,14 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
     maxOperationMs: number;
     turnDeadlineAt: number;
   }): Promise<string> {
+    const operationTimeoutMs = () =>
+      this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt);
     if (
       !args.input.streamReply ||
       !args.primaryProvider.stream ||
       !supportsProviderTextStreaming(args.primaryProvider)
     ) {
+      const timeoutMs = operationTimeoutMs();
       return (
         await this.withOperationTimeout(
           () =>
@@ -842,8 +873,9 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
               input: {
                 messages: args.messages,
               },
+              timeoutMs,
             }),
-          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
+          timeoutMs,
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         )
@@ -852,17 +884,19 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
 
     try {
       let streamedText = "";
+      const streamTimeoutMs = operationTimeoutMs();
       const iterator = invokeProviderStream({
         profile: args.primaryProvider,
         apiKey: args.primaryApiKey,
         input: {
           messages: args.messages,
         },
+        timeoutMs: streamTimeoutMs,
       })[Symbol.asyncIterator]();
       while (true) {
         const next = await this.withOperationTimeout(
           () => iterator.next(),
-          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
+          operationTimeoutMs(),
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         );
@@ -875,6 +909,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
       if (streamedText) {
         return streamedText;
       }
+      const timeoutMs = operationTimeoutMs();
       return (
         await this.withOperationTimeout(
           () =>
@@ -884,13 +919,15 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
               input: {
                 messages: args.messages,
               },
+              timeoutMs,
             }),
-          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
+          timeoutMs,
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         )
       ).text;
     } catch {
+      const timeoutMs = operationTimeoutMs();
       return (
         await this.withOperationTimeout(
           () =>
@@ -900,8 +937,9 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
               input: {
                 messages: args.messages,
               },
+              timeoutMs,
             }),
-          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
+          timeoutMs,
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         )

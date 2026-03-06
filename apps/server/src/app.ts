@@ -120,11 +120,13 @@ interface CreateAppOptions {
     profile: ProviderProfile;
     apiKey: string;
     input: ProviderInvocationInput;
+    timeoutMs?: number | undefined;
   }) => Promise<ProviderInvocationResult>;
   providerMediaInvoker?: (args: {
     profile: ProviderProfile;
     apiKey: string;
     input: ProviderMediaInvocationInput;
+    timeoutMs?: number | undefined;
   }) => Promise<ProviderInvocationResult | null>;
   telegramFactory?: typeof createTelegramBot;
 }
@@ -344,6 +346,8 @@ export function resolveBailianMcpEndpointUrl(
   serverCode: string,
 ): string {
   const explicitUrl = firstStringFieldDeep(record, [
+    "operationalUrl",
+    "operational_url",
     "url",
     "mcp",
     "mcpUrl",
@@ -354,8 +358,22 @@ export function resolveBailianMcpEndpointUrl(
     "streamable_http_url",
     "endpoint",
   ]);
-  if (explicitUrl?.startsWith("/")) {
-    return new URL(explicitUrl, origin).toString();
+  if (explicitUrl) {
+    try {
+      const resolved = explicitUrl.startsWith("/")
+        ? new URL(explicitUrl, origin)
+        : new URL(explicitUrl);
+      const explicitServerCode = bailianServerCodeFromUrl(resolved.toString());
+      if (explicitServerCode) {
+        resolved.pathname = `/api/v1/mcps/${encodeURIComponent(explicitServerCode)}/mcp`;
+        return resolved.toString();
+      }
+      return resolved.toString();
+    } catch {
+      if (explicitUrl.startsWith("/")) {
+        return new URL(explicitUrl, origin).toString();
+      }
+    }
   }
   return explicitUrl ?? `${origin}/api/v1/mcps/${encodeURIComponent(serverCode)}/mcp`;
 }
@@ -423,6 +441,18 @@ async function fetchBailianProviderCatalog(
       if (!remoteId || !operationalUrl) {
         continue;
       }
+      const rawProtocol = normalizeBailianProviderProtocol(record.type);
+      const standardSseServerCode = rawProtocol === "sse"
+        ? bailianServerCodeFromUrl(operationalUrl)
+        : null;
+      const resolvedOperationalUrl = standardSseServerCode
+        ? resolveBailianMcpEndpointUrl(
+            record,
+            resolveBailianOrigin(operationalUrl),
+            standardSseServerCode,
+          )
+        : operationalUrl;
+      const protocol = standardSseServerCode ? "streamable_http" : rawProtocol;
 
       servers.push(
         McpProviderCatalogServerSchema.parse({
@@ -430,8 +460,8 @@ async function fetchBailianProviderCatalog(
           serverId: mcpProviderServerId("bailian", remoteId),
           label: firstStringField(record, ["name", "serverName", "title"]) ?? remoteId,
           description: firstStringField(record, ["description", "desc", "summary"]) ?? "",
-          operationalUrl,
-          protocol: normalizeBailianProviderProtocol(record.type),
+          operationalUrl: resolvedOperationalUrl,
+          protocol,
           active: toBooleanLike(record.active) ?? true,
           tags: Array.isArray(record.tags)
             ? record.tags.filter((value): value is string => typeof value === "string")
@@ -1194,6 +1224,7 @@ class RuntimeState {
     profile: ProviderProfile;
     apiKey: string;
     input: ProviderInvocationInput;
+    timeoutMs?: number | undefined;
   }) {
     return (this.options.providerInvoker ?? invokeProvider)(args);
   }
@@ -1202,6 +1233,7 @@ class RuntimeState {
     profile: ProviderProfile;
     apiKey: string;
     input: ProviderMediaInvocationInput;
+    timeoutMs?: number | undefined;
   }) {
     return (this.options.providerMediaInvoker ?? invokeProviderMedia)(args);
   }
@@ -3009,6 +3041,7 @@ export async function createApp(
     }
 
     const fileName = `${safePathSegment(args.title)}.${fileExtensionForContent(args.content)}`;
+    const mediaTimeoutMs = Math.max(args.profile.maxToolDurationMs, 30_000);
 
     if (args.kind === "text" || args.kind === "json" || args.kind === "csv") {
       return decodeBestEffortText(args.rawBody).trim() || null;
@@ -3036,6 +3069,7 @@ export async function createApp(
               args.content.caption ? `User caption: ${args.content.caption}` : "",
             ].filter(Boolean).join("\n"),
           },
+          timeoutMs: mediaTimeoutMs,
         });
         return result?.text.trim() || null;
       } catch (error) {
@@ -3069,6 +3103,7 @@ export async function createApp(
               "Return plain text only.",
             ].join("\n"),
           },
+          timeoutMs: mediaTimeoutMs,
         });
         return result?.text.trim() || null;
       } catch (error) {
@@ -3104,6 +3139,7 @@ export async function createApp(
               "Return plain text only.",
             ].join("\n"),
           },
+          timeoutMs: mediaTimeoutMs,
         });
         if (result?.text.trim()) {
           return result.text.trim();

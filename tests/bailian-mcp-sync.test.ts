@@ -56,4 +56,16 @@ describe("Bailian MCP sync helpers", () => {
       ),
     ).toBe("https://dashscope.aliyuncs.com/api/v1/mcps/travel-assistant/mcp");
   });
+
+  it("rewrites standard Bailian /sse endpoints to /mcp", () => {
+    expect(
+      resolveBailianMcpEndpointUrl(
+        {
+          operationalUrl: "https://dashscope.aliyuncs.com/api/v1/mcps/tavily-ai/sse",
+        },
+        "https://dashscope.aliyuncs.com",
+        "tavily-ai",
+      ),
+    ).toBe("https://dashscope.aliyuncs.com/api/v1/mcps/tavily-ai/mcp");
+  });
 });
