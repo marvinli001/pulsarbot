@@ -1,0 +1,9 @@
+{
+  "id": "alibaba-bailian",
+  "providerKind": "bailian",
+  "title": "Alibaba Bailian",
+  "description": "Use a Bailian API key to fetch the MCP services you have opened in Bailian, then add individual servers into Pulsarbot's active MCP server list.",
+  "tags": ["alibaba", "bailian", "provider"],
+  "authMode": "api_key",
+  "apiBaseUrl": "https://dashscope.aliyuncs.com"
+}

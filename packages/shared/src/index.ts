@@ -15,6 +15,7 @@ export const ReasoningLevelSchema = z.preprocess(
   z.enum(["off", "low", "medium", "high"]),
 );
 export const MarketKindSchema = z.enum(["skills", "plugins", "mcp"]);
+export const McpProviderKindSchema = z.enum(["bailian"]);
 export const RuntimeKindSchema = z.enum([
   "internal",
   "http",
@@ -206,6 +207,35 @@ export const InstallRecordSchema = z.object({
   updatedAt: z.string().min(1),
 });
 
+export const McpProviderCatalogServerSchema = z.object({
+  remoteId: z.string().min(1),
+  serverId: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().default(""),
+  operationalUrl: z.string().url(),
+  protocol: z.enum(["streamable_http", "sse", "unknown"]).default("streamable_http"),
+  active: z.boolean().default(true),
+  tags: z.array(z.string()).default([]),
+  logoUrl: z.string().nullable().default(null),
+  provider: z.string().nullable().default(null),
+  providerUrl: z.string().nullable().default(null),
+  fetchedAt: z.string().min(1),
+});
+
+export const McpProviderConfigSchema = z.object({
+  id: z.string().min(1),
+  kind: McpProviderKindSchema,
+  label: z.string().min(1),
+  apiKeyRef: z.string().min(1),
+  enabled: z.boolean().default(true),
+  catalogCache: z.array(McpProviderCatalogServerSchema).default([]),
+  lastFetchedAt: z.string().nullable().default(null),
+  lastFetchStatus: z.enum(["idle", "ok", "error"]).default("idle"),
+  lastFetchError: z.string().nullable().default(null),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
 export const SearchSettingsSchema = z.object({
   id: z.string().min(1).default("main"),
   providerPriority: z.array(SearchProviderKindSchema).default([
@@ -228,6 +258,8 @@ export const McpServerConfigSchema = z.object({
   label: z.string().min(1),
   description: z.string().default(""),
   manifestId: z.string().nullable().default(null),
+  providerId: z.string().nullable().optional(),
+  providerKind: McpProviderKindSchema.nullable().optional(),
   transport: McpTransportSchema,
   command: z.string().optional(),
   args: z.array(z.string()).default([]),
@@ -239,7 +271,7 @@ export const McpServerConfigSchema = z.object({
   lastHealthStatus: z.enum(["unknown", "ok", "error"]).default("unknown"),
   lastHealthCheckedAt: z.string().nullable().default(null),
   enabled: z.boolean().default(false),
-  source: z.enum(["official", "custom", "bailian_market"]).default("custom"),
+  source: z.enum(["official", "custom", "provider", "bailian_market"]).default("custom"),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
 });
@@ -277,6 +309,17 @@ export const McpManifestSchema = MarketManifestBaseSchema.extend({
   args: z.array(z.string()).optional(),
   url: z.string().url().optional(),
   envTemplate: z.record(z.string()).optional(),
+});
+
+export const McpProviderManifestSchema = z.object({
+  id: z.string().min(1),
+  providerKind: McpProviderKindSchema,
+  title: z.string().min(1),
+  description: z.string().min(1),
+  icon: z.string().optional(),
+  tags: z.array(z.string()).default([]),
+  authMode: z.enum(["api_key"]).default("api_key"),
+  apiBaseUrl: z.string().url().or(z.literal("")),
 });
 
 export const ToolDescriptorSchema = z.object({
@@ -621,6 +664,7 @@ export const WorkspaceExportBundleSchema = z.object({
   pluginInstalls: z.array(InstallRecordSchema).default([]),
   mcpInstalls: z.array(InstallRecordSchema).default([]),
   installs: z.array(InstallRecordSchema).default([]),
+  mcpProviders: z.array(McpProviderConfigSchema).default([]),
   mcpServers: z.array(McpServerConfigSchema),
   searchSettings: SearchSettingsSchema.optional(),
   documents: z.array(DocumentMetadataSchema).default([]),
@@ -648,7 +692,7 @@ export const ResolvedMcpServerSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
   transport: McpTransportSchema,
-  source: z.enum(["official", "custom", "bailian_market"]),
+  source: z.enum(["official", "custom", "provider", "bailian_market"]),
   manifestId: z.string().nullable().default(null),
 });
 
@@ -676,11 +720,15 @@ export type SecretEnvelope = z.infer<typeof SecretEnvelopeSchema>;
 export type ProviderProfile = z.infer<typeof ProviderProfileSchema>;
 export type AgentProfile = z.infer<typeof AgentProfileSchema>;
 export type InstallRecord = z.infer<typeof InstallRecordSchema>;
+export type McpProviderKind = z.infer<typeof McpProviderKindSchema>;
+export type McpProviderCatalogServer = z.infer<typeof McpProviderCatalogServerSchema>;
+export type McpProviderConfig = z.infer<typeof McpProviderConfigSchema>;
 export type SearchSettings = z.infer<typeof SearchSettingsSchema>;
 export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
 export type SkillManifest = z.infer<typeof SkillManifestSchema>;
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;
 export type McpManifest = z.infer<typeof McpManifestSchema>;
+export type McpProviderManifest = z.infer<typeof McpProviderManifestSchema>;
 export type ToolDescriptor = z.infer<typeof ToolDescriptorSchema>;
 export type PlannerAction = z.infer<typeof PlannerActionSchema>;
 export type ConversationRecord = z.infer<typeof ConversationRecordSchema>;

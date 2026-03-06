@@ -44,6 +44,8 @@ import {
   AgentProfileSchema,
   CloudflareCredentialsSchema,
   McpServerConfigSchema,
+  McpProviderConfigSchema,
+  McpProviderCatalogServerSchema,
   ProviderTestCapabilitySchema,
   ProviderProfileSchema,
   ResolvedRuntimeSnapshotSchema,
@@ -59,6 +61,9 @@ import {
   type DocumentMetadata,
   type InstallRecord,
   type LooseJsonValue,
+  type McpProviderConfig,
+  type McpProviderCatalogServer,
+  type McpProviderKind,
   type McpServerConfig,
   type MemoryDocument,
   type ProviderTestCapability,
@@ -355,6 +360,99 @@ export function resolveBailianMcpEndpointUrl(
   return explicitUrl ?? `${origin}/api/v1/mcps/${encodeURIComponent(serverCode)}/mcp`;
 }
 
+function mcpProviderServerId(kind: McpProviderKind, remoteId: string): string {
+  if (kind === "bailian") {
+    return bailianServerId(remoteId);
+  }
+  return `mcp_provider_${safePathSegment(kind)}_${safePathSegment(remoteId)}`.toLowerCase();
+}
+
+function normalizeBailianProviderProtocol(value: unknown): "streamable_http" | "sse" | "unknown" {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "streamablehttp" || normalized === "streamable_http") {
+    return "streamable_http";
+  }
+  if (normalized === "sse") {
+    return "sse";
+  }
+  return "unknown";
+}
+
+async function fetchBailianProviderCatalog(
+  apiKey: string,
+): Promise<McpProviderCatalogServer[]> {
+  const pageSize = 20;
+  const fetchedAt = nowIso();
+  const servers: McpProviderCatalogServer[] = [];
+  let pageNo = 1;
+  let total = Number.POSITIVE_INFINITY;
+
+  while (servers.length < total) {
+    const endpoint = `https://dashscope.aliyuncs.com/api/v1/mcps/user/list?pageNo=${pageNo}&pageSize=${pageSize}`;
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Bailian MCP provider fetch failed: HTTP ${response.status}`);
+    }
+
+    const payload = await response.json() as {
+      success?: boolean;
+      message?: string;
+      total?: number;
+      data?: Array<Record<string, unknown>>;
+    };
+
+    if (!payload.success) {
+      throw new Error(payload.message || "Bailian MCP provider fetch failed");
+    }
+
+    const records = Array.isArray(payload.data) ? payload.data : [];
+    total = typeof payload.total === "number" && Number.isFinite(payload.total)
+      ? payload.total
+      : records.length;
+
+    for (const record of records) {
+      const remoteId = firstStringField(record, ["id"]) ?? firstStringField(record, ["serverCode"]);
+      const operationalUrl = firstStringField(record, ["operationalUrl", "url"]);
+      if (!remoteId || !operationalUrl) {
+        continue;
+      }
+
+      servers.push(
+        McpProviderCatalogServerSchema.parse({
+          remoteId,
+          serverId: mcpProviderServerId("bailian", remoteId),
+          label: firstStringField(record, ["name", "serverName", "title"]) ?? remoteId,
+          description: firstStringField(record, ["description", "desc", "summary"]) ?? "",
+          operationalUrl,
+          protocol: normalizeBailianProviderProtocol(record.type),
+          active: toBooleanLike(record.active) ?? true,
+          tags: Array.isArray(record.tags)
+            ? record.tags.filter((value): value is string => typeof value === "string")
+            : [],
+          logoUrl: firstStringField(record, ["logoUrl", "logo_url"]),
+          provider: firstStringField(record, ["provider"]),
+          providerUrl: firstStringField(record, ["providerUrl", "provider_url"]),
+          fetchedAt,
+        }),
+      );
+    }
+
+    if (records.length < pageSize) {
+      break;
+    }
+    pageNo += 1;
+  }
+
+  return servers;
+}
+
 function bailianServerId(serverCode: string): string {
   const normalized = safePathSegment(serverCode).toLowerCase();
   return `mcp_bailian_${normalized}`;
@@ -622,6 +720,7 @@ class RuntimeState {
     skills: [],
     plugins: [],
     mcp: [],
+    mcpProviders: [],
   };
   public readonly agent: AgentRuntime;
 
@@ -1040,7 +1139,6 @@ class RuntimeState {
   }
 
   public async listEnabledMcpServers(ids: string[]) {
-    await this.ensureBailianMcpServersSynced();
     const servers = await this.repository.listMcpServers();
     return Promise.all(
       servers
@@ -1189,7 +1287,6 @@ class RuntimeState {
   public async resolveRuntime(profile: AgentProfile): Promise<ResolvedRuntimeSnapshot> {
     const workspace = await this.repository.getWorkspace();
     requireWorkspace(workspace);
-    await this.ensureBailianMcpServersSynced();
     const snapshot = ResolvedRuntimeSnapshotSchema.parse(
       resolveRuntimeSnapshot({
         workspaceId: workspace.id,
@@ -1572,6 +1669,7 @@ class RuntimeState {
       profiles: await this.repository.listAgentProfiles(),
       ...normalizeInstallGroups(installs),
       installs,
+      mcpProviders: await this.repository.listMcpProviders(),
       mcpServers: await this.repository.listMcpServers(),
       searchSettings: await this.repository.getSearchSettings(),
       documents,
@@ -1621,6 +1719,9 @@ class RuntimeState {
     }
     for (const install of installs) {
       await this.repository.saveInstallRecord(install);
+    }
+    for (const provider of parsed.mcpProviders) {
+      await this.repository.saveMcpProvider(provider);
     }
     for (const server of parsed.mcpServers) {
       await this.repository.saveMcpServer(server);
@@ -2444,6 +2545,81 @@ export async function createApp(
     }
   };
   const jwtSecret = getJwtSecret(state.env.PULSARBOT_ACCESS_TOKEN);
+  const officialMcpServerId = (manifestId: string) => `mcp_official_${manifestId}`;
+
+  async function upsertOfficialMcpServer(
+    manifestId: string,
+    options: { enabled?: boolean } = {},
+  ) {
+    const manifest = state.catalog.mcp.find((item) => item.id === manifestId);
+    if (!manifest) {
+      throw app.httpErrors.notFound("MCP manifest not found");
+    }
+
+    const existing = (await state.repository.listMcpServers()).find((server) =>
+      server.id === officialMcpServerId(manifest.id)
+    );
+    const timestamp = nowIso();
+    const nextServer = McpServerConfigSchema.parse({
+      id: officialMcpServerId(manifest.id),
+      label: existing?.label ?? manifest.title,
+      description: existing?.description ?? manifest.description,
+      manifestId: manifest.id,
+      providerId: null,
+      providerKind: null,
+      transport: manifest.transport,
+      command: existing?.command ?? manifest.command,
+      args: existing?.args ?? manifest.args ?? [],
+      url: existing?.url ?? manifest.url,
+      envRefs: existing?.envRefs ?? manifest.envTemplate ?? {},
+      headers: existing?.headers ?? {},
+      restartPolicy: existing?.restartPolicy ?? "on-failure",
+      toolCache: existing?.toolCache ?? {},
+      lastHealthStatus: existing?.lastHealthStatus ?? "unknown",
+      lastHealthCheckedAt: existing?.lastHealthCheckedAt ?? null,
+      enabled: options.enabled ?? existing?.enabled ?? false,
+      source: "official",
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveMcpServer(nextServer);
+    return nextServer;
+  }
+
+  async function attachMcpServerToActiveProfile(serverId: string) {
+    const workspace = await state.repository.getWorkspace();
+    if (!workspace?.activeAgentProfileId) {
+      return {
+        profileId: null,
+        attached: false,
+      };
+    }
+
+    const profiles = await state.repository.listAgentProfiles();
+    const activeProfile = profiles.find((profile) => profile.id === workspace.activeAgentProfileId);
+    if (!activeProfile) {
+      return {
+        profileId: workspace.activeAgentProfileId,
+        attached: false,
+      };
+    }
+    if (activeProfile.enabledMcpServerIds.includes(serverId)) {
+      return {
+        profileId: activeProfile.id,
+        attached: true,
+      };
+    }
+
+    await state.repository.saveAgentProfile({
+      ...activeProfile,
+      enabledMcpServerIds: [...activeProfile.enabledMcpServerIds, serverId],
+      updatedAt: nowIso(),
+    });
+    return {
+      profileId: activeProfile.id,
+      attached: true,
+    };
+  }
 
   await app.register(sensible);
   await app.register(cors, {
@@ -4928,16 +5104,29 @@ export async function createApp(
     { preHandler: requireOwner },
     async (request) => {
       const params = request.params as { kind: "skills" | "plugins" | "mcp"; id: string };
+      const manifests = filterCatalogByKind(state.catalog, params.kind);
+      const manifest = manifests.find((item) => item.id === params.id);
+      if (!manifest) {
+        throw app.httpErrors.notFound("Market manifest not found");
+      }
+
+      const existing = (await state.repository.listInstallRecords(params.kind)).find((record) =>
+        record.manifestId === params.id
+      );
+      const timestamp = nowIso();
       const record = {
-        id: createId("install"),
+        id: existing?.id ?? createId("install"),
         manifestId: params.id,
         kind: params.kind,
-        enabled: false,
-        config: {},
-        installedAt: nowIso(),
-        updatedAt: nowIso(),
+        enabled: existing?.enabled ?? false,
+        config: existing?.config ?? {},
+        installedAt: existing?.installedAt ?? timestamp,
+        updatedAt: timestamp,
       };
       await state.repository.saveInstallRecord(record);
+      if (params.kind === "mcp") {
+        await upsertOfficialMcpServer(params.id);
+      }
       return record;
     },
   );
@@ -4951,6 +5140,18 @@ export async function createApp(
         id: string;
       };
       await state.repository.deleteInstallRecord(params.kind, params.id);
+      if (params.kind === "mcp") {
+        const existing = (await state.repository.listMcpServers()).find((server) =>
+          server.id === officialMcpServerId(params.id)
+        );
+        if (existing) {
+          await state.repository.saveMcpServer({
+            ...existing,
+            enabled: false,
+            updatedAt: nowIso(),
+          });
+        }
+      }
       return { ok: true };
     },
   );
@@ -4971,6 +5172,12 @@ export async function createApp(
       updatedAt: nowIso(),
     };
     await state.repository.saveInstallRecord(next);
+    if (params.kind === "mcp") {
+      const server = await upsertOfficialMcpServer(params.id, { enabled });
+      if (enabled) {
+        await attachMcpServerToActiveProfile(server.id);
+      }
+    }
     return next;
   }
 
@@ -5000,8 +5207,197 @@ export async function createApp(
     return next;
   });
 
+  app.get("/api/mcp/providers/catalog", { preHandler: requireOwner }, async () =>
+    state.catalog.mcpProviders,
+  );
+
+  app.get("/api/mcp/providers", { preHandler: requireOwner }, async () =>
+    state.repository.listMcpProviders(),
+  );
+
+  async function saveMcpProviderHandler(request: FastifyRequest) {
+    const workspace = await state.repository.getWorkspace();
+    requireWorkspace(workspace);
+    const body = request.body as Partial<McpProviderConfig> & { apiKey?: string; accessToken?: string };
+    const params = (request.params ?? {}) as { id?: string };
+    const providers = await state.repository.listMcpProviders();
+    const existing = params.id
+      ? providers.find((item) => item.id === params.id)
+      : providers.find((item) => item.kind === (body.kind ?? "bailian"));
+    const id = params.id ?? body.id ?? createId("mcpprovider");
+    const timestamp = nowIso();
+    const next = McpProviderConfigSchema.parse({
+      id,
+      kind: body.kind ?? existing?.kind ?? "bailian",
+      label: body.label ?? existing?.label ?? "Alibaba Bailian",
+      apiKeyRef: body.apiKeyRef ?? existing?.apiKeyRef ?? `mcp-provider:${id}:apiKey`,
+      enabled: body.enabled ?? existing?.enabled ?? true,
+      catalogCache: body.catalogCache ?? existing?.catalogCache ?? [],
+      lastFetchedAt: body.lastFetchedAt ?? existing?.lastFetchedAt ?? null,
+      lastFetchStatus: body.lastFetchStatus ?? existing?.lastFetchStatus ?? "idle",
+      lastFetchError: body.lastFetchError ?? existing?.lastFetchError ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+
+    await state.repository.saveMcpProvider(next);
+    if (body.apiKey) {
+      if (body.accessToken !== state.env.PULSARBOT_ACCESS_TOKEN) {
+        throw app.httpErrors.unauthorized("Invalid access token");
+      }
+      const existingSecret = await state.repository.getSecretByScope(
+        workspace.id,
+        next.apiKeyRef,
+      );
+      await state.repository.saveSecret(
+        encryptSecret({
+          accessToken: state.env.PULSARBOT_ACCESS_TOKEN,
+          workspaceId: workspace.id,
+          scope: next.apiKeyRef,
+          plainText: body.apiKey,
+          ...(existingSecret ? { existingId: existingSecret.id } : {}),
+        }),
+      );
+    }
+    return next;
+  }
+
+  app.post("/api/mcp/providers", { preHandler: requireOwner }, async (request) =>
+    saveMcpProviderHandler(request),
+  );
+  app.put(
+    "/api/mcp/providers/:id",
+    { preHandler: requireOwner },
+    async (request) => saveMcpProviderHandler(request),
+  );
+  app.delete(
+    "/api/mcp/providers/:id",
+    { preHandler: requireOwner },
+    async (request) => {
+      const id = (request.params as { id: string }).id;
+      const providers = await state.repository.listMcpProviders();
+      const target = providers.find((item) => item.id === id);
+      if (!target) {
+        throw app.httpErrors.notFound("MCP provider not found");
+      }
+      await state.repository.deleteMcpProvider(id);
+      const servers = await state.repository.listMcpServers();
+      await Promise.all(
+        servers
+          .filter((server) => server.providerId === id)
+          .map((server) => state.repository.deleteMcpServer(server.id)),
+      );
+      return { ok: true };
+    },
+  );
+
+  app.post(
+    "/api/mcp/providers/:id/fetch",
+    { preHandler: requireOwner },
+    async (request) => {
+      const id = (request.params as { id: string }).id;
+      const provider = (await state.repository.listMcpProviders()).find((item) => item.id === id);
+      if (!provider) {
+        throw app.httpErrors.notFound("MCP provider not found");
+      }
+
+      let apiKey: string;
+      try {
+        apiKey = await state.resolveApiKey(provider.apiKeyRef);
+      } catch (error) {
+        throw app.httpErrors.badRequest(
+          error instanceof Error ? error.message : "MCP provider API key is missing",
+        );
+      }
+
+      try {
+        const catalogCache = provider.kind === "bailian"
+          ? await fetchBailianProviderCatalog(apiKey)
+          : [];
+        const next = McpProviderConfigSchema.parse({
+          ...provider,
+          catalogCache,
+          lastFetchedAt: nowIso(),
+          lastFetchStatus: "ok",
+          lastFetchError: null,
+          updatedAt: nowIso(),
+        });
+        await state.repository.saveMcpProvider(next);
+        return {
+          provider: next,
+          servers: catalogCache,
+        };
+      } catch (error) {
+        const next = McpProviderConfigSchema.parse({
+          ...provider,
+          lastFetchedAt: nowIso(),
+          lastFetchStatus: "error",
+          lastFetchError: error instanceof Error ? error.message : String(error),
+          updatedAt: nowIso(),
+        });
+        await state.repository.saveMcpProvider(next);
+        throw app.httpErrors.badRequest(next.lastFetchError ?? "MCP provider fetch failed");
+      }
+    },
+  );
+
+  app.post(
+    "/api/mcp/providers/:id/servers",
+    { preHandler: requireOwner },
+    async (request) => {
+      const id = (request.params as { id: string }).id;
+      const body = (request.body ?? {}) as { remoteId?: string };
+      const remoteId = typeof body.remoteId === "string" ? body.remoteId : "";
+      if (!remoteId) {
+        throw app.httpErrors.badRequest("remoteId is required");
+      }
+      const provider = (await state.repository.listMcpProviders()).find((item) => item.id === id);
+      if (!provider) {
+        throw app.httpErrors.notFound("MCP provider not found");
+      }
+      const entry = provider.catalogCache.find((item) => item.remoteId === remoteId);
+      if (!entry) {
+        throw app.httpErrors.badRequest("Provider server was not found in the fetched catalog");
+      }
+      if (entry.protocol !== "streamable_http") {
+        throw app.httpErrors.badRequest("Only streamable_http provider servers are supported");
+      }
+
+      const existing = (await state.repository.listMcpServers()).find((server) =>
+        server.id === entry.serverId
+      );
+      const timestamp = nowIso();
+      const nextServer = McpServerConfigSchema.parse({
+        id: entry.serverId,
+        label: entry.label,
+        description: entry.description
+          ? `${entry.description}\n\nAdded from MCP provider ${provider.label}.`
+          : `Added from MCP provider ${provider.label}.`,
+        manifestId: existing?.manifestId ?? null,
+        providerId: provider.id,
+        providerKind: provider.kind,
+        transport: "streamable_http",
+        command: existing?.command,
+        args: existing?.args ?? [],
+        url: entry.operationalUrl,
+        envRefs: existing?.envRefs ?? {},
+        headers: buildBailianMcpHeaders(provider.apiKeyRef),
+        restartPolicy: existing?.restartPolicy ?? "on-failure",
+        toolCache: existing?.toolCache ?? {},
+        lastHealthStatus: existing?.lastHealthStatus ?? "unknown",
+        lastHealthCheckedAt: existing?.lastHealthCheckedAt ?? null,
+        enabled: existing?.enabled ?? true,
+        source: "provider",
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      });
+      await state.repository.saveMcpServer(nextServer);
+      await attachMcpServerToActiveProfile(nextServer.id);
+      return nextServer;
+    },
+  );
+
   app.get("/api/mcp/servers", { preHandler: requireOwner }, async () => {
-    await state.ensureBailianMcpServersSynced({ force: true });
     return state.repository.listMcpServers();
   });
 
@@ -5018,6 +5414,8 @@ export async function createApp(
       label: body.label ?? existing?.label ?? "MCP Server",
       description: body.description ?? existing?.description ?? "",
       manifestId: body.manifestId ?? existing?.manifestId ?? null,
+      providerId: body.providerId ?? existing?.providerId ?? null,
+      providerKind: body.providerKind ?? existing?.providerKind ?? null,
       transport: body.transport ?? existing?.transport ?? "stdio",
       command: body.command ?? existing?.command,
       args: body.args ?? existing?.args ?? [],
@@ -5394,9 +5792,9 @@ export async function createApp(
   );
 
   app.get("/api/system/health", { preHandler: requireOwner }, async (request) => {
-    await state.ensureBailianMcpServersSynced();
     const jobs = await state.repository.listJobs();
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
+    const mcpProviders = await state.repository.listMcpProviders();
     const mcpServers = await state.repository.listMcpServers();
     const workspace = await state.repository.getWorkspace();
     const providerProfiles = await state.repository.listProviderProfiles();
@@ -5487,6 +5885,7 @@ export async function createApp(
       bootstrapState: await state.repository.getBootstrapState(),
       hasWorkspace: Boolean(workspace),
       providerProfiles: providerProfiles.length,
+      mcpProviders: mcpProviders.length,
       mcpServers: mcpServers.length,
       runtime: runtimeDiagnostics,
       activeTurnLocks: await state.listActiveConversationLocks(),
@@ -5516,11 +5915,11 @@ export async function createApp(
           String(right.lastHealthCheckedAt).localeCompare(String(left.lastHealthCheckedAt))
         )
         .slice(0, 5),
-      bailianMcpSync: state.getBailianMcpSyncStatus(),
       marketCounts: {
         skills: state.catalog.skills.length,
         plugins: state.catalog.plugins.length,
         mcp: state.catalog.mcp.length,
+        mcpProviders: state.catalog.mcpProviders.length,
       },
       cloudflare: await buildCloudflareHealth(state),
     };

@@ -43,7 +43,7 @@ export function MarketPanel({ kind }: { kind: "skills" | "plugins" | "mcp" }) {
     <Panel
       title={kind === "mcp" ? "MCP Market" : `${kind[0]?.toUpperCase() ?? ""}${kind.slice(1)} Market`}
       subtitle={kind === "mcp"
-        ? "官方 MCP manifest 池。启用后仍需要在 MCP Servers 中查看/同步实例，并在 Profiles 中勾选要暴露给 agent 的 server。"
+        ? "官方 MCP manifest 池。Install 会自动创建 MCP server 配置，Enable 会启用它并加入当前 active profile；模板或占位 preset 仍可在 MCP Servers 中继续编辑。"
         : "仓库内官方 manifest 池，支持 install / uninstall / enable / disable。"}
       actions={<MutationBadge mutation={actionMutation} successLabel="Market Updated" />}
     >

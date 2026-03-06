@@ -1288,6 +1288,242 @@ describe("server flows", () => {
     expect(fakeProviderMediaInvoker).toHaveBeenCalledTimes(3);
   });
 
+  it("creates official MCP server configs on install and attaches them to the active profile on enable", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const install = await appState.app.inject({
+      method: "POST",
+      url: "/api/market/mcp/exa-search/install",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(install.statusCode).toBe(200);
+
+    const serversAfterInstall = await appState.app.inject({
+      method: "GET",
+      url: "/api/mcp/servers",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(serversAfterInstall.statusCode).toBe(200);
+    expect(serversAfterInstall.json<Array<Record<string, any>>>()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "mcp_official_exa-search",
+          label: "Exa Search",
+          manifestId: "exa-search",
+          transport: "stdio",
+          command: "uvx",
+          args: ["exa-mcp"],
+          source: "official",
+          enabled: false,
+        }),
+      ]),
+    );
+
+    const enable = await appState.app.inject({
+      method: "POST",
+      url: "/api/market/mcp/exa-search/enable",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(enable.statusCode).toBe(200);
+
+    const profilesResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/agent-profiles",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const balancedProfile = profilesResponse
+      .json<Array<Record<string, any>>>()
+      .find((item) => item.label === "balanced");
+    expect(balancedProfile?.enabledMcpServerIds).toEqual(
+      expect.arrayContaining(["mcp_official_exa-search"]),
+    );
+
+    const runtimePreview = await appState.app.inject({
+      method: "GET",
+      url: `/api/runtime/preview?agentProfileId=${encodeURIComponent(String(balancedProfile?.id ?? ""))}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(runtimePreview.statusCode).toBe(200);
+    expect(runtimePreview.json<Record<string, any>>().enabledMcpServers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "mcp_official_exa-search",
+          manifestId: "exa-search",
+          source: "official",
+        }),
+      ]),
+    );
+  });
+
+  it("fetches Bailian MCP provider servers with an API key and adds supported entries to MCP servers", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("https://dashscope.aliyuncs.com/api/v1/mcps/user/list")) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            total: 2,
+            data: [
+              {
+                id: "web-search",
+                name: "联网搜索",
+                description: "Bailian Web Search MCP",
+                operationalUrl: "https://dashscope.aliyuncs.com/api/v1/mcps/web-search/mcp",
+                type: "streamableHttp",
+                active: true,
+              },
+              {
+                id: "legacy-sse",
+                name: "Legacy SSE",
+                description: "Unsupported SSE MCP",
+                operationalUrl: "https://dashscope.aliyuncs.com/api/v1/mcps/legacy-sse/sse",
+                type: "sse",
+                active: true,
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+            },
+          },
+        );
+      }
+      return originalFetch(input);
+    }) as typeof fetch;
+
+    try {
+      const createProvider = await appState.app.inject({
+        method: "POST",
+        url: "/api/mcp/providers",
+        headers: {
+          cookie: appState.cookie,
+        },
+        payload: {
+          kind: "bailian",
+          label: "Alibaba Bailian",
+          apiKey: "bailian-provider-key",
+          accessToken: "dev-access-token",
+          enabled: true,
+        },
+      });
+      expect(createProvider.statusCode).toBe(200);
+      const providerId = String(createProvider.json<Record<string, any>>().id);
+
+      const fetchCatalog = await appState.app.inject({
+        method: "POST",
+        url: `/api/mcp/providers/${providerId}/fetch`,
+        headers: {
+          cookie: appState.cookie,
+        },
+      });
+      expect(fetchCatalog.statusCode).toBe(200);
+      expect(fetchCatalog.json<Record<string, any>>()).toMatchObject({
+        provider: {
+          id: providerId,
+          lastFetchStatus: "ok",
+        },
+        servers: [
+          expect.objectContaining({
+            remoteId: "web-search",
+            serverId: "mcp_bailian_web-search",
+            protocol: "streamable_http",
+          }),
+          expect.objectContaining({
+            remoteId: "legacy-sse",
+            protocol: "sse",
+          }),
+        ],
+      });
+
+      const addSupported = await appState.app.inject({
+        method: "POST",
+        url: `/api/mcp/providers/${providerId}/servers`,
+        headers: {
+          cookie: appState.cookie,
+        },
+        payload: {
+          remoteId: "web-search",
+        },
+      });
+      expect(addSupported.statusCode).toBe(200);
+      expect(addSupported.json<Record<string, any>>()).toMatchObject({
+        id: "mcp_bailian_web-search",
+        source: "provider",
+        providerId,
+        providerKind: "bailian",
+        transport: "streamable_http",
+      });
+
+      const profilesResponse = await appState.app.inject({
+        method: "GET",
+        url: "/api/agent-profiles",
+        headers: {
+          cookie: appState.cookie,
+        },
+      });
+      const balancedProfile = profilesResponse
+        .json<Array<Record<string, any>>>()
+        .find((item) => item.label === "balanced");
+      expect(balancedProfile?.enabledMcpServerIds).toEqual(
+        expect.arrayContaining(["mcp_bailian_web-search"]),
+      );
+
+      const addUnsupported = await appState.app.inject({
+        method: "POST",
+        url: `/api/mcp/providers/${providerId}/servers`,
+        headers: {
+          cookie: appState.cookie,
+        },
+        payload: {
+          remoteId: "legacy-sse",
+        },
+      });
+      expect(addUnsupported.statusCode).toBe(400);
+
+      const listServers = await appState.app.inject({
+        method: "GET",
+        url: "/api/mcp/servers",
+        headers: {
+          cookie: appState.cookie,
+        },
+      });
+      expect(listServers.statusCode).toBe(200);
+      expect(listServers.json<Array<Record<string, any>>>()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "mcp_bailian_web-search",
+            source: "provider",
+            providerId,
+          }),
+        ]),
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it("keeps runtime preview aligned with install state and rejects invalid profile references", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);

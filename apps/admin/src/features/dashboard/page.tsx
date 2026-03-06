@@ -19,6 +19,7 @@ import {
   ImportExportPanel,
   LogsPanel,
   MarketPanel,
+  McpMarketPanel,
   McpServersPanel,
   MemoryPanel,
   OverviewPanel,
@@ -132,7 +133,7 @@ function Page() {
       {activeSection === "profiles" ? <ProfilesPanel /> : null}
       {activeSection === "skills" ? <MarketPanel kind="skills" /> : null}
       {activeSection === "plugins" ? <MarketPanel kind="plugins" /> : null}
-      {activeSection === "mcp-market" ? <MarketPanel kind="mcp" /> : null}
+      {activeSection === "mcp-market" ? <McpMarketPanel /> : null}
       {activeSection === "mcp-servers" ? <McpServersPanel /> : null}
       {activeSection === "search" ? <SearchPanel /> : null}
       {activeSection === "memory" ? <MemoryPanel /> : null}

@@ -146,7 +146,7 @@ export function McpServersPanel() {
 
   return (
     <div className="grid gap-6 xl:grid-cols-[1.05fr,0.95fr]">
-      <Panel title="Configured MCP Servers" subtitle="支持 stdio / streamable_http、自定义 env refs、headers、healthcheck、tools 和 logs。已启用的 Alibaba Bailian manifest 会在这里自动同步市场里的 MCP 实例。">
+      <Panel title="Configured MCP Servers" subtitle="支持 stdio / streamable_http、自定义 env refs、headers、healthcheck、tools 和 logs。来自 MCP provider 的条目会在 MCP Market 页面拉取后加入到这里。">
         <div className="space-y-3">
           {servers.data?.map((server) => (
             <div key={String(server.id)} className="rounded-2xl border border-slate-200 p-4">
@@ -201,7 +201,7 @@ export function McpServersPanel() {
             <TextArea value={form.envRefsJson} onChange={(event) => setForm((current) => ({ ...current, envRefsJson: event.target.value }))} />
             <TextArea value={form.headersJson} onChange={(event) => setForm((current) => ({ ...current, headersJson: event.target.value }))} />
             <Input value={form.restartPolicy} onChange={(event) => setForm((current) => ({ ...current, restartPolicy: event.target.value }))} placeholder="never | on-failure | always" />
-            <Input value={form.source} onChange={(event) => setForm((current) => ({ ...current, source: event.target.value }))} placeholder="official | custom | bailian_market" />
+            <Input value={form.source} onChange={(event) => setForm((current) => ({ ...current, source: event.target.value }))} placeholder="official | custom | provider | bailian_market" />
             <CheckboxField label="Enabled" checked={form.enabled} onChange={(next) => setForm((current) => ({ ...current, enabled: next }))} />
             <div className="flex flex-wrap gap-3">
               <Button type="button" onClick={() => saveMutation.mutate()}>

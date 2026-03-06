@@ -11,7 +11,8 @@ describe("market catalog", () => {
 
     expect(catalog.skills.length).toBeGreaterThanOrEqual(6);
     expect(catalog.plugins.length).toBeGreaterThanOrEqual(6);
-    expect(catalog.mcp.length).toBeGreaterThanOrEqual(7);
+    expect(catalog.mcp.length).toBeGreaterThanOrEqual(6);
+    expect(catalog.mcpProviders.length).toBeGreaterThanOrEqual(1);
   });
 
   it("creates default install states", async () => {

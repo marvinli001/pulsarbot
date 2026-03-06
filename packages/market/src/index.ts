@@ -5,12 +5,14 @@ import {
   ResolvedRuntimeSnapshotSchema,
   MarketKindSchema,
   McpManifestSchema,
+  McpProviderManifestSchema,
   PluginManifestSchema,
   type AgentProfile,
   SkillManifestSchema,
   type AnyMarketManifest,
   type InstallRecord,
   type McpManifest,
+  type McpProviderManifest,
   type McpServerConfig,
   type PluginManifest,
   type ResolvedRuntimeSnapshot,
@@ -33,17 +35,20 @@ export async function loadMarketCatalog(rootDir: string): Promise<{
   skills: SkillManifest[];
   plugins: PluginManifest[];
   mcp: McpManifest[];
+  mcpProviders: McpProviderManifest[];
 }> {
-  const [skills, plugins, mcp] = await Promise.all([
+  const [skills, plugins, mcp, mcpProviders] = await Promise.all([
     loadMarketManifests(path.join(rootDir, "skills"), "skills"),
     loadMarketManifests(path.join(rootDir, "plugins"), "plugins"),
     loadMarketManifests(path.join(rootDir, "mcp"), "mcp"),
+    loadProviderCatalog(path.join(rootDir, "mcp-providers")),
   ]);
 
   return {
     skills: skills as SkillManifest[],
     plugins: plugins as PluginManifest[],
     mcp: mcp as McpManifest[],
+    mcpProviders: mcpProviders as McpProviderManifest[],
   };
 }
 
@@ -64,10 +69,25 @@ export async function loadMarketManifests(
   );
 }
 
+export async function loadProviderCatalog(
+  directory: string,
+): Promise<McpProviderManifest[]> {
+  const files = await readdir(directory);
+  return Promise.all(
+    files
+      .filter((file) => file.endsWith(".json"))
+      .map(async (file) => {
+        const content = await readFile(path.join(directory, file), "utf8");
+        return McpProviderManifestSchema.parse(JSON.parse(content));
+      }),
+  );
+}
+
 export function createDefaultInstallRecords(catalog: {
   skills: SkillManifest[];
   plugins: PluginManifest[];
   mcp: McpManifest[];
+  mcpProviders?: McpProviderManifest[];
 }): InstallRecord[] {
   const timestamp = nowIso();
 
@@ -107,6 +127,7 @@ export function filterCatalogByKind(
     skills: SkillManifest[];
     plugins: PluginManifest[];
     mcp: McpManifest[];
+    mcpProviders?: McpProviderManifest[];
   },
   kind: string,
 ): AnyMarketManifest[] {
@@ -139,6 +160,7 @@ export function resolveRuntimeSnapshot(args: {
     skills: SkillManifest[];
     plugins: PluginManifest[];
     mcp: McpManifest[];
+    mcpProviders?: McpProviderManifest[];
   };
   installs: InstallRecord[];
   mcpServers: McpServerConfig[];

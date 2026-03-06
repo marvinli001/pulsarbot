@@ -13,6 +13,7 @@ import {
   DocumentMetadataSchema,
   ImportExportRunSchema,
   InstallRecordSchema,
+  McpProviderConfigSchema,
   JobRecordSchema,
   McpServerConfigSchema,
   MemoryChunkSchema,
@@ -38,6 +39,7 @@ import {
   type ImportExportRun,
   type InstallRecord,
   type JobRecord,
+  type McpProviderConfig,
   type McpServerConfig,
   type MemoryChunk,
   type MemoryDocument,
@@ -110,6 +112,10 @@ const createTableStatements = [
     data TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS mcp_server (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS mcp_provider (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
   )`,
@@ -388,6 +394,9 @@ export interface AppRepository {
   listMcpServers(): Promise<McpServerConfig[]>;
   saveMcpServer(server: McpServerConfig): Promise<void>;
   deleteMcpServer(id: string): Promise<void>;
+  listMcpProviders(): Promise<McpProviderConfig[]>;
+  saveMcpProvider(provider: McpProviderConfig): Promise<void>;
+  deleteMcpProvider(id: string): Promise<void>;
   listSecrets(): Promise<SecretEnvelope[]>;
   getSecretByScope(workspaceId: string, scope: string): Promise<SecretEnvelope | null>;
   saveSecret(secret: SecretEnvelope): Promise<void>;
@@ -730,6 +739,21 @@ export class D1AppRepository implements AppRepository {
 
   public async deleteMcpServer(id: string): Promise<void> {
     await this.deleteJsonRow("mcp_server", id);
+  }
+
+  public async listMcpProviders(): Promise<McpProviderConfig[]> {
+    return this.listJsonTable("mcp_provider", McpProviderConfigSchema);
+  }
+
+  public async saveMcpProvider(provider: McpProviderConfig): Promise<void> {
+    await this.saveJsonRow("mcp_provider", {
+      id: provider.id,
+      data: McpProviderConfigSchema.parse(provider),
+    });
+  }
+
+  public async deleteMcpProvider(id: string): Promise<void> {
+    await this.deleteJsonRow("mcp_provider", id);
   }
 
   public async listSecrets(): Promise<SecretEnvelope[]> {
@@ -1310,6 +1334,7 @@ export class InMemoryAppRepository implements AppRepository {
   private agentProfiles = new Map<string, AgentProfile>();
   private installs = new Map<string, InstallRecord>();
   private searchSettings: SearchSettings | null = null;
+  private mcpProviders = new Map<string, McpProviderConfig>();
   private mcpServers = new Map<string, McpServerConfig>();
   private secrets = new Map<string, SecretEnvelope>();
   private documents = new Map<string, DocumentMetadata>();
@@ -1466,6 +1491,19 @@ export class InMemoryAppRepository implements AppRepository {
 
   public async deleteMcpServer(id: string): Promise<void> {
     this.mcpServers.delete(id);
+  }
+
+  public async listMcpProviders(): Promise<McpProviderConfig[]> {
+    return [...this.mcpProviders.values()];
+  }
+
+  public async saveMcpProvider(provider: McpProviderConfig): Promise<void> {
+    const parsed = McpProviderConfigSchema.parse(provider);
+    this.mcpProviders.set(parsed.id, parsed);
+  }
+
+  public async deleteMcpProvider(id: string): Promise<void> {
+    this.mcpProviders.delete(id);
   }
 
   public async listSecrets(): Promise<SecretEnvelope[]> {

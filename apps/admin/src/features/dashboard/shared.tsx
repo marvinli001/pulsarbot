@@ -403,6 +403,20 @@ export function useMarket(kind: "skills" | "plugins" | "mcp") {
   });
 }
 
+export function useMcpProviderCatalog() {
+  return useQuery({
+    queryKey: ["mcp-provider-catalog"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/mcp/providers/catalog"),
+  });
+}
+
+export function useMcpProviders() {
+  return useQuery({
+    queryKey: ["mcp-providers"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/mcp/providers"),
+  });
+}
+
 export function useMcpServers() {
   return useQuery({
     queryKey: ["mcp-servers"],

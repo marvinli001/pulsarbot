@@ -69,12 +69,16 @@ export function HealthPanel() {
               value: String(asNumber(payload.mcpServers)),
             },
             {
+              label: "MCP Providers",
+              value: String(asNumber(payload.mcpProviders)),
+            },
+            {
               label: "Active Turn Locks",
               value: String(activeTurnLocks),
             },
             {
-              label: "Market Skills/Plugins/MCP",
-              value: `${asNumber(marketCounts.skills)}/${asNumber(marketCounts.plugins)}/${asNumber(marketCounts.mcp)}`,
+              label: "Market S/P/M/Pv",
+              value: `${asNumber(marketCounts.skills)}/${asNumber(marketCounts.plugins)}/${asNumber(marketCounts.mcp)}/${asNumber(marketCounts.mcpProviders)}`,
             },
           ]}
         />
