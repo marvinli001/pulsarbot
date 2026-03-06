@@ -149,4 +149,64 @@ describe("MCP supervisor", () => {
 
     await supervisor.closeAll();
   });
+
+  it("falls back from standard Bailian streamable HTTP endpoints to SSE", async () => {
+    const supervisor = createMcpSupervisor();
+    const fixture = path.resolve(
+      process.cwd(),
+      "tests/fixtures/mcp-echo-bailian-sse-fallback.mjs",
+    );
+    const port = 3900;
+    const child = spawn(process.execPath, [fixture], {
+      env: {
+        ...process.env,
+        PORT: String(port),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(child);
+    await waitForOutput(child, /sse-fallback-ready:3900/);
+
+    const config = {
+      id: "bailian-tavily",
+      label: "Bailian Tavily",
+      description: "",
+      transport: "streamable_http" as const,
+      url: `http://127.0.0.1:${port}/api/v1/mcps/tavily-ai/mcp`,
+      args: [],
+      envRefs: {},
+      headers: {},
+      enabled: true,
+      source: "provider" as const,
+      providerId: "provider_1",
+      providerKind: "bailian" as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const health = await supervisor.healthcheck(config);
+    expect(health.status).toBe("ok");
+    expect(health.toolCount).toBeGreaterThanOrEqual(1);
+    expect(health.logs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("trying sse fallback"),
+        expect.stringContaining("connected transport=sse fallback_from=streamable_http"),
+      ]),
+    );
+
+    const tools = await supervisor.listToolDescriptors([config]);
+    expect(tools.map((tool) => tool.id)).toContain("mcp:bailian-tavily:echo");
+
+    const result = await supervisor.invokeTool(
+      "mcp:bailian-tavily:echo",
+      { text: "fallback" },
+      [config],
+    );
+
+    expect(result).toMatchObject({
+      text: "echo:fallback",
+    });
+
+    await supervisor.closeAll();
+  });
 });

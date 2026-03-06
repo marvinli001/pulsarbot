@@ -1,8 +1,12 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   createLogger,
   createId,
@@ -30,7 +34,7 @@ export interface McpSupervisorOptions {
 interface McpSession {
   fingerprint: string;
   client: Client;
-  transport: StdioClientTransport | StreamableHTTPClientTransport;
+  transport: StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
   logs: string[];
   tools: ToolDescriptor[];
   closed: boolean;
@@ -52,6 +56,26 @@ function toolId(serverId: string, toolName: string): string {
 
 function normalizeError(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown MCP error";
+}
+
+function resolveStandardBailianSseUrl(url: string): URL | null {
+  try {
+    const parsed = new URL(url);
+    if (!/^\/api\/v1\/mcps\/[^/]+\/mcp\/?$/i.test(parsed.pathname)) {
+      return null;
+    }
+    parsed.pathname = parsed.pathname.replace(/\/mcp\/?$/i, "/sse");
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function shouldTrySseFallback(error: unknown): boolean {
+  if (error instanceof StreamableHTTPError) {
+    return typeof error.code === "number" && error.code >= 400 && error.code < 500;
+  }
+  return error instanceof Error;
 }
 
 function normalizeContent(result: Record<string, unknown>) {
@@ -234,6 +258,18 @@ export class McpSupervisor {
     };
   }
 
+  private createClient(): Client {
+    return new Client(
+      {
+        name: "pulsarbot-mcp-client",
+        version: "0.1.0",
+      },
+      {
+        capabilities: {},
+      },
+    );
+  }
+
   private async getSession(
     config: McpServerConfig,
     options: { refreshTools: boolean },
@@ -271,22 +307,11 @@ export class McpSupervisor {
     }
 
     const logs: string[] = [];
-    const transport =
-      parsed.transport === "stdio"
-        ? new StdioClientTransport({
-            command: parsed.command!,
-            args: parsed.args,
-            env: compactStringRecord({
-              ...process.env,
-              ...parsed.envRefs,
-            }),
-            stderr: "pipe",
-          })
-        : new StreamableHTTPClientTransport(new URL(parsed.url!), {
-            requestInit: {
-              headers: parsed.headers,
-            },
-          });
+    const {
+      client,
+      transport,
+      transportLabel,
+    } = await this.connectTransport(parsed, logs);
 
     if ("stderr" in transport && transport.stderr) {
       transport.stderr.on("data", (chunk) => {
@@ -310,18 +335,6 @@ export class McpSupervisor {
       );
     };
 
-    const client = new Client(
-      {
-        name: "pulsarbot-mcp-client",
-        version: "0.1.0",
-      },
-      {
-        capabilities: {},
-      },
-    );
-
-    await client.connect(transport as Parameters<Client["connect"]>[0]);
-
     const session: McpSession = {
       fingerprint,
       client,
@@ -330,9 +343,106 @@ export class McpSupervisor {
       tools: options.refreshTools ? await this.fetchTools(client, parsed) : [],
       closed: false,
     };
-    this.recordLog(parsed.id, logs, `connected transport=${parsed.transport}`);
+    this.recordLog(parsed.id, logs, `connected transport=${transportLabel}`);
     this.sessions.set(parsed.id, session);
     return session;
+  }
+
+  private async connectTransport(
+    config: McpServerConfig,
+    logs: string[],
+  ): Promise<{
+    client: Client;
+    transport: McpSession["transport"];
+    transportLabel: string;
+  }> {
+    if (config.transport === "stdio") {
+      const transport = new StdioClientTransport({
+        command: config.command!,
+        args: config.args,
+        env: compactStringRecord({
+          ...process.env,
+          ...config.envRefs,
+        }),
+        stderr: "pipe",
+      });
+      const client = this.createClient();
+      await client.connect(transport as Parameters<Client["connect"]>[0]);
+      return {
+        client,
+        transport,
+        transportLabel: "stdio",
+      };
+    }
+
+    return this.connectRemoteTransport(config, logs);
+  }
+
+  private async connectRemoteTransport(
+    config: McpServerConfig,
+    logs: string[],
+  ): Promise<{
+    client: Client;
+    transport: StreamableHTTPClientTransport | SSEClientTransport;
+    transportLabel: string;
+  }> {
+    const streamableTransport = new StreamableHTTPClientTransport(new URL(config.url!), {
+      requestInit: {
+        headers: config.headers,
+      },
+    });
+    const streamableClient = this.createClient();
+
+    try {
+      await streamableClient.connect(
+        streamableTransport as Parameters<Client["connect"]>[0],
+      );
+      return {
+        client: streamableClient,
+        transport: streamableTransport,
+        transportLabel: "streamable_http",
+      };
+    } catch (error) {
+      await Promise.allSettled([
+        streamableClient.close(),
+        streamableTransport.close(),
+      ]);
+
+      const fallbackUrl = resolveStandardBailianSseUrl(config.url!);
+      if (!fallbackUrl || !shouldTrySseFallback(error)) {
+        throw error;
+      }
+
+      this.recordLog(
+        config.id,
+        logs,
+        `streamable_http connect failed, trying sse fallback url=${fallbackUrl.toString()} error=${normalizeError(error)}`,
+      );
+
+      const sseTransport = new SSEClientTransport(fallbackUrl, {
+        requestInit: {
+          headers: config.headers,
+        },
+      });
+      const sseClient = this.createClient();
+
+      try {
+        await sseClient.connect(sseTransport as Parameters<Client["connect"]>[0]);
+        return {
+          client: sseClient,
+          transport: sseTransport,
+          transportLabel: "sse fallback_from=streamable_http",
+        };
+      } catch (fallbackError) {
+        await Promise.allSettled([
+          sseClient.close(),
+          sseTransport.close(),
+        ]);
+        throw new Error(
+          `Failed to connect using streamable_http and sse fallback: primary=${normalizeError(error)} fallback=${normalizeError(fallbackError)}`,
+        );
+      }
+    }
   }
 
   private async fetchTools(
