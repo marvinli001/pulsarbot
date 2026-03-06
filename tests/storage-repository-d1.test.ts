@@ -5,6 +5,7 @@ import type {
   TurnEvent,
   TurnState,
 } from "../packages/shared/src/index.js";
+import { TurnStateSchema } from "../packages/shared/src/index.js";
 import { D1AppRepository, runMigrations } from "../packages/storage/src/index.js";
 
 function makeInstallRecord(): InstallRecord {
@@ -34,7 +35,7 @@ function makeMemoryChunk(): MemoryChunk {
 }
 
 function makeTurnState(): TurnState {
-  return {
+  return TurnStateSchema.parse({
     id: "state_1",
     turnId: "turn_1",
     workspaceId: "workspace_1",
@@ -86,7 +87,7 @@ function makeTurnState(): TurnState {
     },
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
-  };
+  });
 }
 
 function makeTurnEvent(): TurnEvent {

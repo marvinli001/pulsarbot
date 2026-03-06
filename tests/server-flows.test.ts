@@ -1586,6 +1586,7 @@ describe("server flows", () => {
 
     for (const [kind, manifestId] of [
       ["skills", "memory-core"],
+      ["skills", "web-search"],
       ["plugins", "native-google-search"],
       ["plugins", "native-bing-search"],
       ["plugins", "web-browse-fetcher"],
@@ -1610,9 +1611,22 @@ describe("server flows", () => {
       payload: {
         ...profile,
         allowNetworkTools: true,
+        enabledSkillIds: [...new Set([
+          ...((profile?.enabledSkillIds as string[] | undefined) ?? []),
+          "web-search",
+        ])],
+        enabledPluginIds: [...new Set([
+          ...((profile?.enabledPluginIds as string[] | undefined) ?? []),
+          "native-google-search",
+          "native-bing-search",
+          "web-browse-fetcher",
+          "document-processor",
+        ])],
       },
     });
     expect(enableNetworkTools.statusCode).toBe(200);
+
+    const configuredProfile = enableNetworkTools.json<Record<string, any>>();
 
     const beforePreview = await appState.app.inject({
       method: "GET",
@@ -1675,7 +1689,7 @@ describe("server flows", () => {
         cookie: appState.cookie,
       },
       payload: {
-        ...profile,
+        ...configuredProfile,
       },
     });
 
@@ -2091,7 +2105,7 @@ describe("server flows", () => {
     expect(stateDuringTurn.statusCode).toBe(200);
     expect(stateDuringTurn.json<Record<string, any>>()).toMatchObject({
       turnId,
-      graphVersion: "v1",
+      graphVersion: "v2",
     });
 
     const eventsDuringTurn = await appState.app.inject({

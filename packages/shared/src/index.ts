@@ -331,7 +331,19 @@ export const ToolDescriptorSchema = z.object({
   source: z.enum(["plugin", "mcp", "builtin"]),
 });
 
-export const PlannerActionSchema = z.union([
+export const AgentSpecialistKindSchema = z.enum([
+  "research",
+  "memory",
+  "document",
+]);
+export const AgentSubgraphSchema = z.enum([
+  "main",
+  "research",
+  "memory",
+  "document",
+]);
+
+export const AgentActionSchema = z.union([
   z.object({
     type: z.literal("final_response"),
     content: z.string().min(1),
@@ -350,10 +362,110 @@ export const PlannerActionSchema = z.union([
     type: z.literal("compact_now"),
   }),
   z.object({
+    type: z.literal("delegate_specialist"),
+    specialist: AgentSpecialistKindSchema,
+    goal: z.string().min(1),
+    input: LooseRecordSchema.default({}),
+  }),
+  z.object({
     type: z.literal("abort"),
     reason: z.string().min(1),
   }),
 ]);
+
+export const PlannerActionSchema = AgentActionSchema;
+
+export const AgentScratchpadEntrySchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum([
+    "observation",
+    "tool_result",
+    "memory_result",
+    "specialist_result",
+    "summary",
+    "decision",
+  ]),
+  nodeId: z.string().min(1),
+  subgraph: AgentSubgraphSchema,
+  text: z.string().min(1),
+  createdAt: z.string().min(1),
+});
+
+export const AgentSubgraphFrameSchema = z.object({
+  id: z.string().min(1),
+  kind: AgentSpecialistKindSchema,
+  entryNode: z.string().min(1),
+  returnNode: z.string().min(1),
+  goal: z.string().min(1),
+  status: z.enum(["running", "succeeded", "failed"]),
+  startedAt: z.string().min(1),
+  finishedAt: z.string().nullable().default(null),
+});
+
+export const AgentToolLedgerSchema = z.object({
+  callId: z.string().min(1),
+  toolId: z.string().min(1),
+  subgraph: AgentSubgraphSchema,
+  input: LooseRecordSchema.default({}),
+  output: JsonValueSchema.nullable().default(null),
+  status: z.enum(["pending", "completed", "failed"]),
+  idempotencyKey: z.string().min(1),
+  attempt: z.number().int().positive().default(1),
+  startedAt: z.string().min(1),
+  finishedAt: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+});
+
+export const AgentMemoryLedgerSchema = z.object({
+  id: z.string().min(1),
+  target: z.enum(["daily", "longterm", "summary"]),
+  content: z.string().min(1),
+  status: z.enum(["pending", "completed", "failed"]),
+  startedAt: z.string().min(1),
+  finishedAt: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+});
+
+export const AgentGraphStateSchema = z.object({
+  version: z.literal("v2"),
+  status: z.enum(["idle", "running", "paused", "succeeded", "failed", "aborted"]),
+  currentNode: z.string().nullable().default(null),
+  currentSubgraph: AgentSubgraphSchema.nullable().default(null),
+  iteration: z.number().int().nonnegative().default(0),
+  plannerMode: z.enum(["native_tools", "json_action"]).nullable().default(null),
+  lastAction: AgentActionSchema.nullable().default(null),
+  pendingActions: z.array(AgentActionSchema).default([]),
+  scratchpad: z.array(AgentScratchpadEntrySchema).default([]),
+  subgraphStack: z.array(AgentSubgraphFrameSchema).default([]),
+  toolLedger: z.array(AgentToolLedgerSchema).default([]),
+  memoryLedger: z.array(AgentMemoryLedgerSchema).default([]),
+  summary: z.object({
+    existing: z.string().default(""),
+    working: z.string().default(""),
+    refreshedAt: z.string().nullable().default(null),
+  }),
+  reply: z.object({
+    draft: z.string().default(""),
+    final: z.string().default(""),
+    streamedChars: z.number().int().nonnegative().default(0),
+  }),
+  counters: z.object({
+    planningStepsUsed: z.number().int().nonnegative().default(0),
+    toolCallsUsed: z.number().int().nonnegative().default(0),
+    specialistCallsUsed: z.number().int().nonnegative().default(0),
+    consecutiveNoopPlans: z.number().int().nonnegative().default(0),
+  }),
+  flags: z.object({
+    needsCompaction: z.boolean().default(false),
+    summaryDirty: z.boolean().default(false),
+    finalReplyReady: z.boolean().default(false),
+  }),
+  checkpoints: z.object({
+    lastPlannerAt: z.string().nullable().default(null),
+    lastToolAt: z.string().nullable().default(null),
+    lastSpecialistAt: z.string().nullable().default(null),
+  }),
+});
 
 export const ConversationRecordSchema = z.object({
   id: z.string().min(1),
@@ -449,7 +561,7 @@ export const TurnStateSchema = z.object({
   turnId: z.string().min(1),
   workspaceId: z.string().min(1),
   conversationId: z.string().min(1),
-  graphVersion: z.literal("v1").default("v1"),
+  graphVersion: z.enum(["v1", "v2"]).default("v2"),
   status: z.enum(["running", "waiting_retry", "succeeded", "failed", "aborted"]),
   currentNode: z.string().min(1),
   version: z.number().int().nonnegative().default(0),
@@ -481,6 +593,46 @@ export const TurnStateSchema = z.object({
     toolCallsUsed: z.number().int().nonnegative().default(0),
     deadlineAt: z.string().min(1),
   }),
+  agent: AgentGraphStateSchema.default({
+    version: "v2",
+    status: "idle",
+    currentNode: null,
+    currentSubgraph: null,
+    iteration: 0,
+    plannerMode: null,
+    lastAction: null,
+    pendingActions: [],
+    scratchpad: [],
+    subgraphStack: [],
+    toolLedger: [],
+    memoryLedger: [],
+    summary: {
+      existing: "",
+      working: "",
+      refreshedAt: null,
+    },
+    reply: {
+      draft: "",
+      final: "",
+      streamedChars: 0,
+    },
+    counters: {
+      planningStepsUsed: 0,
+      toolCallsUsed: 0,
+      specialistCallsUsed: 0,
+      consecutiveNoopPlans: 0,
+    },
+    flags: {
+      needsCompaction: false,
+      summaryDirty: false,
+      finalReplyReady: false,
+    },
+    checkpoints: {
+      lastPlannerAt: null,
+      lastToolAt: null,
+      lastSpecialistAt: null,
+    },
+  }),
   toolResults: z.array(TurnToolResultSchema).default([]),
   output: z.object({
     replyText: z.string().default(""),
@@ -503,6 +655,12 @@ export const TurnEventTypeSchema = z.enum([
   "node_started",
   "node_succeeded",
   "node_failed",
+  "agent_node_started",
+  "agent_node_succeeded",
+  "agent_node_failed",
+  "agent_subgraph_entered",
+  "agent_subgraph_exited",
+  "agent_action_planned",
   "tool_started",
   "tool_succeeded",
   "tool_failed",
@@ -700,6 +858,7 @@ export const ResolvedRuntimeSnapshotSchema = z.object({
   workspaceId: z.string().min(1),
   agentProfileId: z.string().min(1),
   promptFragments: z.array(z.string()).default([]),
+  allowedToolIds: z.array(z.string()).default([]),
   enabledSkills: z.array(RuntimeResolvedItemSchema).default([]),
   enabledPlugins: z.array(RuntimeResolvedItemSchema).default([]),
   enabledMcpServers: z.array(ResolvedMcpServerSchema).default([]),
@@ -730,6 +889,14 @@ export type PluginManifest = z.infer<typeof PluginManifestSchema>;
 export type McpManifest = z.infer<typeof McpManifestSchema>;
 export type McpProviderManifest = z.infer<typeof McpProviderManifestSchema>;
 export type ToolDescriptor = z.infer<typeof ToolDescriptorSchema>;
+export type AgentSpecialistKind = z.infer<typeof AgentSpecialistKindSchema>;
+export type AgentSubgraph = z.infer<typeof AgentSubgraphSchema>;
+export type AgentAction = z.infer<typeof AgentActionSchema>;
+export type AgentScratchpadEntry = z.infer<typeof AgentScratchpadEntrySchema>;
+export type AgentSubgraphFrame = z.infer<typeof AgentSubgraphFrameSchema>;
+export type AgentToolLedger = z.infer<typeof AgentToolLedgerSchema>;
+export type AgentMemoryLedger = z.infer<typeof AgentMemoryLedgerSchema>;
+export type AgentGraphState = z.infer<typeof AgentGraphStateSchema>;
 export type PlannerAction = z.infer<typeof PlannerActionSchema>;
 export type ConversationRecord = z.infer<typeof ConversationRecordSchema>;
 export type MessageRecord = z.infer<typeof MessageRecordSchema>;

@@ -180,6 +180,7 @@ export function resolveRuntimeSnapshot(args: {
   const enabledMcpInstalls = enabledInstallByManifestId(args.installs, "mcp");
   const serversById = new Map(args.mcpServers.map((server) => [server.id, server]));
   const promptFragments: string[] = [];
+  const allowedToolIds: string[] = [];
   const blocked: ResolvedRuntimeSnapshot["blocked"] = [];
 
   const enabledSkills = args.profile.enabledSkillIds.flatMap((id) => {
@@ -202,6 +203,7 @@ export function resolveRuntimeSnapshot(args: {
       return [];
     }
     promptFragments.push(...manifest.promptFragments);
+    allowedToolIds.push(...manifest.toolBindings);
     return [{
       id: manifest.id,
       title: manifest.title,
@@ -302,6 +304,7 @@ export function resolveRuntimeSnapshot(args: {
     workspaceId: args.workspaceId,
     agentProfileId: args.profile.id,
     promptFragments: [...new Set(promptFragments)],
+    allowedToolIds: [...new Set(allowedToolIds)],
     enabledSkills,
     enabledPlugins,
     enabledMcpServers,

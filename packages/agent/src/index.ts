@@ -12,20 +12,29 @@ import {
   type ProviderInvocationInput,
   type ProviderMessage,
   type ProviderInvocationResult,
+  type ProviderToolCall,
   type ProviderToolDefinition,
 } from "@pulsarbot/providers";
 import {
+  AgentActionSchema,
+  type AgentAction,
+  type AgentGraphState,
+  type AgentMemoryLedger,
+  type AgentSpecialistKind,
+  type AgentSubgraph,
+  type AgentToolLedger,
+  type LooseJsonValue,
   PlannerActionSchema,
   type ConversationSummary,
   type AgentProfile,
   type McpServerConfig,
   type MessageRecord,
-  type PlannerAction,
   type ProviderProfile,
   type ResolvedRuntimeSnapshot,
   type SearchSettings,
   type ToolDescriptor,
 } from "@pulsarbot/shared";
+import { runGraph } from "./graph/index.js";
 
 export interface AgentRuntimeContext {
   workspaceId: string;
@@ -63,9 +72,54 @@ export interface AgentTurnInput {
   userMessage: string;
   history: MessageRecord[];
   context: AgentRuntimeContext;
+  resumeState?: AgentGraphState | undefined;
+  observer?: AgentGraphObserver | undefined;
   streamReply?: {
     onPartial(text: string): Promise<void>;
   };
+}
+
+export interface AgentGraphObserver {
+  onNodeStarted?(args: {
+    nodeId: string;
+    subgraph: AgentSubgraph;
+    state: AgentGraphState;
+    attempt: number;
+  }): Promise<void> | void;
+  onNodeSucceeded?(args: {
+    nodeId: string;
+    subgraph: AgentSubgraph;
+    state: AgentGraphState;
+    attempt: number;
+  }): Promise<void> | void;
+  onNodeFailed?(args: {
+    nodeId: string;
+    subgraph: AgentSubgraph;
+    state: AgentGraphState;
+    attempt: number;
+    error: unknown;
+  }): Promise<void> | void;
+  onActionPlanned?(args: {
+    action: AgentAction;
+    state: AgentGraphState;
+  }): Promise<void> | void;
+  onToolUpdated?(args: {
+    tool: AgentToolLedger;
+    previous: AgentToolLedger | null;
+    state: AgentGraphState;
+  }): Promise<void> | void;
+  onStatePatched?(args: {
+    state: AgentGraphState;
+  }): Promise<void> | void;
+  onSubgraphEntered?(args: {
+    subgraph: AgentSpecialistKind;
+    state: AgentGraphState;
+  }): Promise<void> | void;
+  onSubgraphExited?(args: {
+    subgraph: AgentSpecialistKind;
+    state: AgentGraphState;
+    status: "succeeded" | "failed";
+  }): Promise<void> | void;
 }
 
 export interface AgentTurnResult {
@@ -81,6 +135,7 @@ export interface AgentTurnResult {
   }>;
   compacted: boolean;
   summary?: string | undefined;
+  agentState: AgentGraphState;
 }
 
 function extractJson(text: string): unknown {
@@ -96,25 +151,25 @@ function extractJson(text: string): unknown {
   return null;
 }
 
-function parsePlannerAction(text: string): PlannerAction {
+function parsePlannerAction(text: string): AgentAction {
   const parsed = extractJson(text);
   if (parsed && typeof parsed === "object") {
     if ("type" in parsed) {
-      return PlannerActionSchema.parse(parsed);
+      return AgentActionSchema.parse(parsed);
     }
     const legacy = parsed as {
       finalResponse?: string;
       toolCalls?: Array<{ toolId: string; input?: Record<string, unknown> }>;
     };
     if (legacy.toolCalls?.length) {
-      return PlannerActionSchema.parse({
+      return AgentActionSchema.parse({
         type: "call_tool",
         toolId: legacy.toolCalls[0]?.toolId,
         input: legacy.toolCalls[0]?.input ?? {},
       });
     }
     if (legacy.finalResponse) {
-      return PlannerActionSchema.parse({
+      return AgentActionSchema.parse({
         type: "final_response",
         content: legacy.finalResponse,
       });
@@ -125,6 +180,110 @@ function parsePlannerAction(text: string): PlannerAction {
     type: "final_response",
     content: text,
   };
+}
+
+function defaultAgentGraphState(existingSummary = ""): AgentGraphState {
+  return {
+    version: "v2",
+    status: "idle",
+    currentNode: null,
+    currentSubgraph: null,
+    iteration: 0,
+    plannerMode: null,
+    lastAction: null,
+    pendingActions: [],
+    scratchpad: [],
+    subgraphStack: [],
+    toolLedger: [],
+    memoryLedger: [],
+    summary: {
+      existing: existingSummary,
+      working: existingSummary,
+      refreshedAt: null,
+    },
+    reply: {
+      draft: "",
+      final: "",
+      streamedChars: 0,
+    },
+    counters: {
+      planningStepsUsed: 0,
+      toolCallsUsed: 0,
+      specialistCallsUsed: 0,
+      consecutiveNoopPlans: 0,
+    },
+    flags: {
+      needsCompaction: false,
+      summaryDirty: false,
+      finalReplyReady: false,
+    },
+    checkpoints: {
+      lastPlannerAt: null,
+      lastToolAt: null,
+      lastSpecialistAt: null,
+    },
+  };
+}
+
+function inputAgentState(
+  resumeState: AgentGraphState | undefined,
+  existingSummary: string,
+): AgentGraphState {
+  if (!resumeState) {
+    return defaultAgentGraphState(existingSummary);
+  }
+  const state = snapshotAgentState(resumeState);
+  state.summary.existing ||= existingSummary;
+  state.summary.working ||= existingSummary;
+  return state;
+}
+
+function snapshotAgentState(state: AgentGraphState): AgentGraphState {
+  return JSON.parse(JSON.stringify(state)) as AgentGraphState;
+}
+
+function attachActionMetadata(action: AgentAction): AgentAction {
+  if (action.type === "call_tool") {
+    return {
+      ...action,
+      input: {
+        ...action.input,
+        __pulsar_callId: typeof action.input.__pulsar_callId === "string"
+          ? action.input.__pulsar_callId
+          : createId("tool"),
+      },
+    };
+  }
+  return action;
+}
+
+function stripPlannerMetadata(input: Record<string, unknown>): Record<string, LooseJsonValue> {
+  const next = { ...input };
+  delete next.__pulsar_callId;
+  delete next.__pulsar_memoryId;
+  return JSON.parse(JSON.stringify(next)) as Record<string, LooseJsonValue>;
+}
+
+function inferSubgraphForNode(
+  nodeId: string,
+  state: AgentGraphState,
+): AgentSubgraph {
+  if (nodeId.startsWith("research_")) {
+    return "research";
+  }
+  if (nodeId.startsWith("memory_")) {
+    return "memory";
+  }
+  if (nodeId.startsWith("document_")) {
+    return "document";
+  }
+  return state.currentSubgraph ?? "main";
+}
+
+function toolOutputText(output: unknown): string {
+  return typeof output === "string"
+    ? output
+    : JSON.stringify(output, null, 2);
 }
 
 function asTranscript(messages: MessageRecord[]): string[] {
@@ -259,492 +418,1096 @@ export class AgentRuntime {
       : input.history.slice(-12);
     const history = recentHistory;
     const transcript = asTranscript(history);
-
-    const snapshot = new TokenBudgetManager(
-      input.profile.compactSoftThreshold,
-      input.profile.compactHardThreshold,
-    ).evaluate({
-      texts: [
-        input.profile.systemPrompt,
-        input.userMessage,
-        startupMemory.longterm,
-        startupMemory.yesterday,
-        startupMemory.today,
-        existingSummary?.content ?? "",
-        ...transcript,
-      ],
-      maxContextTokens: 32_000,
+    return this.runTurnV2({
+      input,
+      turnId,
+      history,
+      transcript,
+      existingSummary: existingSummary?.content ?? "",
+      startupMemory,
+      memory,
+      mcpServers,
+      toolDescriptors,
+      builtinToolIds,
+      memoryToolIds,
+      providerInvoker,
+      primaryProvider,
+      primaryApiKey,
+      backgroundProvider,
+      effectiveMaxToolDurationMs,
+      turnDeadlineAt,
+      skillPrompts,
     });
+  }
 
-    let compacted = false;
-    let summary: string | undefined;
-    let historySummary = existingSummary?.content ?? "";
-
-    if (snapshot.softExceeded || snapshot.hardExceeded) {
-      compacted = true;
-      const summaryTimeoutMs = this.operationTimeoutMs(
-        effectiveMaxToolDurationMs,
-        turnDeadlineAt,
-      );
-      summary = await this.withOperationTimeout(
-        () =>
-          this.generateSummary({
-            backgroundProvider,
-            transcript: historySummary ? [historySummary, ...transcript] : transcript,
-            memory,
-            input,
-            providerInvoker,
-            timeoutMs: summaryTimeoutMs,
-          }),
-        summaryTimeoutMs,
-        "AGENT_SUMMARY_TIMEOUT",
-        "Conversation compaction timed out",
-      );
-      historySummary = summary;
-      if (this.services.enqueueJob) {
-        await this.services.enqueueJob({
-          workspaceId: input.context.workspaceId,
-          kind: "memory_refresh_before_compact",
-          payload: {
-            notes: summary,
-          },
-        });
-      } else {
-        await memory.executeTool("memory_refresh_before_compact", {
-          notes: summary,
-        });
-      }
-      await memory.writeSummarySnapshot(input.context.conversationId, summary);
-    }
-
-    const promptContext = [
-      input.profile.systemPrompt,
-      `Current time: ${input.context.nowIso} (${input.context.timezone})`,
-      ...skillPrompts,
-      this.buildRuntimeCapabilitySummary(input.context, toolDescriptors),
-      "Available tools:",
-      ...toolDescriptors.map((tool) => `- ${tool.id}: ${tool.description}`),
-      "Long-term memory:",
-      startupMemory.longterm || "(empty)",
-      "Recent daily memory:",
-      startupMemory.yesterday || "(empty)",
-      startupMemory.today || "(empty)",
-      historySummary ? `Compacted conversation summary:\n${historySummary}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    const scratchpad: string[] = [];
-    const toolRuns: AgentTurnResult["toolRuns"] = [];
+  private async runTurnV2(args: {
+    input: AgentTurnInput;
+    turnId: string;
+    history: MessageRecord[];
+    transcript: string[];
+    existingSummary: string;
+    startupMemory: {
+      longterm: string;
+      today: string;
+      yesterday: string;
+    };
+    memory: MemoryStoreLike;
+    mcpServers: McpServerConfig[];
+    toolDescriptors: ToolDescriptor[];
+    builtinToolIds: Set<string>;
+    memoryToolIds: Set<string>;
+    providerInvoker: NonNullable<AgentExecutionServices["invokeProvider"]> | typeof invokeProvider;
+    primaryProvider: ProviderProfile;
+    primaryApiKey: string;
+    backgroundProvider: { profile: ProviderProfile; apiKey: string } | null;
+    effectiveMaxToolDurationMs: number;
+    turnDeadlineAt: number;
+    skillPrompts: string[];
+  }): Promise<AgentTurnResult> {
+    const useNativeToolCalling = supportsNativeToolCalling(args.primaryProvider);
+    const agentState = inputAgentState(args.input.resumeState, args.existingSummary);
     const toolMessages: Array<{ role: "tool"; content: string }> = [];
-    let stepsUsed = 0;
-    const useNativeToolCalling = supportsNativeToolCalling(primaryProvider);
-    const nativeToolDefinitions = toProviderToolDefinitions(toolDescriptors);
-    const nativePlanningMessages: ProviderMessage[] = useNativeToolCalling
-      ? [
-          {
-            role: "system",
-            content: `${promptContext}
+    const toolRuns: AgentTurnResult["toolRuns"] = [];
+    let compacted = Boolean(args.input.resumeState?.summary.working);
+    let summary: string | undefined = agentState.summary.working || undefined;
+    let specialistResultText = "";
+    let lastExecutedToolCallId: string | null = null;
+    let lastExecutedMemoryId: string | null = null;
 
-You are operating inside a Telegram-native agent loop.
-You may call tools when needed.
-When enough information is available, respond directly with the user-facing answer.`,
-          },
-          ...toProviderHistoryMessages(history),
-          {
-            role: "user",
-            content: input.userMessage,
-          },
-        ]
-      : [];
+    const observeState = async () => {
+      await args.input.observer?.onStatePatched?.({
+        state: snapshotAgentState(agentState),
+      });
+    };
 
-    for (let step = 0; step < input.profile.maxPlanningSteps; step += 1) {
-      stepsUsed = step + 1;
-      if (useNativeToolCalling) {
-        const nativeFinalRequestInput: ProviderInvocationInput = {
-          messages: nativePlanningMessages,
-          tools: nativeToolDefinitions,
-          toolChoice: "none",
-        };
-        const nativeToolChoice = toolRuns.length >= input.profile.maxToolCalls
-          ? "none"
-          : "auto";
-        if (nativeToolChoice === "none" && this.canStreamFinalReply(input, primaryProvider)) {
-          return {
-            reply: await this.resolveFinalReply({
-              input,
-              primaryProvider,
-              primaryApiKey,
-              providerInvoker,
-              requestInput: nativeFinalRequestInput,
-              maxOperationMs: effectiveMaxToolDurationMs,
-              turnDeadlineAt,
-            }),
-            turnId,
-            stepCount: stepsUsed,
-            toolRuns,
-            compacted,
-            summary,
-          };
-        }
-        const plannerTimeoutMs = this.operationTimeoutMs(
-          effectiveMaxToolDurationMs,
-          turnDeadlineAt,
-        );
-        const providerResult = await this.withOperationTimeout(
-          () =>
-            providerInvoker({
-              profile: primaryProvider,
-              apiKey: primaryApiKey,
-              input: {
-                messages: nativePlanningMessages,
-                tools: nativeToolDefinitions,
-                toolChoice: nativeToolChoice,
-              },
-              timeoutMs: plannerTimeoutMs,
-            }),
-          plannerTimeoutMs,
-          "AGENT_PROVIDER_TIMEOUT",
-          "Planner model timed out",
-        );
+    const currentSummary = () => agentState.summary.working || agentState.summary.existing;
+    const scratchpadTexts = () => agentState.scratchpad.map((entry) => entry.text);
+    const promptContext = () =>
+      [
+        args.input.profile.systemPrompt,
+        `Current time: ${args.input.context.nowIso} (${args.input.context.timezone})`,
+        ...args.skillPrompts,
+        this.buildRuntimeCapabilitySummary(args.input.context, args.toolDescriptors),
+        "Available tools:",
+        ...args.toolDescriptors.map((tool) => `- ${tool.id}: ${tool.description}`),
+        "Long-term memory:",
+        args.startupMemory.longterm || "(empty)",
+        "Recent daily memory:",
+        args.startupMemory.yesterday || "(empty)",
+        args.startupMemory.today || "(empty)",
+        currentSummary() ? `Compacted conversation summary:\n${currentSummary()}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-        const providerToolCalls = providerResult.toolCalls ?? [];
-        if (providerToolCalls.length === 0) {
-          const directReply = providerResult.text.trim();
-          if (directReply) {
-            if (this.canStreamFinalReply(input, primaryProvider)) {
-              return {
-                reply: await this.resolveFinalReply({
-                  input,
-                  primaryProvider,
-                  primaryApiKey,
-                  providerInvoker,
-                  requestInput: nativeFinalRequestInput,
-                  maxOperationMs: effectiveMaxToolDurationMs,
-                  turnDeadlineAt,
-                }),
-                turnId,
-                stepCount: stepsUsed,
-                toolRuns,
-                compacted,
-                summary,
-              };
-            }
-            return {
-              reply: directReply,
-              turnId,
-              stepCount: stepsUsed,
-              toolRuns,
-              compacted,
-              summary,
-            };
-          }
-          break;
-        }
+    const planningMessages = () => [
+      {
+        role: "system" as const,
+        content: `${promptContext()}
 
-        nativePlanningMessages.push({
-          role: "assistant",
-          content: providerResult.text,
-          toolCalls: providerToolCalls,
-        });
-
-        for (const toolCall of providerToolCalls) {
-          if (toolRuns.length >= input.profile.maxToolCalls) {
-            break;
-          }
-          const output = await this.withOperationTimeout(
-            () =>
-              this.executeTool({
-                action: {
-                  type: "call_tool",
-                  toolId: toolCall.toolId,
-                  input: toolCall.input,
-                },
-                input,
-                memory,
-                mcpServers,
-                builtinToolIds,
-                memoryToolIds,
-              }),
-            this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
-            "AGENT_TOOL_TIMEOUT",
-            `Tool ${toolCall.toolId} timed out`,
-          );
-          const source = toolSourceFor(toolCall.toolId, builtinToolIds, memoryToolIds);
-          const toolOutputText =
-            typeof output === "string" ? output : JSON.stringify(output, null, 2);
-          toolRuns.push({
-            id: createId("tool"),
-            toolId: toolCall.toolId,
-            input: toolCall.input,
-            output,
-            source,
-          });
-          toolMessages.push({
-            role: "tool",
-            content: toolOutputText,
-          });
-          nativePlanningMessages.push({
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: toolOutputText,
-          });
-          scratchpad.push(`Tool ${toolCall.toolId} output:\n${toolOutputText}`);
-        }
-        continue;
-      }
-
-      const planningMessages = [
-        {
-          role: "system" as const,
-          content: `${promptContext}
-
-You are operating inside a Telegram-native agent loop.
+You are operating inside a Telegram-native agent graph.
 Return strict JSON using one of these shapes only:
 {"type":"final_response","content":"..."}
 {"type":"call_tool","toolId":"...","input":{}}
 {"type":"write_memory","target":"daily|longterm","content":"..."}
 {"type":"compact_now"}
+{"type":"delegate_specialist","specialist":"research|memory|document","goal":"...","input":{}}
 {"type":"abort","reason":"..."}
 
 Rules:
 - Use only one action per response.
-- Prefer tools when they increase precision.
-- If the user explicitly asks to remember something, write memory.
-- If you already have enough information, produce final_response.`,
-        },
-        ...history.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
-        ...(scratchpad.length
-          ? [
-              {
-                role: "assistant" as const,
-                content: `Scratchpad:\n${scratchpad.join("\n\n")}`,
-              },
-            ]
-          : []),
-        {
-          role: "user" as const,
-          content: input.userMessage,
-        },
-      ];
+- Prefer delegate_specialist when a task is clearly about research, memory, or document handling.
+- If tool budget is exhausted, return final_response.
+- If the user explicitly asks to remember something, use write_memory or delegate_specialist(memory).`,
+      },
+      ...args.history.map((message) => ({
+        role: message.role,
+        content: message.content,
+      })),
+      ...(agentState.scratchpad.length
+        ? [
+            {
+              role: "assistant" as const,
+              content: `Scratchpad:\n${scratchpadTexts().join("\n\n")}`,
+            },
+          ]
+        : []),
+      {
+        role: "user" as const,
+        content: args.input.userMessage,
+      },
+    ];
 
-      const plannerTimeoutMs = this.operationTimeoutMs(
-        effectiveMaxToolDurationMs,
-        turnDeadlineAt,
-      );
-      const action = parsePlannerAction(
-        (
-          await this.withOperationTimeout(
-            () =>
-              providerInvoker({
-                profile: primaryProvider,
-                apiKey: primaryApiKey,
-                input: {
-                  messages: planningMessages,
-                  jsonMode: true,
-                },
-                timeoutMs: plannerTimeoutMs,
-              }),
-            plannerTimeoutMs,
-            "AGENT_PROVIDER_TIMEOUT",
-            "Planner model timed out",
-          )
-        ).text,
-      );
-
-      if (action.type === "final_response") {
-        return {
-          reply: action.content,
-          turnId,
-          stepCount: stepsUsed,
-          toolRuns,
-          compacted,
-          summary,
-        };
-      }
-
-      if (action.type === "abort") {
-        return {
-          reply: action.reason,
-          turnId,
-          stepCount: stepsUsed,
-          toolRuns,
-          compacted,
-          summary,
-        };
-      }
-
-      if (action.type === "compact_now") {
-        compacted = true;
-        const summaryTimeoutMs = this.operationTimeoutMs(
-          effectiveMaxToolDurationMs,
-          turnDeadlineAt,
-        );
-        summary = await this.withOperationTimeout(
-          () =>
-            this.generateSummary({
-              backgroundProvider,
-              transcript: [...transcript, ...scratchpad],
-              memory,
-              input,
-              providerInvoker,
-              timeoutMs: summaryTimeoutMs,
-            }),
-          summaryTimeoutMs,
-          "AGENT_SUMMARY_TIMEOUT",
-          "Conversation compaction timed out",
-        );
-        historySummary = summary;
-        await memory.writeSummarySnapshot(input.context.conversationId, summary);
-        scratchpad.push(`Compacted history:\n${summary}`);
-        continue;
-      }
-
-      if (action.type === "write_memory") {
-        if (action.target === "longterm") {
-          await memory.upsertLongterm(action.content);
-        } else {
-          await memory.appendDaily(action.content, new Date(input.context.nowIso));
+    const nativeToolReplayMessages = (): ProviderMessage[] =>
+      agentState.toolLedger.flatMap((tool) => {
+        const messages: ProviderMessage[] = [{
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: tool.callId,
+            toolId: tool.toolId,
+            input: tool.input,
+          } satisfies ProviderToolCall],
+        }];
+        if (tool.status !== "pending") {
+          messages.push({
+            role: "tool",
+            content: toolOutputText(tool.output),
+            toolCallId: tool.callId,
+          });
         }
-        scratchpad.push(`Memory written to ${action.target}: ${action.content}`);
-        continue;
-      }
+        return messages;
+      });
 
-      if (toolRuns.length >= input.profile.maxToolCalls) {
-        break;
-      }
+    const nativeMessages = (mode: "planner" | "final"): ProviderMessage[] => [
+      {
+        role: "system",
+        content: mode === "planner"
+          ? `${promptContext()}
 
+You are operating inside a Telegram-native agent graph.
+You may call tools when needed. When enough information is available, respond directly with the user-facing answer.`
+          : `${promptContext()}
+
+Produce the final user-facing answer for Telegram. Keep it concise and grounded in the scratchpad and tool results. Do not call more tools.`,
+      },
+      ...toProviderHistoryMessages(args.history),
+      ...(agentState.scratchpad.length
+        ? [{
+            role: "assistant" as const,
+            content: `Scratchpad:\n${scratchpadTexts().join("\n\n")}`,
+          }]
+        : []),
+      {
+        role: "user",
+        content: args.input.userMessage,
+      },
+      ...nativeToolReplayMessages(),
+    ];
+
+    const syncToolRuns = () => {
+      toolRuns.splice(0, toolRuns.length, ...agentState.toolLedger
+        .filter((tool) => tool.status !== "pending")
+        .map((tool) => ({
+          id: tool.callId,
+          toolId: tool.toolId,
+          input: stripPlannerMetadata(tool.input),
+          output: tool.output,
+          source: toolSourceFor(tool.toolId, args.builtinToolIds, args.memoryToolIds),
+        })));
+    };
+
+    const refreshMemoryFromSummary = async (notes: string) => {
+      if (this.services.enqueueJob) {
+        await this.services.enqueueJob({
+          workspaceId: args.input.context.workspaceId,
+          kind: "memory_refresh_before_compact",
+          payload: {
+            notes,
+          },
+        });
+        return;
+      }
+      await args.memory.executeTool("memory_refresh_before_compact", {
+        notes,
+      });
+    };
+
+    const appendScratchpad = async (entry: {
+      kind: "observation" | "tool_result" | "memory_result" | "specialist_result" | "summary" | "decision";
+      nodeId: string;
+      subgraph: AgentSubgraph;
+      text: string;
+      id?: string;
+    }) => {
+      if (!entry.text.trim()) {
+        return;
+      }
+      const id = entry.id ?? createId("scratch");
+      if (agentState.scratchpad.some((item) => item.id === id)) {
+        return;
+      }
+      agentState.scratchpad.push({
+        id,
+        kind: entry.kind,
+        nodeId: entry.nodeId,
+        subgraph: entry.subgraph,
+        text: entry.text,
+        createdAt: args.input.context.nowIso,
+      });
+      await observeState();
+    };
+
+    const registerAction = async (action: AgentAction) => {
+      const nextAction = attachActionMetadata(action);
+      agentState.lastAction = nextAction;
+      agentState.pendingActions = [nextAction];
+      if (nextAction.type === "final_response") {
+        agentState.reply.draft = nextAction.content;
+      }
+      if (nextAction.type === "abort") {
+        agentState.reply.draft = nextAction.reason;
+      }
+      await args.input.observer?.onActionPlanned?.({
+        action: nextAction,
+        state: snapshotAgentState(agentState),
+      });
+      await observeState();
+      return nextAction;
+    };
+
+    const updateToolLedger = async (next: AgentToolLedger) => {
+      const index = agentState.toolLedger.findIndex((tool) => tool.callId === next.callId);
+      const previous = index >= 0 ? agentState.toolLedger[index] ?? null : null;
+      if (index >= 0) {
+        agentState.toolLedger[index] = next;
+      } else {
+        agentState.toolLedger.push(next);
+      }
+      syncToolRuns();
+      await args.input.observer?.onToolUpdated?.({
+        tool: next,
+        previous,
+        state: snapshotAgentState(agentState),
+      });
+      await observeState();
+    };
+
+    const updateMemoryLedger = async (next: AgentMemoryLedger) => {
+      const index = agentState.memoryLedger.findIndex((item) => item.id === next.id);
+      if (index >= 0) {
+        agentState.memoryLedger[index] = next;
+      } else {
+        agentState.memoryLedger.push(next);
+      }
+      await observeState();
+    };
+
+    const findTool = (toolId: string) =>
+      args.toolDescriptors.find((tool) => tool.id === toolId) ?? null;
+
+    const executeToolLedger = async (toolId: string, input: Record<string, unknown>, subgraph: AgentSubgraph) => {
+      const existingCallId = typeof input.__pulsar_callId === "string" ? input.__pulsar_callId : createId("tool");
+      const cleanInput = stripPlannerMetadata(input);
+      const startedAt = new Date().toISOString();
+      await updateToolLedger({
+        callId: existingCallId,
+        toolId,
+        subgraph,
+        input: cleanInput,
+        output: null,
+        status: "pending",
+        idempotencyKey: `tool:${args.turnId}:${existingCallId}`,
+        attempt: 1,
+        startedAt,
+        finishedAt: null,
+        error: null,
+      });
       const output = await this.withOperationTimeout(
         () =>
           this.executeTool({
-            action,
-            input,
-            memory,
-            mcpServers,
-            builtinToolIds,
-            memoryToolIds,
+            action: {
+              type: "call_tool",
+              toolId,
+              input: cleanInput,
+            },
+            input: args.input,
+            memory: args.memory,
+            mcpServers: args.mcpServers,
+            builtinToolIds: args.builtinToolIds,
+            memoryToolIds: args.memoryToolIds,
           }),
-        this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
+        this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
         "AGENT_TOOL_TIMEOUT",
-        `Tool ${action.toolId} timed out`,
+        `Tool ${toolId} timed out`,
       );
-
-      const source = toolSourceFor(action.toolId, builtinToolIds, memoryToolIds);
-      toolRuns.push({
-        id: createId("tool"),
-        toolId: action.toolId,
-        input: action.input,
-        output,
-        source,
+      agentState.counters.toolCallsUsed += 1;
+      agentState.checkpoints.lastToolAt = new Date().toISOString();
+      await updateToolLedger({
+        callId: existingCallId,
+        toolId,
+        subgraph,
+        input: cleanInput,
+        output: JSON.parse(JSON.stringify(output ?? null)) as LooseJsonValue,
+        status: "completed",
+        idempotencyKey: `tool:${args.turnId}:${existingCallId}`,
+        attempt: 1,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        error: null,
       });
-      toolMessages.push({
-        role: "tool",
-        content: typeof output === "string" ? output : JSON.stringify(output, null, 2),
-      });
-      scratchpad.push(
-        `Tool ${action.toolId} output:\n${typeof output === "string" ? output : JSON.stringify(output, null, 2)}`,
-      );
-    }
+      lastExecutedToolCallId = existingCallId;
+      return output;
+    };
 
-    if (useNativeToolCalling) {
-      const nativeFinalRequestInput: ProviderInvocationInput = {
-        messages: nativePlanningMessages,
-        tools: nativeToolDefinitions,
-        toolChoice: "none",
-      };
-      if (this.canStreamFinalReply(input, primaryProvider)) {
-        return {
-          reply: await this.resolveFinalReply({
-            input,
-            primaryProvider,
-            primaryApiKey,
-            providerInvoker,
-            requestInput: nativeFinalRequestInput,
-            maxOperationMs: effectiveMaxToolDurationMs,
-            turnDeadlineAt,
-          }),
-          turnId,
-          stepCount: stepsUsed || input.profile.maxPlanningSteps,
-          toolRuns,
-          compacted,
-          summary,
-        };
-      }
-      try {
-        const finalProviderTimeoutMs = this.operationTimeoutMs(
-          effectiveMaxToolDurationMs,
-          turnDeadlineAt,
-        );
-        const finalProviderReply = await this.withOperationTimeout(
-          () =>
-            providerInvoker({
-              profile: primaryProvider,
-              apiKey: primaryApiKey,
-              input: nativeFinalRequestInput,
-              timeoutMs: finalProviderTimeoutMs,
-            }),
-          finalProviderTimeoutMs,
-          "AGENT_PROVIDER_TIMEOUT",
-          "Final response generation timed out",
-        );
-        const text = finalProviderReply.text.trim();
-        if (text) {
-          return {
-            reply: text,
-            turnId,
-            stepCount: stepsUsed || input.profile.maxPlanningSteps,
-            toolRuns,
-            compacted,
-            summary,
-          };
-        }
-      } catch {
-        // Fall through to legacy final-response path.
-      }
-    }
-
-    const finalMessages = [
+    const buildFinalMessages = () => [
       {
         role: "system" as const,
-        content: `${promptContext}
+        content: `${promptContext()}
 
 Produce the final user-facing answer for Telegram. Keep it concise and grounded in the scratchpad.`,
       },
-      ...history.map((message) => ({
+      ...args.history.map((message) => ({
         role: message.role,
         content: message.content,
       })),
       ...toolMessages,
-      {
-        role: "assistant" as const,
-        content: `Scratchpad:\n${scratchpad.join("\n\n")}`,
-      },
+      ...(agentState.scratchpad.length
+        ? [
+            {
+              role: "assistant" as const,
+              content: `Scratchpad:\n${scratchpadTexts().join("\n\n")}`,
+            },
+          ]
+        : []),
       {
         role: "user" as const,
-        content: input.userMessage,
+        content: args.input.userMessage,
       },
     ];
 
-    return {
-      reply: await this.resolveFinalReply({
-        input,
-        primaryProvider,
-        primaryApiKey,
-        providerInvoker,
-        requestInput: {
-          messages: finalMessages,
+    const snapshot = new TokenBudgetManager(
+      args.input.profile.compactSoftThreshold,
+      args.input.profile.compactHardThreshold,
+    ).evaluate({
+      texts: [
+        args.input.profile.systemPrompt,
+        args.input.userMessage,
+        args.startupMemory.longterm,
+        args.startupMemory.yesterday,
+        args.startupMemory.today,
+        args.existingSummary,
+        ...args.transcript,
+      ],
+      maxContextTokens: 32_000,
+    });
+
+    const specialistStartNode = (specialist: AgentSpecialistKind) => {
+      switch (specialist) {
+        case "research":
+          return "research_plan";
+        case "memory":
+          return "memory_plan";
+        case "document":
+          return "document_plan";
+      }
+    };
+
+    const nodes = {
+      bootstrap: {
+        id: "bootstrap",
+        run: async () => {
+          agentState.status = "running";
+          agentState.currentSubgraph = agentState.currentSubgraph ?? "main";
+          agentState.summary.existing ||= args.existingSummary;
+          agentState.summary.working ||= args.existingSummary;
+          agentState.flags.needsCompaction ||= snapshot.softExceeded || snapshot.hardExceeded;
+          await observeState();
         },
-        maxOperationMs: effectiveMaxToolDurationMs,
-        turnDeadlineAt,
-      }),
-      turnId,
-      stepCount: stepsUsed || input.profile.maxPlanningSteps,
+      },
+      maybe_compact_history: {
+        id: "maybe_compact_history",
+        run: async () => {
+          if (!agentState.flags.needsCompaction) {
+            return;
+          }
+          compacted = true;
+          summary = await this.withOperationTimeout(
+            () =>
+              this.generateSummary({
+                backgroundProvider: args.backgroundProvider,
+                transcript: currentSummary()
+                  ? [currentSummary(), ...args.transcript, ...scratchpadTexts()]
+                  : [...args.transcript, ...scratchpadTexts()],
+                memory: args.memory,
+                input: args.input,
+                providerInvoker: args.providerInvoker,
+                timeoutMs: this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+              }),
+            this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+            "AGENT_SUMMARY_TIMEOUT",
+            "Conversation compaction timed out",
+          );
+          agentState.summary.working = summary;
+          agentState.summary.refreshedAt = new Date().toISOString();
+          agentState.flags.needsCompaction = false;
+          agentState.flags.summaryDirty = false;
+          await refreshMemoryFromSummary(summary);
+          await args.memory.writeSummarySnapshot(args.input.context.conversationId, summary);
+          await appendScratchpad({
+            id: "summary:initial",
+            kind: "summary",
+            nodeId: "maybe_compact_history",
+            subgraph: "main",
+            text: `Compacted history:\n${summary}`,
+          });
+        },
+      },
+      load_memory_context: {
+        id: "load_memory_context",
+        run: async () => {
+          await observeState();
+        },
+      },
+      load_tool_catalog: {
+        id: "load_tool_catalog",
+        run: async () => {
+          await observeState();
+        },
+      },
+      select_planner_mode: {
+        id: "select_planner_mode",
+        run: async () => {
+          agentState.plannerMode = useNativeToolCalling ? "native_tools" : "json_action";
+          await observeState();
+        },
+      },
+      plan_step: {
+        id: "plan_step",
+        run: async () => {
+          if (agentState.pendingActions.length > 0) {
+            return "route_action";
+          }
+          if (agentState.counters.planningStepsUsed >= args.input.profile.maxPlanningSteps) {
+            await observeState();
+            return "generate_final_response";
+          }
+          agentState.counters.planningStepsUsed += 1;
+          agentState.iteration += 1;
+          agentState.checkpoints.lastPlannerAt = new Date().toISOString();
+          if (agentState.plannerMode === "native_tools") {
+            const result = await this.withOperationTimeout(
+              () =>
+                args.providerInvoker({
+                  profile: args.primaryProvider,
+                  apiKey: args.primaryApiKey,
+                  input: {
+                    messages: nativeMessages("planner"),
+                    tools: toProviderToolDefinitions(args.toolDescriptors),
+                    toolChoice: agentState.counters.toolCallsUsed >= args.input.profile.maxToolCalls
+                      ? "none"
+                      : "auto",
+                  },
+                  timeoutMs: this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+                }),
+              this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+              "AGENT_PROVIDER_TIMEOUT",
+              "Planner model timed out",
+            );
+            if (result.toolCalls?.length) {
+              agentState.pendingActions = result.toolCalls.map((toolCall) =>
+                attachActionMetadata({
+                  type: "call_tool",
+                  toolId: toolCall.toolId,
+                  input: {
+                    ...toolCall.input,
+                    __pulsar_callId: toolCall.id || createId("tool"),
+                  },
+                })
+              );
+              agentState.lastAction = agentState.pendingActions[0] ?? null;
+              await args.input.observer?.onActionPlanned?.({
+                action: agentState.lastAction!,
+                state: snapshotAgentState(agentState),
+              });
+              await observeState();
+              return "route_action";
+            }
+            const content = result.text.trim();
+            agentState.reply.draft = content || agentState.reply.draft;
+            await observeState();
+            return "generate_final_response";
+          }
+
+          const action = parsePlannerAction(
+            (
+              await this.withOperationTimeout(
+                () =>
+                  args.providerInvoker({
+                    profile: args.primaryProvider,
+                    apiKey: args.primaryApiKey,
+                    input: {
+                      messages: planningMessages(),
+                      jsonMode: true,
+                    },
+                    timeoutMs: this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+                  }),
+                this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+                "AGENT_PROVIDER_TIMEOUT",
+                "Planner model timed out",
+              )
+            ).text,
+          );
+          await registerAction(action);
+          return "route_action";
+        },
+      },
+      route_action: {
+        id: "route_action",
+        run: async () => {
+          const action = agentState.pendingActions[0] ?? agentState.lastAction;
+          if (!action) {
+            return "generate_final_response";
+          }
+          switch (action.type) {
+            case "final_response":
+              return "generate_final_response";
+            case "call_tool":
+              return "execute_tool";
+            case "write_memory":
+              return "execute_memory_write";
+            case "compact_now":
+              return "refresh_summary";
+            case "delegate_specialist":
+              return "enter_specialist_subgraph";
+            case "abort":
+              return "abort_reply";
+          }
+        },
+      },
+      execute_tool: {
+        id: "execute_tool",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (!action || action.type !== "call_tool") {
+            return "plan_step";
+          }
+          if (agentState.counters.toolCallsUsed >= args.input.profile.maxToolCalls) {
+            agentState.pendingActions = [];
+            agentState.lastAction = null;
+            await observeState();
+            return "generate_final_response";
+          }
+          await executeToolLedger(action.toolId, action.input, agentState.currentSubgraph ?? "main");
+        },
+      },
+      record_tool_result: {
+        id: "record_tool_result",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (!action || action.type !== "call_tool") {
+            return "plan_step";
+          }
+          const callId = typeof action.input.__pulsar_callId === "string"
+            ? action.input.__pulsar_callId
+            : lastExecutedToolCallId;
+          const ledger = callId
+            ? agentState.toolLedger.find((tool) => tool.callId === callId)
+            : null;
+          if (ledger) {
+            const outputText = toolOutputText(ledger.output);
+            toolMessages.push({
+              role: "tool",
+              content: outputText,
+            });
+            await appendScratchpad({
+              id: `tool:${ledger.callId}`,
+              kind: "tool_result",
+              nodeId: "record_tool_result",
+              subgraph: ledger.subgraph,
+              text: `[tool:${ledger.callId}] ${ledger.toolId}\n${outputText}`,
+            });
+          }
+          agentState.pendingActions = agentState.pendingActions.slice(1);
+          agentState.lastAction = agentState.pendingActions[0] ?? null;
+          await observeState();
+          return agentState.pendingActions.length > 0 ? "route_action" : "plan_step";
+        },
+      },
+      execute_memory_write: {
+        id: "execute_memory_write",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (!action || action.type !== "write_memory") {
+            return "plan_step";
+          }
+          const memoryId = typeof action.content === "string"
+            ? `mem:${args.turnId}:${agentState.memoryLedger.length + 1}`
+            : createId("mem");
+          const startedAt = new Date().toISOString();
+          await updateMemoryLedger({
+            id: memoryId,
+            target: action.target,
+            content: action.content,
+            status: "pending",
+            startedAt,
+            finishedAt: null,
+            error: null,
+          });
+          if (action.target === "longterm") {
+            await args.memory.upsertLongterm(action.content);
+          } else {
+            await args.memory.appendDaily(action.content, new Date(args.input.context.nowIso));
+          }
+          await updateMemoryLedger({
+            id: memoryId,
+            target: action.target,
+            content: action.content,
+            status: "completed",
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            error: null,
+          });
+          lastExecutedMemoryId = memoryId;
+        },
+      },
+      record_memory_result: {
+        id: "record_memory_result",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          const ledger = lastExecutedMemoryId
+            ? agentState.memoryLedger.find((entry) => entry.id === lastExecutedMemoryId)
+            : null;
+          if (action?.type === "write_memory" && ledger) {
+            await appendScratchpad({
+              id: `memory:${ledger.id}`,
+              kind: "memory_result",
+              nodeId: "record_memory_result",
+              subgraph: agentState.currentSubgraph ?? "main",
+              text: `Memory written to ${ledger.target}: ${ledger.content}`,
+            });
+          }
+          agentState.pendingActions = agentState.pendingActions.slice(1);
+          agentState.lastAction = agentState.pendingActions[0] ?? null;
+          await observeState();
+          return "plan_step";
+        },
+      },
+      refresh_summary: {
+        id: "refresh_summary",
+        run: async () => {
+          compacted = true;
+          summary = await this.withOperationTimeout(
+            () =>
+              this.generateSummary({
+                backgroundProvider: args.backgroundProvider,
+                transcript: [...args.transcript, ...scratchpadTexts()],
+                memory: args.memory,
+                input: args.input,
+                providerInvoker: args.providerInvoker,
+                timeoutMs: this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+              }),
+            this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+            "AGENT_SUMMARY_TIMEOUT",
+            "Conversation compaction timed out",
+          );
+          agentState.summary.working = summary;
+          agentState.summary.refreshedAt = new Date().toISOString();
+          agentState.flags.needsCompaction = false;
+          agentState.flags.summaryDirty = false;
+          await refreshMemoryFromSummary(summary);
+          await args.memory.writeSummarySnapshot(args.input.context.conversationId, summary);
+          await appendScratchpad({
+            id: `summary:${agentState.iteration}`,
+            kind: "summary",
+            nodeId: "refresh_summary",
+            subgraph: "main",
+            text: `Compacted history:\n${summary}`,
+          });
+          if (agentState.pendingActions[0]?.type === "compact_now") {
+            agentState.pendingActions = agentState.pendingActions.slice(1);
+            agentState.lastAction = agentState.pendingActions[0] ?? null;
+          }
+          await observeState();
+        },
+      },
+      enter_specialist_subgraph: {
+        id: "enter_specialist_subgraph",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (!action || action.type !== "delegate_specialist") {
+            return "plan_step";
+          }
+          agentState.counters.specialistCallsUsed += 1;
+          agentState.currentSubgraph = action.specialist;
+          agentState.subgraphStack.push({
+            id: createId("sub"),
+            kind: action.specialist,
+            entryNode: specialistStartNode(action.specialist),
+            returnNode: "merge_specialist_result",
+            goal: action.goal,
+            status: "running",
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+          });
+          await args.input.observer?.onSubgraphEntered?.({
+            subgraph: action.specialist,
+            state: snapshotAgentState(agentState),
+          });
+          await observeState();
+          return specialistStartNode(action.specialist);
+        },
+      },
+      research_plan: {
+        id: "research_plan",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist") {
+            return "merge_specialist_result";
+          }
+          specialistResultText = `Research goal: ${action.goal}`;
+        },
+      },
+      research_search: {
+        id: "research_search",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist") {
+            return "merge_specialist_result";
+          }
+          if (!findTool("search_web")) {
+            specialistResultText = `${specialistResultText}\nSearch tool unavailable.`;
+            return;
+          }
+          const query = String(action.input.query ?? action.goal);
+          const output = await executeToolLedger("search_web", { query }, "research");
+          specialistResultText = `${specialistResultText}\nSearch completed.`;
+          if (output && typeof output === "object") {
+            await observeState();
+          }
+        },
+      },
+      research_browse_optional: {
+        id: "research_browse_optional",
+        run: async () => {
+          if (!findTool("web_browse")) {
+            return;
+          }
+          const searchLedger = [...agentState.toolLedger]
+            .reverse()
+            .find((tool) => tool.subgraph === "research" && tool.toolId === "search_web");
+          const firstResult = searchLedger && typeof searchLedger.output === "object" && searchLedger.output
+            ? (searchLedger.output as { results?: Array<{ url?: string }> }).results?.[0]
+            : undefined;
+          const url = firstResult?.url;
+          if (!url) {
+            return;
+          }
+          await executeToolLedger("web_browse", { url }, "research");
+          specialistResultText = `${specialistResultText}\nPrimary source fetched.`;
+        },
+      },
+      research_summarize: {
+        id: "research_summarize",
+        run: async () => {
+          const recentResearch = agentState.toolLedger
+            .filter((tool) => tool.subgraph === "research" && tool.status === "completed")
+            .map((tool) => `${tool.toolId}: ${typeof tool.output === "string" ? tool.output : JSON.stringify(tool.output, null, 2)}`)
+            .join("\n\n");
+          specialistResultText = [specialistResultText, recentResearch].filter(Boolean).join("\n\n");
+        },
+      },
+      memory_plan: {
+        id: "memory_plan",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist") {
+            return "merge_specialist_result";
+          }
+          specialistResultText = `Memory goal: ${action.goal}`;
+        },
+      },
+      memory_read_optional: {
+        id: "memory_read_optional",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist" || !findTool("memory_search")) {
+            return;
+          }
+          const query = typeof action.input.query === "string" ? action.input.query : action.goal;
+          await executeToolLedger("memory_search", { query, limit: 5 }, "memory");
+        },
+      },
+      memory_write_optional: {
+        id: "memory_write_optional",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist") {
+            return;
+          }
+          const content = typeof action.input.content === "string"
+            ? action.input.content
+            : null;
+          if (!content) {
+            return;
+          }
+          const target = action.input.target === "longterm" ? "memory_upsert_longterm" : "memory_append_daily";
+          if (findTool(target)) {
+            await executeToolLedger(target, target === "memory_upsert_longterm"
+              ? { content }
+              : { text: content }, "memory");
+          }
+        },
+      },
+      memory_summarize: {
+        id: "memory_summarize",
+        run: async () => {
+          const recentMemory = agentState.toolLedger
+            .filter((tool) => tool.subgraph === "memory" && tool.status === "completed")
+            .map((tool) => `${tool.toolId}: ${typeof tool.output === "string" ? tool.output : JSON.stringify(tool.output, null, 2)}`)
+            .join("\n\n");
+          specialistResultText = [specialistResultText, recentMemory].filter(Boolean).join("\n\n");
+        },
+      },
+      document_plan: {
+        id: "document_plan",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist") {
+            return "merge_specialist_result";
+          }
+          specialistResultText = `Document goal: ${action.goal}`;
+        },
+      },
+      document_extract_optional: {
+        id: "document_extract_optional",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist" || !findTool("document_extract_text")) {
+            return;
+          }
+          const text = typeof action.input.text === "string"
+            ? action.input.text
+            : args.input.userMessage;
+          await executeToolLedger("document_extract_text", { text }, "document");
+        },
+      },
+      document_query_optional: {
+        id: "document_query_optional",
+        run: async () => {
+          const action = agentState.pendingActions[0];
+          if (action?.type !== "delegate_specialist" || !findTool("memory_search")) {
+            return;
+          }
+          const query = typeof action.input.query === "string" ? action.input.query : action.goal;
+          await executeToolLedger("memory_search", { query, limit: 3 }, "document");
+        },
+      },
+      document_summarize: {
+        id: "document_summarize",
+        run: async () => {
+          const recentDocument = agentState.toolLedger
+            .filter((tool) => tool.subgraph === "document" && tool.status === "completed")
+            .map((tool) => `${tool.toolId}: ${typeof tool.output === "string" ? tool.output : JSON.stringify(tool.output, null, 2)}`)
+            .join("\n\n");
+          specialistResultText = [specialistResultText, recentDocument].filter(Boolean).join("\n\n");
+        },
+      },
+      merge_specialist_result: {
+        id: "merge_specialist_result",
+        run: async () => {
+          const frame = agentState.subgraphStack[agentState.subgraphStack.length - 1] ?? null;
+          if (frame) {
+            frame.status = "succeeded";
+            frame.finishedAt = new Date().toISOString();
+            await args.input.observer?.onSubgraphExited?.({
+              subgraph: frame.kind,
+              state: snapshotAgentState(agentState),
+              status: "succeeded",
+            });
+          }
+          await appendScratchpad({
+            id: `specialist:${agentState.iteration}:${frame?.kind ?? "main"}`,
+            kind: "specialist_result",
+            nodeId: "merge_specialist_result",
+            subgraph: agentState.currentSubgraph ?? "main",
+            text: specialistResultText || "Specialist finished with no additional result.",
+          });
+          specialistResultText = "";
+          agentState.subgraphStack = agentState.subgraphStack.slice(0, -1);
+          agentState.currentSubgraph = "main";
+          agentState.pendingActions = agentState.pendingActions.slice(1);
+          agentState.lastAction = agentState.pendingActions[0] ?? null;
+          await observeState();
+        },
+      },
+      generate_final_response: {
+        id: "generate_final_response",
+        run: async () => {
+          if (!agentState.reply.final) {
+            const shouldUseNativeFinal =
+              agentState.plannerMode === "native_tools" &&
+              (Boolean(args.input.streamReply) || !agentState.reply.draft.trim());
+            if (shouldUseNativeFinal) {
+              agentState.reply.final = await this.resolveFinalReply({
+                input: args.input,
+                primaryProvider: args.primaryProvider,
+                primaryApiKey: args.primaryApiKey,
+                providerInvoker: args.providerInvoker,
+                requestInput: {
+                  messages: nativeMessages("final"),
+                  tools: toProviderToolDefinitions(args.toolDescriptors),
+                  toolChoice: "none",
+                },
+                maxOperationMs: args.effectiveMaxToolDurationMs,
+                turnDeadlineAt: args.turnDeadlineAt,
+              });
+            } else {
+              const text = agentState.reply.draft.trim();
+              if (text) {
+                agentState.reply.final = text;
+              } else {
+                agentState.reply.final = await this.resolveFinalReply({
+                  input: args.input,
+                  primaryProvider: args.primaryProvider,
+                  primaryApiKey: args.primaryApiKey,
+                  providerInvoker: args.providerInvoker,
+                  requestInput: {
+                    messages: buildFinalMessages(),
+                  },
+                  maxOperationMs: args.effectiveMaxToolDurationMs,
+                  turnDeadlineAt: args.turnDeadlineAt,
+                });
+              }
+            }
+          }
+          agentState.flags.finalReplyReady = true;
+          agentState.reply.streamedChars = agentState.reply.final.length;
+          await observeState();
+          return "done";
+        },
+      },
+      abort_reply: {
+        id: "abort_reply",
+        run: async () => {
+          const action = agentState.pendingActions[0] ?? agentState.lastAction;
+          agentState.reply.final = action?.type === "abort"
+            ? action.reason
+            : agentState.reply.draft || "The request was aborted.";
+          agentState.status = "aborted";
+          await observeState();
+          return "done";
+        },
+      },
+      done: {
+        id: "done",
+        run: async () => {
+          agentState.status = agentState.status === "aborted" ? "aborted" : "succeeded";
+          await observeState();
+          return null;
+        },
+      },
+    } satisfies Parameters<typeof runGraph<AgentGraphState, Record<string, never>>>[0]["nodes"];
+
+    const nextNodeFor = (nodeId: string): string | null => {
+      switch (nodeId) {
+        case "bootstrap":
+          return "maybe_compact_history";
+        case "maybe_compact_history":
+          return "load_memory_context";
+        case "load_memory_context":
+          return "load_tool_catalog";
+        case "load_tool_catalog":
+          return "select_planner_mode";
+        case "select_planner_mode":
+          return "plan_step";
+        case "plan_step":
+          return "route_action";
+        case "route_action":
+          return "plan_step";
+        case "execute_tool":
+          return "record_tool_result";
+        case "record_tool_result":
+          return agentState.pendingActions.length > 0 ? "route_action" : "plan_step";
+        case "execute_memory_write":
+          return "record_memory_result";
+        case "record_memory_result":
+          return "plan_step";
+        case "refresh_summary":
+          return "plan_step";
+        case "enter_specialist_subgraph": {
+          const action = agentState.pendingActions[0];
+          return action?.type === "delegate_specialist"
+            ? specialistStartNode(action.specialist)
+            : "plan_step";
+        }
+        case "research_plan":
+          return "research_search";
+        case "research_search":
+          return "research_browse_optional";
+        case "research_browse_optional":
+          return "research_summarize";
+        case "research_summarize":
+          return "merge_specialist_result";
+        case "memory_plan":
+          return "memory_read_optional";
+        case "memory_read_optional":
+          return "memory_write_optional";
+        case "memory_write_optional":
+          return "memory_summarize";
+        case "memory_summarize":
+          return "merge_specialist_result";
+        case "document_plan":
+          return "document_extract_optional";
+        case "document_extract_optional":
+          return "document_query_optional";
+        case "document_query_optional":
+          return "document_summarize";
+        case "document_summarize":
+          return "merge_specialist_result";
+        case "merge_specialist_result":
+          return "plan_step";
+        case "generate_final_response":
+        case "abort_reply":
+          return "done";
+        case "done":
+          return null;
+        default:
+          return null;
+      }
+    };
+
+    await runGraph({
+      state: agentState,
+      context: {},
+      startNode: args.input.resumeState?.currentNode ?? "bootstrap",
+      resolveNext: ({ nodeId }) => nextNodeFor(nodeId),
+      hooks: {
+        onNodeStarted: async ({ nodeId, attempt }) => {
+          agentState.currentNode = nodeId;
+          agentState.currentSubgraph = inferSubgraphForNode(nodeId, agentState);
+          await args.input.observer?.onNodeStarted?.({
+            nodeId,
+            subgraph: agentState.currentSubgraph ?? "main",
+            state: snapshotAgentState(agentState),
+            attempt,
+          });
+          await observeState();
+        },
+        onNodeSucceeded: async ({ nodeId, attempt }) => {
+          await args.input.observer?.onNodeSucceeded?.({
+            nodeId,
+            subgraph: inferSubgraphForNode(nodeId, agentState),
+            state: snapshotAgentState(agentState),
+            attempt,
+          });
+          await observeState();
+        },
+        onNodeFailed: async ({ nodeId, attempt, error }) => {
+          agentState.status = "failed";
+          await args.input.observer?.onNodeFailed?.({
+            nodeId,
+            subgraph: inferSubgraphForNode(nodeId, agentState),
+            state: snapshotAgentState(agentState),
+            attempt,
+            error,
+          });
+          await observeState();
+        },
+      },
+      nodes,
+    });
+
+    syncToolRuns();
+
+    return {
+      reply: agentState.reply.final || agentState.reply.draft || "done",
+      turnId: args.turnId,
+      stepCount: agentState.counters.planningStepsUsed,
       toolRuns,
       compacted,
       summary,
+      agentState: snapshotAgentState(agentState),
     };
   }
 
@@ -814,7 +1577,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
   }
 
   private async executeTool(args: {
-    action: Extract<PlannerAction, { type: "call_tool" }>;
+    action: Extract<AgentAction, { type: "call_tool" }>;
     input: AgentTurnInput;
     memory: MemoryStoreLike;
     mcpServers: McpServerConfig[];
@@ -894,7 +1657,23 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
       ...memoryTools,
       ...mcpTools,
     ];
+    const allowedToolIds = new Set(context.runtime.allowedToolIds);
+    const routedSearchAllowed = allowedToolIds.has("search_web") ||
+      allowedToolIds.has("google_search") ||
+      allowedToolIds.has("bing_search") ||
+      allowedToolIds.has("web_browse") ||
+      [...allowedToolIds].some((toolId) =>
+        toolId.startsWith("mcp:") &&
+        /exa/i.test(toolId) &&
+        /search/i.test(toolId)
+      );
     return tools.filter((tool) => {
+      const isAllowedByBindings = allowedToolIds.size === 0 ||
+        allowedToolIds.has(tool.id) ||
+        (tool.id === "search_web" && routedSearchAllowed);
+      if (!isAllowedByBindings) {
+        return false;
+      }
       if (tool.source === "mcp" && !profile.allowMcpTools) {
         return false;
       }
