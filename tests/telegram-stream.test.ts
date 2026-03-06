@@ -12,10 +12,11 @@ afterEach(() => {
 });
 
 describe("Telegram streaming controller", () => {
-  it("streams with sendMessageDraft and finalizes with one reply", async () => {
+  it("streams with sendMessageDraft and finalizes by converting the draft", async () => {
     vi.useFakeTimers();
     const reply = vi.fn(async () => ({ message_id: 7 }));
     const sendMessageDraft = vi.fn(async () => true);
+    const sendMessage = vi.fn(async () => ({ message_id: 8 }));
     const controller = createTelegramStreamController({
       ctx: {
         chat: { id: 42 },
@@ -23,6 +24,9 @@ describe("Telegram streaming controller", () => {
         reply,
         api: {
           sendMessageDraft,
+          raw: {
+            sendMessage,
+          },
         },
       } as never,
     });
@@ -38,13 +42,44 @@ describe("Telegram streaming controller", () => {
     await controller.emit("hel");
     await controller.finalize("hello");
 
-    expect(reply).toHaveBeenCalledTimes(1);
-    expect(reply).toHaveBeenLastCalledWith("hello", undefined);
-    expect(sendMessageDraft).toHaveBeenCalledTimes(2);
-    expect(sendMessageDraft).toHaveBeenLastCalledWith(42, 99, "hello", undefined);
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenLastCalledWith({
+      chat_id: 42,
+      draft_id: 99,
+      text: "hello",
+    });
+    expect(reply).toHaveBeenCalledTimes(0);
 
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(sendMessageDraft).toHaveBeenCalledTimes(2);
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to reply when draft conversion is rejected", async () => {
+    const reply = vi.fn(async () => ({ message_id: 7 }));
+    const sendMessageDraft = vi.fn(async () => true);
+    const sendMessage = vi.fn(async () => {
+      throw new Error("send failed");
+    });
+    const controller = createTelegramStreamController({
+      ctx: {
+        chat: { id: 42 },
+        msg: { message_id: 99 },
+        reply,
+        api: {
+          sendMessageDraft,
+          raw: {
+            sendMessage,
+          },
+        },
+      } as never,
+    });
+
+    await controller.finalize("hello");
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenLastCalledWith("hello", undefined);
   });
 });
 
@@ -90,9 +125,9 @@ describe("Telegram service message filters", () => {
   });
 
   it("builds forum topic name from assistant reply", () => {
-    expect(buildForumTopicNameFromReply("  hello\n\nworld  ")).toBe("hello world");
+    expect(buildForumTopicNameFromReply("  hello\n\nworld  ")).toBe("hellow");
     expect(buildForumTopicNameFromReply("   ")).toBeNull();
-    expect(buildForumTopicNameFromReply("a".repeat(140))).toHaveLength(128);
+    expect(buildForumTopicNameFromReply("a".repeat(140))).toHaveLength(6);
   });
 
   it("renames implicit forum topic after the first threaded user message", async () => {
@@ -114,9 +149,17 @@ describe("Telegram service message filters", () => {
     vi
       .spyOn(bot.api, "sendMessageDraft")
       .mockResolvedValue(true as never);
-    vi
-      .spyOn(bot.api, "sendMessage")
-      .mockResolvedValue({ message_id: 901 } as never);
+    const sentMessages: Array<Record<string, unknown>> = [];
+    bot.api.config.use(async (prev, method, payload, signal) => {
+      if (method === "sendMessage") {
+        sentMessages.push(payload as Record<string, unknown>);
+        return {
+          ok: true,
+          result: { message_id: 901 },
+        } as never;
+      }
+      return prev(method, payload, signal);
+    });
     const editForumTopicSpy = vi
       .spyOn(bot.api, "editForumTopic")
       .mockResolvedValue(true as never);
@@ -152,9 +195,47 @@ describe("Telegram service message filters", () => {
     } as never);
 
     expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0]).toMatchObject({
+      chat_id: 42,
+      draft_id: 11,
+      message_thread_id: 777,
+      text: "  Topic   Name\nFrom Agent  ",
+    });
     expect(editForumTopicSpy).toHaveBeenCalledTimes(1);
     expect(editForumTopicSpy).toHaveBeenCalledWith(42, 777, {
-      name: "Topic Name From Agent",
+      name: "TopicN",
     });
+  });
+
+  it("ignores edited text updates authored by the bot itself", async () => {
+    const onMessage = vi.fn(async () => "ignored");
+    const { bot } = createTelegramBot({
+      token: "123456:TESTTOKEN",
+      onMessage,
+    });
+    bot.botInfo = {
+      id: 999001,
+      is_bot: true,
+      first_name: "PulsarBot",
+      username: "pulsarbot_test",
+      can_join_groups: true,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+    } as never;
+
+    await bot.handleUpdate({
+      update_id: 2001,
+      edited_message: {
+        message_id: 501,
+        date: 2,
+        edit_date: 3,
+        chat: { id: 42, type: "private" },
+        from: { id: 999001, is_bot: true, first_name: "PulsarBot" },
+        text: "bot draft change",
+      },
+    } as never);
+
+    expect(onMessage).toHaveBeenCalledTimes(0);
   });
 });

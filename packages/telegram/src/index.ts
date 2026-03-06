@@ -327,11 +327,11 @@ export function getImplicitForumTopicThreadId(message: unknown): number | null {
 }
 
 export function buildForumTopicNameFromReply(replyText: string): string | null {
-  const normalized = replyText.replace(/\s+/g, " ").trim();
+  const normalized = replyText.replace(/\s+/g, "").trim();
   if (!normalized) {
     return null;
   }
-  return normalized.slice(0, 128);
+  return Array.from(normalized).slice(0, 6).join("");
 }
 
 function createTopicKey(chatId: number, threadId: number): string {
@@ -421,12 +421,24 @@ export function createTelegramStreamController(args: {
         closed = true;
         return;
       }
-      await flush();
       try {
-        await args.ctx.reply(latestText, args.replyOptions);
+        const rawApi = args.ctx.api.raw as unknown as {
+          sendMessage(payload: Record<string, unknown>): Promise<unknown>;
+        };
+        await rawApi.sendMessage({
+          chat_id: args.ctx.chat!.id,
+          text: latestText,
+          ...(args.replyOptions ?? {}),
+          draft_id: draftId,
+        });
         lastRenderedText = latestText;
       } catch {
-        // Do not throw from finalize if Telegram rejects fallback send.
+        try {
+          await args.ctx.reply(latestText, args.replyOptions);
+          lastRenderedText = latestText;
+        } catch {
+          // Do not throw from finalize if Telegram rejects fallback send.
+        }
       }
       closed = true;
     },
@@ -477,6 +489,9 @@ export function createTelegramBot(args: {
   });
 
   bot.on("message", async (ctx, next) => {
+    if (ctx.message.from?.is_bot) {
+      return;
+    }
     const implicitThreadId = getImplicitForumTopicThreadId(ctx.message);
     if (implicitThreadId !== null) {
       implicitTopicNames.set(createTopicKey(ctx.chat!.id, implicitThreadId), true);
@@ -610,6 +625,9 @@ export function createTelegramBot(args: {
   });
 
   bot.on("edited_message:text", async (ctx) => {
+    if (ctx.editedMessage.from?.is_bot) {
+      return;
+    }
     await dispatchMessage({
       ctx,
       token: args.token,

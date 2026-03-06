@@ -3182,55 +3182,63 @@ export async function createApp(
         emit: async () => {},
         finalize: async () => {},
       };
-      const payload = normalizeTelegramPayload(rawPayload);
-      const workspace = await state.repository.getWorkspace();
-      requireWorkspace(workspace);
+      let payload: TelegramUpdatePayload | null = null;
+      let conversationId: string | null = null;
+      let activeTurnSlot: ActiveTurnQueueItem | null = null;
+      let releasedActiveTurnSlot = false;
 
-      if (
-        workspace.ownerTelegramUserId &&
-        workspace.ownerTelegramUserId !== String(payload.userId)
-      ) {
-        return "This Pulsarbot instance only responds to the configured owner.";
-      }
+      try {
+        payload = normalizeTelegramPayload(rawPayload);
+        const workspace = await state.repository.getWorkspace();
+        requireWorkspace(workspace);
 
-      const conversationId = payload.threadId === null
-        ? `telegram:${payload.chatId}`
-        : `telegram:${payload.chatId}:thread:${payload.threadId}`;
-      const activeTurnSlot = await acquireActiveTurnSlot(conversationId, 60_000);
-      if (!activeTurnSlot) {
-        return "A previous agent turn is still running for this chat. Please try again in a moment.";
-      }
+        if (
+          workspace.ownerTelegramUserId &&
+          workspace.ownerTelegramUserId !== String(payload.userId)
+        ) {
+          return "This Pulsarbot instance only responds to the configured owner.";
+        }
 
-      const startedAt = nowIso();
-      const turnId = createId("turn");
-      const stateSnapshotId = createId("state");
-      const fallbackText = normalizeInboundText(payload.content);
-      const fallbackDeadlineAt = new Date(
-        Date.parse(startedAt) + 30_000,
-      ).toISOString();
+        const resolvedPayload = payload;
+        const resolvedConversationId = resolvedPayload.threadId === null
+          ? `telegram:${resolvedPayload.chatId}`
+          : `telegram:${resolvedPayload.chatId}:thread:${resolvedPayload.threadId}`;
+        conversationId = resolvedConversationId;
+        activeTurnSlot = await acquireActiveTurnSlot(resolvedConversationId, 60_000);
+        if (!activeTurnSlot) {
+          return "A previous agent turn is still running for this chat. Please try again in a moment.";
+        }
 
-      let turnState = TurnStateSchema.parse({
+        const startedAt = nowIso();
+        const turnId = createId("turn");
+        const stateSnapshotId = createId("state");
+        const fallbackText = normalizeInboundText(resolvedPayload.content);
+        const fallbackDeadlineAt = new Date(
+          Date.parse(startedAt) + 30_000,
+        ).toISOString();
+
+        let turnState = TurnStateSchema.parse({
         id: stateSnapshotId,
         turnId,
         workspaceId: workspace.id,
-        conversationId,
+        conversationId: resolvedConversationId,
         graphVersion: TURN_GRAPH_VERSION,
         status: "running",
         currentNode: "ingest_input",
         version: 0,
         input: {
-          updateId: payload.updateId,
-          chatId: payload.chatId,
-          threadId: payload.threadId,
-          userId: payload.userId,
-          username: payload.username ?? null,
-          messageId: payload.messageId,
-          contentKind: payload.content.kind,
+          updateId: resolvedPayload.updateId,
+          chatId: resolvedPayload.chatId,
+          threadId: resolvedPayload.threadId,
+          userId: resolvedPayload.userId,
+          username: resolvedPayload.username ?? null,
+          messageId: resolvedPayload.messageId,
+          contentKind: resolvedPayload.content.kind,
           normalizedText: fallbackText,
           rawMetadata: toLooseJsonRecord({
-            ...payload.content.metadata,
-            threadId: payload.threadId,
-            ...(payload.updateId !== null ? { updateId: payload.updateId } : {}),
+            ...resolvedPayload.content.metadata,
+            threadId: resolvedPayload.threadId,
+            ...(resolvedPayload.updateId !== null ? { updateId: resolvedPayload.updateId } : {}),
           }),
         },
         context: {
@@ -3267,21 +3275,21 @@ export async function createApp(
         updatedAt: startedAt,
       });
 
-      const graphContext: {
-        workspace: Workspace;
-        payload: TelegramUpdatePayload;
-        conversationId: string;
+        const graphContext: {
+          workspace: Workspace;
+          payload: TelegramUpdatePayload;
+          conversationId: string;
         profile: AgentProfile | null;
         runtime: ResolvedRuntimeSnapshot | null;
         acquiredTurnId: string | null;
         document: DocumentMetadata | null;
-      } = {
-        workspace,
-        payload,
-        conversationId,
-        profile: null,
-        runtime: null,
-        acquiredTurnId: null,
+        } = {
+          workspace,
+          payload: resolvedPayload,
+          conversationId: resolvedConversationId,
+          profile: null,
+          runtime: null,
+          acquiredTurnId: null,
         document: null,
       };
 
@@ -3360,13 +3368,13 @@ export async function createApp(
         return graphNodeOrder[index + 1] ?? null;
       };
 
-      try {
-        await persistTurnState();
-        await appendTurnEvent({
-          nodeId: "ingest_input",
-          eventType: "turn_started",
-          attempt: 1,
-        });
+        try {
+          await persistTurnState();
+          await appendTurnEvent({
+            nodeId: "ingest_input",
+            eventType: "turn_started",
+            attempt: 1,
+          });
 
         await runGraph({
           state: turnState,
@@ -3461,10 +3469,10 @@ export async function createApp(
                 }
                 const acquired = await acquireConversationTurn({
                   workspaceId: workspace.id,
-                  conversationId,
+                  conversationId: resolvedConversationId,
                   profileId,
-                  telegramChatId: String(payload.chatId),
-                  telegramUserId: String(payload.userId),
+                  telegramChatId: String(resolvedPayload.chatId),
+                  telegramUserId: String(resolvedPayload.userId),
                   turnId: turnState.turnId,
                   graphVersion: TURN_GRAPH_VERSION,
                   stateSnapshotId: turnState.id,
@@ -3497,7 +3505,7 @@ export async function createApp(
                 }
                 const processedPayload = await registerDocument(
                   workspace.id,
-                  payload,
+                  resolvedPayload,
                   graphContext.profile,
                   turnState.input.normalizedText,
                 );
@@ -3547,23 +3555,23 @@ export async function createApp(
             persist_user_message: {
               id: "persist_user_message",
               run: async () => {
-                await state.repository.saveConversationMessage(conversationId, {
+                await state.repository.saveConversationMessage(resolvedConversationId, {
                   id: userMessageIdForTurn(turnState.turnId),
-                  conversationId,
+                  conversationId: resolvedConversationId,
                   role: "user",
                   content: turnState.input.normalizedText,
-                  sourceType: sourceTypeForContent(payload.content),
-                  telegramMessageId: payload.messageId ? String(payload.messageId) : null,
+                  sourceType: sourceTypeForContent(resolvedPayload.content),
+                  telegramMessageId: resolvedPayload.messageId ? String(resolvedPayload.messageId) : null,
                   metadata: toLooseJsonRecord({
-                    ...payload.content.metadata,
-                    threadId: payload.threadId,
-                    ...(payload.updateId !== null ? { updateId: payload.updateId } : {}),
+                    ...resolvedPayload.content.metadata,
+                    threadId: resolvedPayload.threadId,
+                    ...(resolvedPayload.updateId !== null ? { updateId: resolvedPayload.updateId } : {}),
                     ...(graphContext.document ? { documentId: graphContext.document.id } : {}),
                   }),
                   createdAt: nowIso(),
                 });
                 turnState.context.historyWindow = (
-                  await state.repository.listConversationMessages(conversationId)
+                  await state.repository.listConversationMessages(resolvedConversationId)
                 ).length;
               },
             },
@@ -3573,7 +3581,7 @@ export async function createApp(
                 if (!graphContext.profile || !graphContext.runtime) {
                   throw new Error("Runtime prerequisites are missing");
                 }
-                const allMessages = await state.repository.listConversationMessages(conversationId);
+                const allMessages = await state.repository.listConversationMessages(resolvedConversationId);
                 const history = allMessages.filter(
                   (message) => message.id !== userMessageIdForTurn(turnState.turnId),
                 );
@@ -3594,7 +3602,7 @@ export async function createApp(
                       : {}),
                     context: {
                       workspaceId: workspace.id,
-                      conversationId,
+                      conversationId: resolvedConversationId,
                       turnId: turnState.turnId,
                       nowIso: nowIso(),
                       timezone: workspace.timezone,
@@ -3643,7 +3651,7 @@ export async function createApp(
               id: "persist_assistant_message",
               run: async () => {
                 await persistAssistantArtifactsFromState({
-                  conversationId,
+                  conversationId: resolvedConversationId,
                   stateSnapshot: {
                     ...turnState,
                     toolResults: [],
@@ -3666,7 +3674,7 @@ export async function createApp(
                   });
                   await state.repository.saveToolRun({
                     id: toolRunIdForTurn(turnState.turnId, toolResult.callId),
-                    conversationId,
+                    conversationId: resolvedConversationId,
                     turnId: turnState.turnId,
                     toolId: toolResult.toolId,
                     toolSource: toolResult.source,
@@ -3697,10 +3705,10 @@ export async function createApp(
                   return;
                 }
                 await finalizeConversationTurn({
-                  conversationId,
+                  conversationId: resolvedConversationId,
                   turnId: graphContext.acquiredTurnId,
-                  telegramChatId: String(payload.chatId),
-                  telegramUserId: String(payload.userId),
+                  telegramChatId: String(resolvedPayload.chatId),
+                  telegramUserId: String(resolvedPayload.userId),
                   stepCount: turnState.budgets.stepsUsed,
                   compacted: Boolean(turnState.context.summaryCursor),
                   toolCallCount: turnState.budgets.toolCallsUsed,
@@ -3748,10 +3756,10 @@ export async function createApp(
                 turnState.recovery.resumeEligible = false;
                 if (graphContext.acquiredTurnId) {
                   await finalizeConversationTurn({
-                    conversationId,
+                    conversationId: resolvedConversationId,
                     turnId: graphContext.acquiredTurnId,
-                    telegramChatId: String(payload.chatId),
-                    telegramUserId: String(payload.userId),
+                    telegramChatId: String(resolvedPayload.chatId),
+                    telegramUserId: String(resolvedPayload.userId),
                     stepCount: turnState.budgets.stepsUsed,
                     compacted: Boolean(turnState.context.summaryCursor),
                     toolCallCount: turnState.budgets.toolCallsUsed,
@@ -3771,42 +3779,60 @@ export async function createApp(
             },
           },
         });
-      } catch (error) {
-        logger.error({ error, conversationId, turnId: turnState.turnId }, "Turn graph execution failed");
-        turnState.status = "failed";
-        turnState.error = turnState.error ?? toTurnError({
-          error,
-          nodeId: turnState.currentNode,
-          code: "TURN_GRAPH_CRASHED",
-        });
-        turnState.recovery.resumeEligible = false;
-        if (!turnState.output.replyText) {
-          turnState.output.replyText =
-            "The agent turn failed. Open the Mini App health page for details.";
+        } catch (error) {
+          logger.error({ error, conversationId, turnId: turnState.turnId }, "Turn graph execution failed");
+          turnState.status = "failed";
+          turnState.error = turnState.error ?? toTurnError({
+            error,
+            nodeId: turnState.currentNode,
+            code: "TURN_GRAPH_CRASHED",
+          });
+          turnState.recovery.resumeEligible = false;
+          if (!turnState.output.replyText) {
+            turnState.output.replyText =
+              "The agent turn failed. Open the Mini App health page for details.";
+          }
+          await persistTurnState();
+        } finally {
+          activeTurnSlot.resolve();
+          if (activeTurns.get(conversationId) === activeTurnSlot) {
+            activeTurns.delete(conversationId);
+          }
+          releasedActiveTurnSlot = true;
+          const terminalEvent: TurnEventType = turnState.status === "failed" ||
+              turnState.status === "aborted"
+            ? "turn_failed"
+            : "turn_succeeded";
+          await appendTurnEvent({
+            nodeId: turnState.currentNode,
+            eventType: terminalEvent,
+            attempt: 1,
+            payload: {
+              status: turnState.status,
+              error: turnState.error?.message ?? null,
+            },
+          });
+          await persistTurnState();
         }
-        await persistTurnState();
-      } finally {
-        activeTurnSlot.resolve();
-        if (activeTurns.get(conversationId) === activeTurnSlot) {
-          activeTurns.delete(conversationId);
-        }
-        const terminalEvent: TurnEventType = turnState.status === "failed" ||
-            turnState.status === "aborted"
-          ? "turn_failed"
-          : "turn_succeeded";
-        await appendTurnEvent({
-          nodeId: turnState.currentNode,
-          eventType: terminalEvent,
-          attempt: 1,
-          payload: {
-            status: turnState.status,
-            error: turnState.error?.message ?? null,
-          },
-        });
-        await persistTurnState();
-      }
 
-      return turnState.output.replyText;
+        return turnState.output.replyText;
+      } catch (outerError) {
+        if (activeTurnSlot && conversationId && !releasedActiveTurnSlot) {
+          activeTurnSlot.resolve();
+          if (activeTurns.get(conversationId) === activeTurnSlot) {
+            activeTurns.delete(conversationId);
+          }
+        }
+        logger.error(
+          {
+            error: outerError,
+            chatId: payload?.chatId ?? null,
+            updateId: payload?.updateId ?? null,
+          },
+          "onMessage setup failed before graph execution",
+        );
+        return "Something went wrong during initialization. Please try again.";
+      }
     },
   });
 
@@ -5280,9 +5306,9 @@ export async function createApp(
           });
         }
         if (claimResult === "in_progress") {
-          return reply.code(409).send({
-            ok: false,
-            error: "Update is still being processed",
+          return reply.code(200).send({
+            ok: true,
+            ignored: true,
             reason: claimResult,
           });
         }
@@ -5298,19 +5324,22 @@ export async function createApp(
         return;
       }
 
-      if (reply.statusCode >= 500) {
-        await state.repository.releaseTelegramUpdate(updateId);
-      } else {
+      try {
         await state.repository.completeTelegramUpdate(updateId);
+      } catch (error) {
+        logger.error(
+          { error, updateId, statusCode: reply.statusCode },
+          "Failed to finalize Telegram update receipt state",
+        );
       }
     } catch (error) {
       if (claimed && updateId !== null) {
         try {
-          await state.repository.releaseTelegramUpdate(updateId);
+          await state.repository.completeTelegramUpdate(updateId);
         } catch (releaseError) {
           logger.warn(
             { error: releaseError, updateId },
-            "Failed to release Telegram update lock after handler failure",
+            "Failed to complete Telegram update receipt after handler failure",
           );
         }
       }

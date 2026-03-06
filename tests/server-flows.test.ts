@@ -393,6 +393,82 @@ const fakeTelegramFactory = ({ onMessage }: {
   }),
 });
 
+const crashingTelegramFactory = ({ onMessage }: {
+  onMessage: (
+    payload: {
+      updateId: number | null;
+      chatId: number;
+      threadId: number | null;
+      userId: number;
+      username?: string;
+      messageId: number | null;
+      content: ReturnType<typeof buildFakeTelegramContent>;
+    },
+    stream: {
+      enabled: boolean;
+      emit(partialText: string): Promise<void>;
+      finalize(finalText: string): Promise<void>;
+    },
+  ) => Promise<string>;
+}) => ({
+  handler: async (request: { body?: any }, _reply: { send: (payload: unknown) => unknown }) => {
+    const body = request.body ?? {};
+    const message = body.message ?? body;
+    await onMessage({
+      updateId: Number.isFinite(Number(body.update_id))
+        ? Math.trunc(Number(body.update_id))
+        : null,
+      chatId: Number(message.chat?.id ?? body.chatId ?? 1),
+      threadId: null,
+      username: message.from?.username ?? body.username,
+      userId: Number(message.from?.id ?? body.userId ?? 1),
+      messageId: Number(message.message_id ?? body.messageId ?? 1),
+      content: buildFakeTelegramContent(message, body),
+    }, {
+      enabled: false,
+      async emit() {},
+      async finalize() {},
+    });
+    throw new Error("telegram handler crashed after processing update");
+  },
+  describeWebhookState: () => ({
+    updatedAt: new Date().toISOString(),
+    status: "ready",
+  }),
+});
+
+const invalidPayloadTelegramFactory = ({ onMessage }: {
+  onMessage: (
+    payload: {
+      updateId: number | null;
+      chatId: number;
+      threadId: number | null;
+      userId: number;
+      username?: string;
+      messageId: number | null;
+      content: ReturnType<typeof buildFakeTelegramContent>;
+    },
+    stream: {
+      enabled: boolean;
+      emit(partialText: string): Promise<void>;
+      finalize(finalText: string): Promise<void>;
+    },
+  ) => Promise<string>;
+}) => ({
+  handler: async (_request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
+    const response = await onMessage(null as never, {
+      enabled: false,
+      async emit() {},
+      async finalize() {},
+    });
+    return reply.send({ ok: true, response });
+  },
+  describeWebhookState: () => ({
+    updatedAt: new Date().toISOString(),
+    status: "ready",
+  }),
+});
+
 async function createTempDataDir() {
   return mkdtemp(path.join(os.tmpdir(), "pulsarbot-test-"));
 }
@@ -430,6 +506,7 @@ async function bootstrapApp(
     providerMediaInvoker?: typeof fakeProviderMediaInvoker;
     backgroundPollMs?: number;
     cloudflareClientFactory?: (credentials: CloudflareCredentials) => unknown;
+    telegramFactory?: typeof fakeTelegramFactory;
   },
 ) {
   process.env.NODE_ENV = "test";
@@ -453,7 +530,7 @@ async function bootstrapApp(
     providerInvoker: options?.providerInvoker ?? fakeProviderInvoker,
     providerMediaInvoker: options?.providerMediaInvoker ?? fakeProviderMediaInvoker,
     backgroundPollMs: options?.backgroundPollMs,
-    telegramFactory: fakeTelegramFactory as never,
+    telegramFactory: (options?.telegramFactory ?? fakeTelegramFactory) as never,
   });
 
   const session = await app.inject({
@@ -1536,6 +1613,72 @@ describe("server flows", () => {
       ok: true,
       ignored: true,
       reason: "duplicate",
+    });
+
+    await appState.app.close();
+  });
+
+  it("keeps the Telegram update receipt completed even when the webhook handler crashes", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir, {
+      telegramFactory: crashingTelegramFactory,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const payload = {
+      update_id: 99124,
+      message: {
+        message_id: 322,
+        text: "duplicate after crash",
+        chat: { id: 7102 },
+        from: { id: 42, username: "owner" },
+      },
+    };
+
+    const firstDelivery = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload,
+    });
+    expect(firstDelivery.statusCode).toBe(500);
+
+    const duplicateDelivery = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload,
+    });
+    expect(duplicateDelivery.statusCode).toBe(200);
+    expect(duplicateDelivery.json()).toMatchObject({
+      ok: true,
+      ignored: true,
+      reason: "duplicate",
+    });
+
+    await appState.app.close();
+  });
+
+  it("returns a safe fallback when Telegram onMessage setup throws before graph execution", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir, {
+      telegramFactory: invalidPayloadTelegramFactory,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const response = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        update_id: 99125,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+      response: "Something went wrong during initialization. Please try again.",
     });
 
     await appState.app.close();
