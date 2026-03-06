@@ -225,17 +225,45 @@ interface MigrationDefinition {
   statement: string;
 }
 
+function tableMigrationId(statement: string): string {
+  const match = statement.match(/CREATE TABLE IF NOT EXISTS\s+([a-z_]+)/i);
+  const tableName = match?.[1];
+  if (!tableName) {
+    throw new Error(`Unable to derive table migration id from statement: ${statement}`);
+  }
+  return `create_table_${tableName.toLowerCase()}`;
+}
+
+function alterMigrationId(statement: string): string {
+  const match = statement.match(/ALTER TABLE\s+([a-z_]+)\s+ADD COLUMN\s+([a-z_]+)/i);
+  const tableName = match?.[1];
+  const columnName = match?.[2];
+  if (!tableName || !columnName) {
+    throw new Error(`Unable to derive alter migration id from statement: ${statement}`);
+  }
+  return `alter_table_${tableName.toLowerCase()}_add_column_${columnName.toLowerCase()}`;
+}
+
+function indexMigrationId(statement: string): string {
+  const match = statement.match(/CREATE INDEX IF NOT EXISTS\s+([a-z_]+)/i);
+  const indexName = match?.[1];
+  if (!indexName) {
+    throw new Error(`Unable to derive index migration id from statement: ${statement}`);
+  }
+  return `create_index_${indexName.toLowerCase()}`;
+}
+
 const migrationDefinitions: MigrationDefinition[] = [
-  ...createTableStatements.map((statement, index) => ({
-    id: `create_${index + 1}`,
+  ...createTableStatements.map((statement) => ({
+    id: tableMigrationId(statement),
     statement,
   })),
-  ...alterStatements.map((statement, index) => ({
-    id: `alter_${index + 1}`,
+  ...alterStatements.map((statement) => ({
+    id: alterMigrationId(statement),
     statement,
   })),
-  ...createIndexStatements.map((statement, index) => ({
-    id: `index_${index + 1}`,
+  ...createIndexStatements.map((statement) => ({
+    id: indexMigrationId(statement),
     statement,
   })),
 ];

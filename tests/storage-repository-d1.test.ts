@@ -5,7 +5,7 @@ import type {
   TurnEvent,
   TurnState,
 } from "../packages/shared/src/index.js";
-import { D1AppRepository } from "../packages/storage/src/index.js";
+import { D1AppRepository, runMigrations } from "../packages/storage/src/index.js";
 
 function makeInstallRecord(): InstallRecord {
   return {
@@ -248,6 +248,38 @@ describe("D1AppRepository", () => {
       "db_1",
       "DELETE FROM turn_event WHERE id = ?",
       ["tevt_2"],
+    );
+  });
+
+  it("replays stable migrations when legacy ordinal ids are already recorded", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => [
+      { id: "create_1" },
+      { id: "create_2" },
+      { id: "create_3" },
+      { id: "index_1" },
+    ]);
+
+    await runMigrations(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      expect.stringContaining("CREATE TABLE IF NOT EXISTS mcp_provider"),
+    );
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      expect.stringContaining("INSERT INTO migration_history"),
+      expect.arrayContaining([
+        "create_table_mcp_provider",
+        expect.stringContaining("CREATE TABLE IF NOT EXISTS mcp_provider"),
+        expect.any(String),
+      ]),
     );
   });
 });
