@@ -776,7 +776,27 @@ function messageToGeminiShape(
   };
 }
 
-function buildSamplingOptions(profile: ProviderProfile) {
+function isOpenAiGpt5SeriesModel(model: string): boolean {
+  const normalized = normalizeOpenAiModelId(model).trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return /^gpt-5([.-].+)?$/.test(normalized);
+}
+
+function buildSamplingOptions(
+  profile: ProviderProfile,
+  options?: {
+    model?: string | null | undefined;
+  },
+) {
+  if (
+    profile.kind === "openai" &&
+    typeof options?.model === "string" &&
+    isOpenAiGpt5SeriesModel(options.model)
+  ) {
+    return {};
+  }
   return {
     temperature: profile.temperature,
     ...(profile.topP !== null ? { top_p: profile.topP } : {}),
@@ -1011,6 +1031,33 @@ function resolveTaskModel(
   }
 }
 
+type BailianAudioModelKind = "asr_flash" | "asr_filetrans" | "audio_asr" | "other";
+
+function classifyBailianAudioModel(model: string): BailianAudioModelKind {
+  const normalized = model.trim().toLowerCase();
+  if (!normalized) {
+    return "other";
+  }
+  if (
+    normalized === "qwen3-asr-flash-filetrans" ||
+    normalized.startsWith("qwen3-asr-flash-filetrans-")
+  ) {
+    return "asr_filetrans";
+  }
+  if (normalized === "qwen-audio-asr") {
+    return "audio_asr";
+  }
+  if (normalized === "qwen3-asr-flash" || normalized.startsWith("qwen3-asr-flash-")) {
+    return "asr_flash";
+  }
+  return "other";
+}
+
+function supportsBailianInlineAudioInput(profile: ProviderProfile): boolean {
+  const model = resolveTaskModel(profile, "audio");
+  return classifyBailianAudioModel(model) !== "asr_filetrans";
+}
+
 function readResponsePayload(response: Response): Promise<unknown> {
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
@@ -1238,14 +1285,16 @@ export function supportsProviderCapability(
           ].includes(profile.kind)
         : true;
     case "audio":
-      return [
-        "openai",
-        "gemini",
-        "openrouter",
-        "bailian",
-        "openai_compatible_chat",
-        "openai_compatible_responses",
-      ].includes(profile.kind);
+      return profile.kind === "bailian"
+        ? supportsBailianInlineAudioInput(profile)
+        : [
+            "openai",
+            "gemini",
+            "openrouter",
+            "bailian",
+            "openai_compatible_chat",
+            "openai_compatible_responses",
+          ].includes(profile.kind);
     case "document":
       return providerSupportsDocumentInput({
         profile,
@@ -1586,36 +1635,96 @@ function buildBailianMediaRequest(
         },
       };
     case "audio":
-      return {
-        url: `${compatibleBaseUrl}/chat/completions`,
-        headers: mergeJsonHeaders(profile, {
-          Authorization: `Bearer ${apiKey}`,
-        }),
-        body: {
-          model: resolveTaskModel(profile, "audio"),
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: input.prompt,
-                },
-                {
-                  type: "input_audio",
-                  input_audio: {
-                    data: dataUrlForBytes(input.rawBody, input.mimeType),
-                    format: inferAudioFormat(input.mimeType, input.fileName),
+      {
+        const audioModel = resolveTaskModel(profile, "audio");
+        const audioModelKind = classifyBailianAudioModel(audioModel);
+        if (audioModelKind === "asr_filetrans") {
+          return null;
+        }
+        if (audioModelKind === "audio_asr") {
+          return {
+            url: `${dashscopeOrigin(profile)}/api/v1/services/aigc/multimodal-generation/generation`,
+            headers: mergeJsonHeaders(profile, {
+              Authorization: `Bearer ${apiKey}`,
+            }),
+            body: {
+              model: audioModel,
+              input: {
+                messages: [
+                  {
+                    role: "user",
+                    content: [
+                      {
+                        audio: dataUrlForBytes(input.rawBody, input.mimeType),
+                      },
+                    ],
                   },
+                ],
+              },
+              parameters: {
+                result_format: "message",
+              },
+              ...profile.extraBody,
+            },
+          };
+        }
+        if (audioModelKind === "asr_flash") {
+          return {
+            url: `${compatibleBaseUrl}/chat/completions`,
+            headers: mergeJsonHeaders(profile, {
+              Authorization: `Bearer ${apiKey}`,
+            }),
+            body: {
+              model: audioModel,
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "input_audio",
+                      input_audio: {
+                        data: dataUrlForBytes(input.rawBody, input.mimeType),
+                      },
+                    },
+                  ],
                 },
               ],
+              stream: false,
+              ...profile.extraBody,
             },
-          ],
-          max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
-          stream: false,
-          ...profile.extraBody,
-        },
-      };
+          };
+        }
+        return {
+          url: `${compatibleBaseUrl}/chat/completions`,
+          headers: mergeJsonHeaders(profile, {
+            Authorization: `Bearer ${apiKey}`,
+          }),
+          body: {
+            model: audioModel,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: input.prompt,
+                  },
+                  {
+                    type: "input_audio",
+                    input_audio: {
+                      data: dataUrlForBytes(input.rawBody, input.mimeType),
+                      format: inferAudioFormat(input.mimeType, input.fileName),
+                    },
+                  },
+                ],
+              },
+            ],
+            max_tokens: input.maxOutputTokens ?? profile.maxOutputTokens,
+            stream: false,
+            ...profile.extraBody,
+          },
+        };
+      }
     case "document":
       if (!providerSupportsDocumentInput({
         profile,
@@ -1739,7 +1848,7 @@ export const adapters: Record<ProviderKind, AgentProviderAdapter> = {
           text: wantsJsonMode(profile, input)
             ? { format: { type: "json_object" } }
             : undefined,
-          ...buildSamplingOptions(profile),
+          ...buildSamplingOptions(profile, { model }),
           ...profile.extraBody,
         },
       };

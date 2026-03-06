@@ -56,6 +56,8 @@ describe("provider request preview", () => {
     expect(preview.url).toContain("/responses");
     expect(preview.headers.Authorization).toBe("Bearer sk-test");
     expect(preview.body.model).toBe("test-model");
+    expect(preview.body.temperature).toBe(0.2);
+    expect("top_p" in preview.body).toBe(false);
   });
 
   it("normalizes OpenAI GPT-5 model aliases", () => {
@@ -70,6 +72,23 @@ describe("provider request preview", () => {
     });
 
     expect(preview.body.model).toBe("gpt-5.2");
+  });
+
+  it("omits temperature and top_p for OpenAI GPT-5.x models", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("openai", {
+        defaultModel: "gpt5",
+        topP: 0.8,
+      }),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Hello" }],
+      },
+    });
+
+    expect(preview.body.model).toBe("gpt-5");
+    expect("temperature" in preview.body).toBe(false);
+    expect("top_p" in preview.body).toBe(false);
   });
 
   it("builds an Anthropic payload with thinking enabled", () => {
@@ -804,16 +823,11 @@ describe("provider media request preview", () => {
     expect(audioPreview?.url).toContain("/compatible-mode/v1/chat/completions");
     expect(audioBody.model).toBe("qwen3-asr-flash");
     expect(audioBody.messages[0].content[0]).toMatchObject({
-      type: "text",
-      text: "Transcribe this.",
-    });
-    expect(audioBody.messages[0].content[1]).toMatchObject({
       type: "input_audio",
-      input_audio: {
-        format: "mp3",
-      },
+      input_audio: {},
     });
-    expect(audioBody.messages[0].content[1].input_audio.data).toContain(
+    expect(audioBody.messages[0].content).toHaveLength(1);
+    expect(audioBody.messages[0].content[0].input_audio.data).toContain(
       "data:audio/mpeg;base64,",
     );
 
@@ -826,6 +840,45 @@ describe("provider media request preview", () => {
       role: "system",
       content: "fileid://<uploaded-file-id>",
     });
+  });
+
+  it("builds a Bailian qwen-audio-asr payload on DashScope multimodal endpoint", () => {
+    const preview = createProviderMediaRequestPreview({
+      profile: profile("bailian", {
+        audioModel: "qwen-audio-asr",
+      }),
+      apiKey: "bailian-key",
+      input: {
+        kind: "audio",
+        prompt: "Transcribe this.",
+        rawBody: new Uint8Array([1, 2, 3]),
+        mimeType: "audio/mpeg",
+        fileName: "clip.mp3",
+      },
+    });
+
+    const body = preview?.body as Record<string, any>;
+    expect(preview?.url).toContain("/api/v1/services/aigc/multimodal-generation/generation");
+    expect(body.model).toBe("qwen-audio-asr");
+    expect(body.input.messages[0].content[0].audio).toContain("data:audio/mpeg;base64,");
+    expect(body.parameters.result_format).toBe("message");
+  });
+
+  it("returns null for Bailian qwen3-asr-flash-filetrans with inline audio bytes", () => {
+    const preview = createProviderMediaRequestPreview({
+      profile: profile("bailian", {
+        audioModel: "qwen3-asr-flash-filetrans",
+      }),
+      apiKey: "bailian-key",
+      input: {
+        kind: "audio",
+        prompt: "Transcribe this.",
+        rawBody: new Uint8Array([1, 2, 3]),
+        mimeType: "audio/mpeg",
+        fileName: "clip.mp3",
+      },
+    });
+    expect(preview).toBeNull();
   });
 
   it("captures provider media support rules", () => {
@@ -847,6 +900,22 @@ describe("provider media request preview", () => {
         mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         fileName: "notes.docx",
       }),
+    ).toBe(true);
+    expect(
+      supportsProviderCapability(
+        profile("bailian", {
+          audioModel: "qwen3-asr-flash-filetrans",
+        }),
+        "audio",
+      ),
+    ).toBe(false);
+    expect(
+      supportsProviderCapability(
+        profile("bailian", {
+          audioModel: "qwen-audio-asr",
+        }),
+        "audio",
+      ),
     ).toBe(true);
   });
 });
