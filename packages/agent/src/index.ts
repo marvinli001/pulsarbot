@@ -361,6 +361,32 @@ When enough information is available, respond directly with the user-facing answ
     for (let step = 0; step < input.profile.maxPlanningSteps; step += 1) {
       stepsUsed = step + 1;
       if (useNativeToolCalling) {
+        const nativeFinalRequestInput: ProviderInvocationInput = {
+          messages: nativePlanningMessages,
+          tools: nativeToolDefinitions,
+          toolChoice: "none",
+        };
+        const nativeToolChoice = toolRuns.length >= input.profile.maxToolCalls
+          ? "none"
+          : "auto";
+        if (nativeToolChoice === "none" && this.canStreamFinalReply(input, primaryProvider)) {
+          return {
+            reply: await this.resolveFinalReply({
+              input,
+              primaryProvider,
+              primaryApiKey,
+              providerInvoker,
+              requestInput: nativeFinalRequestInput,
+              maxOperationMs: effectiveMaxToolDurationMs,
+              turnDeadlineAt,
+            }),
+            turnId,
+            stepCount: stepsUsed,
+            toolRuns,
+            compacted,
+            summary,
+          };
+        }
         const plannerTimeoutMs = this.operationTimeoutMs(
           effectiveMaxToolDurationMs,
           turnDeadlineAt,
@@ -373,8 +399,7 @@ When enough information is available, respond directly with the user-facing answ
               input: {
                 messages: nativePlanningMessages,
                 tools: nativeToolDefinitions,
-                toolChoice:
-                  toolRuns.length >= input.profile.maxToolCalls ? "none" : "auto",
+                toolChoice: nativeToolChoice,
               },
               timeoutMs: plannerTimeoutMs,
             }),
@@ -387,6 +412,24 @@ When enough information is available, respond directly with the user-facing answ
         if (providerToolCalls.length === 0) {
           const directReply = providerResult.text.trim();
           if (directReply) {
+            if (this.canStreamFinalReply(input, primaryProvider)) {
+              return {
+                reply: await this.resolveFinalReply({
+                  input,
+                  primaryProvider,
+                  primaryApiKey,
+                  providerInvoker,
+                  requestInput: nativeFinalRequestInput,
+                  maxOperationMs: effectiveMaxToolDurationMs,
+                  turnDeadlineAt,
+                }),
+                turnId,
+                stepCount: stepsUsed,
+                toolRuns,
+                compacted,
+                summary,
+              };
+            }
             return {
               reply: directReply,
               turnId,
@@ -607,6 +650,29 @@ Rules:
     }
 
     if (useNativeToolCalling) {
+      const nativeFinalRequestInput: ProviderInvocationInput = {
+        messages: nativePlanningMessages,
+        tools: nativeToolDefinitions,
+        toolChoice: "none",
+      };
+      if (this.canStreamFinalReply(input, primaryProvider)) {
+        return {
+          reply: await this.resolveFinalReply({
+            input,
+            primaryProvider,
+            primaryApiKey,
+            providerInvoker,
+            requestInput: nativeFinalRequestInput,
+            maxOperationMs: effectiveMaxToolDurationMs,
+            turnDeadlineAt,
+          }),
+          turnId,
+          stepCount: stepsUsed || input.profile.maxPlanningSteps,
+          toolRuns,
+          compacted,
+          summary,
+        };
+      }
       try {
         const finalProviderTimeoutMs = this.operationTimeoutMs(
           effectiveMaxToolDurationMs,
@@ -617,11 +683,7 @@ Rules:
             providerInvoker({
               profile: primaryProvider,
               apiKey: primaryApiKey,
-              input: {
-                messages: nativePlanningMessages,
-                tools: nativeToolDefinitions,
-                toolChoice: "none",
-              },
+              input: nativeFinalRequestInput,
               timeoutMs: finalProviderTimeoutMs,
             }),
           finalProviderTimeoutMs,
@@ -672,7 +734,9 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
         primaryProvider,
         primaryApiKey,
         providerInvoker,
-        messages: finalMessages,
+        requestInput: {
+          messages: finalMessages,
+        },
         maxOperationMs: effectiveMaxToolDurationMs,
         turnDeadlineAt,
       }),
@@ -847,12 +911,21 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
     });
   }
 
+  private canStreamFinalReply(
+    input: AgentTurnInput,
+    provider: ProviderProfile,
+  ): boolean {
+    return Boolean(input.streamReply) &&
+      provider.stream &&
+      supportsProviderTextStreaming(provider);
+  }
+
   private async resolveFinalReply(args: {
     input: AgentTurnInput;
     primaryProvider: ProviderProfile;
     primaryApiKey: string;
     providerInvoker: NonNullable<AgentExecutionServices["invokeProvider"]> | typeof invokeProvider;
-    messages: ProviderInvocationInput["messages"];
+    requestInput: ProviderInvocationInput;
     maxOperationMs: number;
     turnDeadlineAt: number;
   }): Promise<string> {
@@ -870,9 +943,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
             args.providerInvoker({
               profile: args.primaryProvider,
               apiKey: args.primaryApiKey,
-              input: {
-                messages: args.messages,
-              },
+              input: args.requestInput,
               timeoutMs,
             }),
           timeoutMs,
@@ -888,9 +959,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
       const iterator = invokeProviderStream({
         profile: args.primaryProvider,
         apiKey: args.primaryApiKey,
-        input: {
-          messages: args.messages,
-        },
+        input: args.requestInput,
         timeoutMs: streamTimeoutMs,
       })[Symbol.asyncIterator]();
       while (true) {
@@ -916,9 +985,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
             args.providerInvoker({
               profile: args.primaryProvider,
               apiKey: args.primaryApiKey,
-              input: {
-                messages: args.messages,
-              },
+              input: args.requestInput,
               timeoutMs,
             }),
           timeoutMs,
@@ -934,9 +1001,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
             args.providerInvoker({
               profile: args.primaryProvider,
               apiKey: args.primaryApiKey,
-              input: {
-                messages: args.messages,
-              },
+              input: args.requestInput,
               timeoutMs,
             }),
           timeoutMs,

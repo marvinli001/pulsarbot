@@ -15,6 +15,22 @@ import type {
 
 const originalFetch = global.fetch;
 
+function createSseResponse(deltas: string[]): Response {
+  const body = [
+    ...deltas.map((delta) =>
+      `data: ${JSON.stringify({ choices: [{ delta: { content: delta } }] })}\n\n`
+    ),
+    "data: [DONE]\n\n",
+  ].join("");
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+    },
+  });
+}
+
 function createSearchSettings(): SearchSettings {
   return {
     id: "main",
@@ -556,6 +572,166 @@ describe("AgentRuntime", () => {
         }),
       ]),
     );
+  });
+
+  it("streams native direct replies when tool calling stops without tool calls", async () => {
+    global.fetch = vi.fn(async () => createSseResponse(["Hel", "lo"])) as typeof fetch;
+
+    try {
+      const memory = createMemoryStore();
+      const provider = createProviderProfile({
+        stream: true,
+      });
+      const partials: string[] = [];
+      const invokeProvider = vi.fn(
+        async (args: {
+          profile: ProviderProfile;
+          apiKey: string;
+          input: ProviderInvocationInput;
+        }): Promise<ProviderInvocationResult> => {
+          void args.profile;
+          void args.apiKey;
+          return {
+            text: "Hello",
+            raw: {},
+          };
+        },
+      );
+
+      const runtime = new AgentRuntime(
+        {
+          resolveProviderProfile: async () => provider,
+          resolveApiKey: async () => "sk-test",
+          listEnabledMcpServers: async () => [],
+          listConversationSummaries: async () => [],
+          createMemoryStore: async () => memory,
+          invokeProvider,
+        },
+        "/tmp",
+      );
+
+      const result = await runtime.runTurn({
+        profile: createAgentProfile(),
+        userMessage: "Say hello",
+        history: [],
+        streamReply: {
+          onPartial: async (text: string) => {
+            partials.push(text);
+          },
+        },
+        context: {
+          workspaceId: "main",
+          conversationId: "conversation_1",
+          nowIso: "2026-01-01T00:00:00.000Z",
+          timezone: "UTC",
+          profileId: "agent_1",
+          runtime: createRuntime(),
+          searchSettings: createSearchSettings(),
+        },
+      });
+
+      expect(result.reply).toBe("Hello");
+      expect(partials).toEqual(["Hel", "Hello"]);
+      expect(invokeProvider).toHaveBeenCalledTimes(1);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("streams native final replies after tool loops complete", async () => {
+    global.fetch = vi.fn(async () => createSseResponse(["Final ", "answer"])) as typeof fetch;
+
+    try {
+      const memory = createMemoryStore();
+      memory.listToolDescriptors = vi.fn(() => [
+        {
+          id: "memory_search",
+          title: "Memory Search",
+          description: "Search saved memory.",
+          inputSchema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+          permissionScopes: [],
+          source: "builtin",
+        },
+      ]);
+      memory.executeTool = vi.fn(async () => ({ hits: ["result-1"] }));
+      const provider = createProviderProfile({
+        stream: true,
+      });
+      const partials: string[] = [];
+      const invokeProvider = vi.fn(
+        async (args: {
+          profile: ProviderProfile;
+          apiKey: string;
+          input: ProviderInvocationInput;
+        }): Promise<ProviderInvocationResult> => {
+          void args.profile;
+          void args.apiKey;
+          if (invokeProvider.mock.calls.length === 1) {
+            return {
+              text: "",
+              raw: {},
+              toolCalls: [
+                {
+                  id: "call_1",
+                  toolId: "memory_search",
+                  input: { query: "alpha" },
+                },
+              ],
+            };
+          }
+
+          return {
+            text: "unexpected",
+            raw: {},
+          };
+        },
+      );
+
+      const runtime = new AgentRuntime(
+        {
+          resolveProviderProfile: async () => provider,
+          resolveApiKey: async () => "sk-test",
+          listEnabledMcpServers: async () => [],
+          listConversationSummaries: async () => [],
+          createMemoryStore: async () => memory,
+          invokeProvider,
+        },
+        "/tmp",
+      );
+
+      const result = await runtime.runTurn({
+        profile: createAgentProfile({
+          maxPlanningSteps: 1,
+        }),
+        userMessage: "Find memory",
+        history: [],
+        streamReply: {
+          onPartial: async (text: string) => {
+            partials.push(text);
+          },
+        },
+        context: {
+          workspaceId: "main",
+          conversationId: "conversation_1",
+          nowIso: "2026-01-01T00:00:00.000Z",
+          timezone: "UTC",
+          profileId: "agent_1",
+          runtime: createRuntime(),
+          searchSettings: createSearchSettings(),
+        },
+      });
+
+      expect(result.reply).toBe("Final answer");
+      expect(result.toolRuns).toHaveLength(1);
+      expect(partials).toEqual(["Final ", "Final answer"]);
+      expect(invokeProvider).toHaveBeenCalledTimes(1);
+    } finally {
+      global.fetch = originalFetch;
+    }
   });
 
   it("enables native tool-calling path for gemini, openrouter, and bailian providers", async () => {
