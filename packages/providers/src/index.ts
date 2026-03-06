@@ -1,4 +1,4 @@
-import { AppError, assertNever } from "@pulsarbot/core";
+import { AppError, assertNever, createLogger } from "@pulsarbot/core";
 import {
   ProviderKindSchema,
   type ProviderKind,
@@ -87,6 +87,11 @@ export interface AgentProviderAdapter {
   parseResponse(payload: unknown): ProviderInvocationResult;
 }
 
+const logger = createLogger({ name: "providers" });
+const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
+const PROVIDER_MAX_RETRIES = 2;
+const PROVIDER_RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
+
 function defaultBaseUrl(kind: ProviderKind): string {
   switch (kind) {
     case "openai":
@@ -105,6 +110,14 @@ function defaultBaseUrl(kind: ProviderKind): string {
     default:
       return assertNever(kind);
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function providerRetryDelayMs(attempt: number): number {
+  return Math.min(250 * 2 ** attempt, 1_500);
 }
 
 function compactHeaders(headers: Record<string, string>): Record<string, string> {
@@ -784,17 +797,43 @@ function isOpenAiGpt5SeriesModel(model: string): boolean {
   return /^gpt-5([.-].+)?$/.test(normalized);
 }
 
+function isOpenAiReasoningModel(model: string): boolean {
+  const normalized = normalizeOpenAiModelId(model).trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (isOpenAiGpt5SeriesModel(normalized)) {
+    return true;
+  }
+  return /^(o1|o1-mini|o1-preview|o3|o3-mini|o3-pro|o4-mini)([.-].+)?$/.test(
+    normalized,
+  );
+}
+
+function shouldOmitSamplingOptions(
+  profile: ProviderProfile,
+  model: string | null | undefined,
+): boolean {
+  if (typeof model !== "string") {
+    return false;
+  }
+  if (
+    profile.kind !== "openai" &&
+    profile.kind !== "openai_compatible_chat" &&
+    profile.kind !== "openai_compatible_responses"
+  ) {
+    return false;
+  }
+  return isOpenAiReasoningModel(model);
+}
+
 function buildSamplingOptions(
   profile: ProviderProfile,
   options?: {
     model?: string | null | undefined;
   },
 ) {
-  if (
-    profile.kind === "openai" &&
-    typeof options?.model === "string" &&
-    isOpenAiGpt5SeriesModel(options.model)
-  ) {
+  if (shouldOmitSamplingOptions(profile, options?.model)) {
     return {};
   }
   return {
@@ -1064,6 +1103,122 @@ function readResponsePayload(response: Response): Promise<unknown> {
     return response.json();
   }
   return response.text();
+}
+
+function providerModelLabel(
+  preview: Pick<ProviderRequestPreview, "body">,
+  fallbackModel: string,
+): string {
+  const rawModel = preview.body.model;
+  return typeof rawModel === "string" && rawModel.trim()
+    ? rawModel
+    : fallbackModel;
+}
+
+function isRetryableProviderResponse(response: Response): boolean {
+  return PROVIDER_RETRYABLE_STATUS_CODES.has(response.status);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isRetryableProviderNetworkError(error: unknown): boolean {
+  if (isAbortLikeError(error)) {
+    return false;
+  }
+  if (error instanceof TypeError) {
+    return true;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return /fetch failed|network|socket|econnreset|enotfound|eai_again|timed out|timeout|und_err/i
+    .test(error.message);
+}
+
+async function performProviderFetch(args: {
+  profile: ProviderProfile;
+  url: string;
+  init: RequestInit;
+  model: string;
+}): Promise<Response> {
+  for (let attempt = 0; attempt <= PROVIDER_MAX_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROVIDER_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(args.url, {
+        ...args.init,
+        signal: controller.signal,
+      });
+
+      if (
+        !response.ok &&
+        isRetryableProviderResponse(response) &&
+        attempt < PROVIDER_MAX_RETRIES
+      ) {
+        const preview = await response.clone().text().catch(() => "");
+        logger.warn(
+          {
+            kind: args.profile.kind,
+            model: args.model,
+            status: response.status,
+            attempt: attempt + 1,
+            maxAttempts: PROVIDER_MAX_RETRIES + 1,
+            bodyPreview: preview.slice(0, 300),
+          },
+          "Retrying provider request after transient upstream response",
+        );
+        await sleep(providerRetryDelayMs(attempt));
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw new AppError(
+          "PROVIDER_REQUEST_TIMEOUT",
+          `Provider request timed out after ${PROVIDER_REQUEST_TIMEOUT_MS}ms (${args.profile.kind} ${args.model})`,
+          504,
+        );
+      }
+
+      if (
+        isRetryableProviderNetworkError(error) &&
+        attempt < PROVIDER_MAX_RETRIES
+      ) {
+        logger.warn(
+          {
+            kind: args.profile.kind,
+            model: args.model,
+            attempt: attempt + 1,
+            maxAttempts: PROVIDER_MAX_RETRIES + 1,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Retrying provider request after transient network failure",
+        );
+        await sleep(providerRetryDelayMs(attempt));
+        continue;
+      }
+
+      throw new AppError(
+        "PROVIDER_NETWORK_ERROR",
+        `Provider network request failed (${args.profile.kind} ${args.model} ${args.url}): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        502,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw new AppError(
+    "PROVIDER_NETWORK_ERROR",
+    `Provider network request failed (${args.profile.kind} ${args.model} ${args.url})`,
+    502,
+  );
 }
 
 async function* readSseEvents(
@@ -2262,17 +2417,29 @@ export async function invokeProvider(args: {
 }): Promise<ProviderInvocationResult> {
   const adapter = getProviderAdapter(args.profile.kind);
   const preview = adapter.buildRequest(args.profile, args.apiKey, args.input);
-  const response = await fetch(preview.url, {
-    method: "POST",
-    headers: preview.headers,
-    body: JSON.stringify(preview.body),
+  const model = providerModelLabel(
+    preview,
+    normalizeModelForProvider(
+      args.profile,
+      args.input.model ?? args.profile.defaultModel,
+    ),
+  );
+  const response = await performProviderFetch({
+    profile: args.profile,
+    url: preview.url,
+    model,
+    init: {
+      method: "POST",
+      headers: preview.headers,
+      body: JSON.stringify(preview.body),
+    },
   });
 
   if (!response.ok) {
     const text = await response.text();
     throw new AppError(
       "PROVIDER_REQUEST_FAILED",
-      `Provider request failed: ${response.status} ${text}`,
+      `Provider request failed (${args.profile.kind} ${model}): ${response.status} ${text}`,
       response.status,
     );
   }
@@ -2298,17 +2465,29 @@ export async function* invokeProviderStream(args: {
     profile: args.profile,
     preview: createProviderRequestPreview(args),
   });
-  const response = await fetch(preview.url, {
-    method: "POST",
-    headers: preview.headers,
-    body: JSON.stringify(preview.body),
+  const model = providerModelLabel(
+    preview,
+    normalizeModelForProvider(
+      args.profile,
+      args.input.model ?? args.profile.defaultModel,
+    ),
+  );
+  const response = await performProviderFetch({
+    profile: args.profile,
+    url: preview.url,
+    model,
+    init: {
+      method: "POST",
+      headers: preview.headers,
+      body: JSON.stringify(preview.body),
+    },
   });
 
   if (!response.ok) {
     const text = await response.text();
     throw new AppError(
       "PROVIDER_REQUEST_FAILED",
-      `Provider request failed: ${response.status} ${text}`,
+      `Provider request failed (${args.profile.kind} ${model}): ${response.status} ${text}`,
       response.status,
     );
   }

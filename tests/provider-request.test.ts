@@ -1,11 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createProviderMediaRequestPreview,
   createProviderRequestPreview,
   getProviderAdapter,
+  invokeProvider,
   supportsProviderCapability,
 } from "../packages/providers/src/index.js";
 import type { ProviderProfile } from "../packages/shared/src/index.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 function profile(
   kind: ProviderProfile["kind"],
@@ -89,6 +95,48 @@ describe("provider request preview", () => {
     expect(preview.body.model).toBe("gpt-5");
     expect("temperature" in preview.body).toBe(false);
     expect("top_p" in preview.body).toBe(false);
+  });
+
+  it("omits temperature and top_p for OpenAI reasoning models", () => {
+    const preview = createProviderRequestPreview({
+      profile: profile("openai", {
+        defaultModel: "o3-mini",
+        topP: 0.8,
+      }),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Hello" }],
+      },
+    });
+
+    expect(preview.body.model).toBe("o3-mini");
+    expect("temperature" in preview.body).toBe(false);
+    expect("top_p" in preview.body).toBe(false);
+  });
+
+  it("retries transient provider network failures", async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        output_text: "OK",
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await invokeProvider({
+      profile: profile("openai"),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Hello" }],
+      },
+    });
+
+    expect(result.text).toBe("OK");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("builds an Anthropic payload with thinking enabled", () => {

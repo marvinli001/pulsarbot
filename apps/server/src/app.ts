@@ -994,7 +994,7 @@ class RuntimeState {
     const workspace = await this.repository.getWorkspace();
     requireWorkspace(workspace);
     await this.ensureBailianMcpServersSynced();
-    return ResolvedRuntimeSnapshotSchema.parse(
+    const snapshot = ResolvedRuntimeSnapshotSchema.parse(
       resolveRuntimeSnapshot({
         workspaceId: workspace.id,
         profile,
@@ -1004,6 +1004,16 @@ class RuntimeState {
         mcpServers: await this.repository.listMcpServers(),
       }),
     );
+    if (snapshot.blocked.length > 0) {
+      logger.warn(
+        {
+          profileId: profile.id,
+          blocked: snapshot.blocked,
+        },
+        "Runtime resolved with blocked capabilities",
+      );
+    }
+    return snapshot;
   }
 
   public async setPendingCloudflare(credentials: CloudflareCredentials): Promise<void> {
@@ -3213,9 +3223,6 @@ export async function createApp(
         const turnId = createId("turn");
         const stateSnapshotId = createId("state");
         const fallbackText = normalizeInboundText(resolvedPayload.content);
-        const fallbackDeadlineAt = new Date(
-          Date.parse(startedAt) + 30_000,
-        ).toISOString();
 
         let turnState = TurnStateSchema.parse({
         id: stateSnapshotId,
@@ -3253,10 +3260,12 @@ export async function createApp(
         budgets: {
           maxPlanningSteps: 8,
           maxToolCalls: 6,
-          maxTurnDurationMs: 30_000,
+          maxTurnDurationMs: 60_000,
           stepsUsed: 0,
           toolCallsUsed: 0,
-          deadlineAt: fallbackDeadlineAt,
+          deadlineAt: new Date(
+            Date.parse(startedAt) + 60_000,
+          ).toISOString(),
         },
         toolResults: [],
         output: {
@@ -4639,9 +4648,9 @@ export async function createApp(
       maxPlanningSteps: body.maxPlanningSteps ?? existing?.maxPlanningSteps ?? 8,
       maxToolCalls: body.maxToolCalls ?? existing?.maxToolCalls ?? 6,
       maxTurnDurationMs:
-        body.maxTurnDurationMs ?? existing?.maxTurnDurationMs ?? 30_000,
+        body.maxTurnDurationMs ?? existing?.maxTurnDurationMs ?? 60_000,
       maxToolDurationMs:
-        body.maxToolDurationMs ?? existing?.maxToolDurationMs ?? 15_000,
+        body.maxToolDurationMs ?? existing?.maxToolDurationMs ?? 30_000,
       compactSoftThreshold:
         body.compactSoftThreshold ?? existing?.compactSoftThreshold ?? 0.7,
       compactHardThreshold:
@@ -5192,6 +5201,9 @@ export async function createApp(
     const jobs = await state.repository.listJobs();
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpServers = await state.repository.listMcpServers();
+    const workspace = await state.repository.getWorkspace();
+    const providerProfiles = await state.repository.listProviderProfiles();
+    const agentProfiles = await state.repository.listAgentProfiles();
     const allTurns = await state.repository.listConversationTurns({ limit: 200 });
     const runningTurns = allTurns.filter((turn) => turn.status === "running");
     const failedTurns = allTurns
@@ -5200,6 +5212,72 @@ export async function createApp(
       .slice(0, 5);
     const expectedWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env, request);
     const webhookInfo = await readTelegramWebhookInfo();
+    let runtimeDiagnostics: Record<string, unknown> | null = null;
+
+    if (workspace?.activeAgentProfileId) {
+      const activeProfile = agentProfiles.find((profile) =>
+        profile.id === workspace.activeAgentProfileId
+      );
+      if (!activeProfile) {
+        runtimeDiagnostics = {
+          activeProfileId: workspace.activeAgentProfileId,
+          error: "Active agent profile not found",
+        };
+      } else {
+        try {
+          const runtime = await state.resolveRuntime(activeProfile);
+          const tools = await state.agent.previewTools({
+            profile: activeProfile,
+            context: {
+              workspaceId: workspace.id,
+              conversationId: "__system_health__",
+              nowIso: nowIso(),
+              timezone: workspace.timezone,
+              profileId: activeProfile.id,
+              searchSettings: runtime.searchSettings,
+              runtime,
+            },
+          });
+          runtimeDiagnostics = {
+            activeProfile: {
+              id: activeProfile.id,
+              label: activeProfile.label,
+              maxPlanningSteps: activeProfile.maxPlanningSteps,
+              maxToolCalls: activeProfile.maxToolCalls,
+              maxTurnDurationMs: activeProfile.maxTurnDurationMs,
+              maxToolDurationMs: activeProfile.maxToolDurationMs,
+              effectiveMaxTurnDurationMs: Math.max(activeProfile.maxTurnDurationMs, 60_000),
+              effectiveMaxToolDurationMs: Math.max(activeProfile.maxToolDurationMs, 30_000),
+              allowNetworkTools: activeProfile.allowNetworkTools,
+              allowWriteTools: activeProfile.allowWriteTools,
+              allowMcpTools: activeProfile.allowMcpTools,
+            },
+            enabledSkills: runtime.enabledSkills,
+            enabledPlugins: runtime.enabledPlugins,
+            enabledMcpServers: runtime.enabledMcpServers,
+            blocked: runtime.blocked,
+            tools: tools.map((tool) => ({
+              id: tool.id,
+              title: tool.title,
+              source: tool.source,
+              permissionScopes: tool.permissionScopes,
+            })),
+            promptFragmentCount: runtime.promptFragments.length,
+            searchSettings: runtime.searchSettings,
+            generatedAt: runtime.generatedAt,
+          };
+        } catch (error) {
+          runtimeDiagnostics = {
+            activeProfile: {
+              id: activeProfile.id,
+              label: activeProfile.label,
+            },
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+    }
+
     return {
       time: nowIso(),
       mode: state.cloudflare ? "d1" : "bootstrap",
@@ -5210,9 +5288,10 @@ export async function createApp(
         webhookInfoError: webhookInfo.error,
       },
       bootstrapState: await state.repository.getBootstrapState(),
-      hasWorkspace: Boolean(await state.repository.getWorkspace()),
-      providerProfiles: (await state.repository.listProviderProfiles()).length,
+      hasWorkspace: Boolean(workspace),
+      providerProfiles: providerProfiles.length,
       mcpServers: mcpServers.length,
+      runtime: runtimeDiagnostics,
       activeTurnLocks: await state.listActiveConversationLocks(),
       graph: {
         enabled: true,

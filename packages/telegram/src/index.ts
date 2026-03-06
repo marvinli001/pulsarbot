@@ -331,7 +331,7 @@ export function buildForumTopicNameFromReply(replyText: string): string | null {
   if (!normalized) {
     return null;
   }
-  return Array.from(normalized).slice(0, 6).join("");
+  return Array.from(normalized).slice(0, 8).join("");
 }
 
 function createTopicKey(chatId: number, threadId: number): string {

@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
+  createLogger,
   createId,
   nowIso,
   sha256,
@@ -34,6 +35,8 @@ interface McpSession {
   tools: ToolDescriptor[];
   closed: boolean;
 }
+
+const logger = createLogger({ name: "mcp" });
 
 function compactStringRecord(
   input: Record<string, string | undefined>,
@@ -131,7 +134,22 @@ export class McpSupervisor {
         .map(async (config) => {
           try {
             return (await this.getSession(config, { refreshTools: true })).tools;
-          } catch {
+          } catch (error) {
+            const message = normalizeError(error);
+            this.recordLog(
+              config.id,
+              this.sessions.get(config.id)?.logs ?? [],
+              `tool discovery failed: ${message}`,
+            );
+            logger.error(
+              {
+                serverId: config.id,
+                label: config.label,
+                transport: config.transport,
+                error: message,
+              },
+              "Failed to list MCP tool descriptors",
+            );
             return [];
           }
         }),

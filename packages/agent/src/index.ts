@@ -190,7 +190,9 @@ export class AgentRuntime {
 
   public async runTurn(input: AgentTurnInput): Promise<AgentTurnResult> {
     const turnId = input.context.turnId ?? createId("turn");
-    const turnDeadlineAt = Date.now() + input.profile.maxTurnDurationMs;
+    const effectiveMaxTurnDurationMs = this.effectiveMaxTurnDurationMs(input.profile);
+    const effectiveMaxToolDurationMs = this.effectiveMaxToolDurationMs(input.profile);
+    const turnDeadlineAt = Date.now() + effectiveMaxTurnDurationMs;
     const memory = await this.services.createMemoryStore(input.context.workspaceId);
     const existingSummary = await this.loadLatestConversationSummary(
       input.context.conversationId,
@@ -257,7 +259,7 @@ export class AgentRuntime {
             input,
             providerInvoker,
           }),
-        this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+        this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
         "AGENT_SUMMARY_TIMEOUT",
         "Conversation compaction timed out",
       );
@@ -282,6 +284,7 @@ export class AgentRuntime {
       input.profile.systemPrompt,
       `Current time: ${input.context.nowIso} (${input.context.timezone})`,
       ...skillPrompts,
+      this.buildRuntimeCapabilitySummary(input.context, toolDescriptors),
       "Available tools:",
       ...toolDescriptors.map((tool) => `- ${tool.id}: ${tool.description}`),
       "Long-term memory:",
@@ -333,7 +336,7 @@ When enough information is available, respond directly with the user-facing answ
                   toolRuns.length >= input.profile.maxToolCalls ? "none" : "auto",
               },
             }),
-          this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+          this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
           "AGENT_PROVIDER_TIMEOUT",
           "Planner model timed out",
         );
@@ -378,7 +381,7 @@ When enough information is available, respond directly with the user-facing answ
                 builtinToolIds,
                 memoryToolIds,
               }),
-            this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+            this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
             "AGENT_TOOL_TIMEOUT",
             `Tool ${toolCall.toolId} timed out`,
           );
@@ -455,7 +458,7 @@ Rules:
                   jsonMode: true,
                 },
               }),
-            this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+            this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
             "AGENT_PROVIDER_TIMEOUT",
             "Planner model timed out",
           )
@@ -495,7 +498,7 @@ Rules:
               input,
               providerInvoker,
             }),
-          this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+          this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
           "AGENT_SUMMARY_TIMEOUT",
           "Conversation compaction timed out",
         );
@@ -529,7 +532,7 @@ Rules:
             builtinToolIds,
             memoryToolIds,
           }),
-        this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+        this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
         "AGENT_TOOL_TIMEOUT",
         `Tool ${action.toolId} timed out`,
       );
@@ -564,7 +567,7 @@ Rules:
                 toolChoice: "none",
               },
             }),
-          this.operationTimeoutMs(input.profile.maxToolDurationMs, turnDeadlineAt),
+          this.operationTimeoutMs(effectiveMaxToolDurationMs, turnDeadlineAt),
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         );
@@ -613,6 +616,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
         primaryApiKey,
         providerInvoker,
         messages: finalMessages,
+        maxOperationMs: effectiveMaxToolDurationMs,
         turnDeadlineAt,
       }),
       turnId,
@@ -790,6 +794,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
     primaryApiKey: string;
     providerInvoker: NonNullable<AgentExecutionServices["invokeProvider"]> | typeof invokeProvider;
     messages: ProviderInvocationInput["messages"];
+    maxOperationMs: number;
     turnDeadlineAt: number;
   }): Promise<string> {
     if (
@@ -807,10 +812,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
                 messages: args.messages,
               },
             }),
-          this.operationTimeoutMs(
-            args.input.profile.maxToolDurationMs,
-            args.turnDeadlineAt,
-          ),
+          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         )
@@ -829,10 +831,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
       while (true) {
         const next = await this.withOperationTimeout(
           () => iterator.next(),
-          this.operationTimeoutMs(
-            args.input.profile.maxToolDurationMs,
-            args.turnDeadlineAt,
-          ),
+          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         );
@@ -855,10 +854,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
                 messages: args.messages,
               },
             }),
-          this.operationTimeoutMs(
-            args.input.profile.maxToolDurationMs,
-            args.turnDeadlineAt,
-          ),
+          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         )
@@ -874,10 +870,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
                 messages: args.messages,
               },
             }),
-          this.operationTimeoutMs(
-            args.input.profile.maxToolDurationMs,
-            args.turnDeadlineAt,
-          ),
+          this.operationTimeoutMs(args.maxOperationMs, args.turnDeadlineAt),
           "AGENT_PROVIDER_TIMEOUT",
           "Final response generation timed out",
         )
@@ -891,6 +884,38 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
   ): number {
     const remainingTurnMs = Math.max(0, turnDeadlineAt - Date.now());
     return Math.min(maxOperationMs, remainingTurnMs);
+  }
+
+  private effectiveMaxTurnDurationMs(profile: AgentProfile): number {
+    return Math.max(profile.maxTurnDurationMs, 60_000);
+  }
+
+  private effectiveMaxToolDurationMs(profile: AgentProfile): number {
+    return Math.max(profile.maxToolDurationMs, 30_000);
+  }
+
+  private buildRuntimeCapabilitySummary(
+    context: AgentRuntimeContext,
+    toolDescriptors: ToolDescriptor[],
+  ): string {
+    const enabledSkills = context.runtime.enabledSkills.map((skill) => skill.id);
+    const enabledPlugins = context.runtime.enabledPlugins.map((plugin) => plugin.id);
+    const enabledMcpServers = context.runtime.enabledMcpServers.map((server) => server.label);
+    const blocked = context.runtime.blocked.map((item) =>
+      `${item.scope}:${item.id} (${item.reason})`
+    );
+
+    return [
+      "Runtime capability snapshot:",
+      `- Enabled skills: ${enabledSkills.join(", ") || "(none)"}`,
+      `- Enabled plugins: ${enabledPlugins.join(", ") || "(none)"}`,
+      `- Enabled MCP servers: ${enabledMcpServers.join(", ") || "(none)"}`,
+      `- Available tool ids right now: ${
+        toolDescriptors.map((tool) => tool.id).join(", ") || "(none)"
+      }`,
+      `- Blocked runtime references: ${blocked.join("; ") || "(none)"}`,
+      "If the user asks what you can do, answer from this runtime snapshot and do not claim disabled or missing tools.",
+    ].join("\n");
   }
 
   private async withOperationTimeout<T>(

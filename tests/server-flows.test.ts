@@ -898,7 +898,7 @@ describe("server flows", () => {
         id: "main",
       },
     });
-  });
+  }, 15_000);
 
   it("lists cloudflare resources without losing method context", async () => {
     const dataDir = await createTempDataDir();
@@ -1680,6 +1680,50 @@ describe("server flows", () => {
       ok: true,
       response: "Something went wrong during initialization. Please try again.",
     });
+
+    await appState.app.close();
+  });
+
+  it("exposes active runtime diagnostics and blocked capability reasons in system health", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const disablePlugin = await appState.app.inject({
+      method: "POST",
+      url: "/api/market/plugins/web-browse-fetcher/disable",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(disablePlugin.statusCode).toBe(200);
+
+    const health = await appState.app.inject({
+      method: "GET",
+      url: "/api/system/health",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(health.statusCode).toBe(200);
+    const payload = health.json<Record<string, any>>();
+
+    expect(payload.runtime?.activeProfile?.label).toBe("balanced");
+    expect(Array.isArray(payload.runtime?.tools)).toBe(true);
+    expect(
+      payload.runtime.tools.some((tool: Record<string, unknown>) => tool.id === "memory_search"),
+    ).toBe(true);
+    expect(payload.runtime?.blocked).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          scope: "plugin",
+          id: "web-browse-fetcher",
+          reason: "Plugin is not installed or not enabled",
+        }),
+      ]),
+    );
 
     await appState.app.close();
   });

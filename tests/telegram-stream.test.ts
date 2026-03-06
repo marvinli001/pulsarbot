@@ -125,9 +125,9 @@ describe("Telegram service message filters", () => {
   });
 
   it("builds forum topic name from assistant reply", () => {
-    expect(buildForumTopicNameFromReply("  hello\n\nworld  ")).toBe("hellow");
+    expect(buildForumTopicNameFromReply("  hello\n\nworld  ")).toBe("hellowor");
     expect(buildForumTopicNameFromReply("   ")).toBeNull();
-    expect(buildForumTopicNameFromReply("a".repeat(140))).toHaveLength(6);
+    expect(buildForumTopicNameFromReply("a".repeat(140))).toHaveLength(8);
   });
 
   it("renames implicit forum topic after the first threaded user message", async () => {
@@ -204,7 +204,7 @@ describe("Telegram service message filters", () => {
     });
     expect(editForumTopicSpy).toHaveBeenCalledTimes(1);
     expect(editForumTopicSpy).toHaveBeenCalledWith(42, 777, {
-      name: "TopicN",
+      name: "TopicNam",
     });
   });
 

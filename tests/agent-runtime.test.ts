@@ -298,6 +298,110 @@ describe("AgentRuntime", () => {
     expect(flattened).not.toContain("old assistant answer");
   });
 
+  it("injects the current runtime capability snapshot into the system prompt", async () => {
+    const memory = createMemoryStore();
+    const provider = createProviderProfile();
+    const providerCalls: ProviderInvocationInput[] = [];
+    const runtime = new AgentRuntime(
+      {
+        resolveProviderProfile: async () => provider,
+        resolveApiKey: async () => "sk-test",
+        listEnabledMcpServers: async () => [],
+        listConversationSummaries: async () => [],
+        createMemoryStore: async () => memory,
+        invokeProvider: vi.fn(
+          async (args: {
+            profile: ProviderProfile;
+            apiKey: string;
+            input: ProviderInvocationInput;
+          }): Promise<ProviderInvocationResult> => {
+            void args.profile;
+            void args.apiKey;
+            providerCalls.push(args.input);
+            return {
+              text: "done",
+              raw: {},
+            };
+          },
+        ),
+      },
+      "/tmp",
+    );
+
+    await runtime.runTurn({
+      profile: createAgentProfile({
+        enabledSkillIds: ["core-agent"],
+        enabledPluginIds: ["time-context", "native-google-search"],
+      }),
+      userMessage: "What can you do?",
+      history: [],
+      context: {
+        workspaceId: "main",
+        conversationId: "conversation_1",
+        nowIso: "2026-01-01T00:00:00.000Z",
+        timezone: "UTC",
+        profileId: "agent_1",
+        runtime: {
+          ...createRuntime(),
+          enabledSkills: [
+            {
+              id: "core-agent",
+              title: "Core Agent",
+              kind: "skill",
+              source: "market",
+              installId: "install_skill_1",
+              manifestId: "core-agent",
+            },
+          ],
+          enabledPlugins: [
+            {
+              id: "time-context",
+              title: "Time Context",
+              kind: "plugin",
+              source: "market",
+              installId: "install_plugin_1",
+              manifestId: "time-context",
+            },
+            {
+              id: "native-google-search",
+              title: "Google Search",
+              kind: "plugin",
+              source: "market",
+              installId: "install_plugin_2",
+              manifestId: "native-google-search",
+            },
+          ],
+          enabledMcpServers: [
+            {
+              id: "mcp-exa",
+              label: "Exa Search",
+              transport: "streamable_http",
+              source: "official",
+              manifestId: "exa-search",
+            },
+          ],
+          blocked: [
+            {
+              scope: "plugin",
+              id: "web-browse-fetcher",
+              reason: "Plugin is not installed or not enabled",
+            },
+          ],
+        },
+        searchSettings: createSearchSettings(),
+      },
+    });
+
+    const firstCall = providerCalls[0];
+    const systemPrompt = String(firstCall?.messages[0]?.content ?? "");
+    expect(systemPrompt).toContain("Runtime capability snapshot:");
+    expect(systemPrompt).toContain("Enabled skills: core-agent");
+    expect(systemPrompt).toContain("Enabled plugins: time-context, native-google-search");
+    expect(systemPrompt).toContain("Enabled MCP servers: Exa Search");
+    expect(systemPrompt).toContain("Blocked runtime references: plugin:web-browse-fetcher");
+    expect(systemPrompt).toContain("Available tool ids right now:");
+  });
+
   it("executes native tool calls and feeds tool results back to the provider", async () => {
     const memory = createMemoryStore();
     memory.listToolDescriptors = vi.fn(() => [
