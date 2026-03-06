@@ -147,6 +147,37 @@ function toolSourceFor(
   return "builtin";
 }
 
+function resultItemsFromSearchOutput(output: unknown): unknown[] | null {
+  if (!output || typeof output !== "object") {
+    return null;
+  }
+  const results = (output as { results?: unknown }).results;
+  return Array.isArray(results) ? results : null;
+}
+
+function resolveBrowseTarget(query: string): string | null {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  if (/\s/.test(trimmed)) {
+    return null;
+  }
+
+  try {
+    const url = new URL(`https://${trimmed}`);
+    if (!url.hostname.includes(".")) {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function supportsNativeToolCalling(provider: ProviderProfile): boolean {
   if (!provider.toolCallingEnabled) {
     return false;
@@ -963,6 +994,7 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
     const enabledPluginIds = new Set(
       args.input.context.runtime.enabledPlugins.map((plugin) => plugin.id),
     );
+    const browseTarget = resolveBrowseTarget(query);
 
     for (const provider of priority) {
       try {
@@ -972,9 +1004,11 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
             timezone: args.input.context.timezone,
             searchSettings: args.input.context.searchSettings,
           });
-          if (result && typeof result === "object" && Array.isArray((result as { results?: unknown[] }).results) && (result as { results?: unknown[] }).results?.length) {
+          const results = resultItemsFromSearchOutput(result);
+          if (results?.length) {
             return result;
           }
+          failures.push("google_native: empty results");
         }
 
         if (provider === "bing_native" && enabledPluginIds.has("native-bing-search")) {
@@ -983,9 +1017,11 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
             timezone: args.input.context.timezone,
             searchSettings: args.input.context.searchSettings,
           });
-          if (result && typeof result === "object" && Array.isArray((result as { results?: unknown[] }).results) && (result as { results?: unknown[] }).results?.length) {
+          const results = resultItemsFromSearchOutput(result);
+          if (results?.length) {
             return result;
           }
+          failures.push("bing_native: empty results");
         }
 
         if (provider === "exa_mcp") {
@@ -1008,8 +1044,8 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
           }
         }
 
-        if (provider === "web_browse" && /^https?:\/\//i.test(query) && enabledPluginIds.has("web-browse-fetcher")) {
-          return this.plugins.executeTool("web_browse", { url: query }, {
+        if (provider === "web_browse" && browseTarget && enabledPluginIds.has("web-browse-fetcher")) {
+          return this.plugins.executeTool("web_browse", { url: browseTarget }, {
             workspaceId: args.input.context.workspaceId,
             timezone: args.input.context.timezone,
             searchSettings: args.input.context.searchSettings,
@@ -1023,10 +1059,10 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
     if (
       args.input.context.searchSettings.fallbackStrategy === "browse_only" &&
       enabledPluginIds.has("web-browse-fetcher") &&
-      /^https?:\/\//i.test(query)
+      browseTarget
     ) {
       try {
-        return await this.plugins.executeTool("web_browse", { url: query }, {
+        return await this.plugins.executeTool("web_browse", { url: browseTarget }, {
           workspaceId: args.input.context.workspaceId,
           timezone: args.input.context.timezone,
           searchSettings: args.input.context.searchSettings,

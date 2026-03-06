@@ -35,6 +35,95 @@ function preferredResultCount(
   return Math.min(Math.max(Math.trunc(requested), 1), 10);
 }
 
+interface SearchResult {
+  title: string;
+  url: string;
+  snippet?: string;
+}
+
+async function fetchSearchHtml(url: string): Promise<string> {
+  const response = await fetch(url, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Search request failed: HTTP ${response.status}`);
+  }
+  return response.text();
+}
+
+function parseGoogleResults(html: string, maxResults: number): SearchResult[] {
+  const $ = load(html);
+  return $("a[href^='/url?q=']")
+    .slice(0, maxResults)
+    .toArray()
+    .map((element) => {
+      const href = $(element).attr("href") ?? "";
+      const title = compactWhitespace($(element).text());
+      const url = href.replace("/url?q=", "").split("&sa=")[0] ?? "";
+      return {
+        title,
+        url,
+      };
+    })
+    .filter((result) => result.title && result.url);
+}
+
+function parseBingResults(html: string, maxResults: number): SearchResult[] {
+  const $ = load(html);
+  return $("li.b_algo")
+    .slice(0, maxResults)
+    .toArray()
+    .map((element) => ({
+      title: compactWhitespace($(element).find("h2").text()),
+      url: $(element).find("h2 a").attr("href") ?? "",
+      snippet: compactWhitespace($(element).find("p").text()),
+    }))
+    .filter((result) => result.title && result.url);
+}
+
+function decodeDuckDuckGoUrl(rawUrl: string): string {
+  try {
+    const absolute = new URL(rawUrl, "https://html.duckduckgo.com");
+    const redirected = absolute.searchParams.get("uddg");
+    return redirected ? decodeURIComponent(redirected) : absolute.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
+  const $ = load(html);
+  return $("a.result__a")
+    .slice(0, maxResults)
+    .toArray()
+    .map((element) => {
+      const title = compactWhitespace($(element).text());
+      const url = decodeDuckDuckGoUrl($(element).attr("href") ?? "");
+      const snippet = compactWhitespace(
+        $(element).closest(".result").find(".result__snippet").text(),
+      );
+      return {
+        title,
+        url,
+        snippet,
+      };
+    })
+    .filter((result) => result.title && result.url);
+}
+
+async function fallbackDuckDuckGoSearch(
+  query: string,
+  maxResults: number,
+): Promise<SearchResult[]> {
+  const html = await fetchSearchHtml(
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+  );
+  return parseDuckDuckGoResults(html, maxResults);
+}
+
 const builtInTools: BuiltinToolDefinition[] = [
   {
     pluginId: "time-context",
@@ -72,31 +161,21 @@ const builtInTools: BuiltinToolDefinition[] = [
     async execute(input, context) {
       const query = String(input.query ?? "");
       const maxResults = preferredResultCount(input, context);
-      const response = await fetch(
+      const html = await fetchSearchHtml(
         `https://www.google.com/search?hl=en&q=${encodeURIComponent(query)}`,
-        {
-          headers: {
-            "user-agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          },
-        },
       );
-      const html = await response.text();
-      const $ = load(html);
-      const results = $("a[href^='/url?q=']")
-        .slice(0, maxResults)
-        .toArray()
-        .map((element) => {
-          const href = $(element).attr("href") ?? "";
-          const title = compactWhitespace($(element).text());
-          const url = href.replace("/url?q=", "").split("&sa=")[0];
-          return {
-            title,
-            url,
-          };
-        })
-        .filter((result) => result.title && result.url);
-      return { query, provider: "google_native", results };
+      const results = parseGoogleResults(html, maxResults);
+      if (results.length > 0) {
+        return { query, provider: "google_native", results };
+      }
+
+      const fallbackResults = await fallbackDuckDuckGoSearch(query, maxResults);
+      return {
+        query,
+        provider: "google_native",
+        upstream: "duckduckgo_html",
+        results: fallbackResults,
+      };
     },
   },
   {
@@ -118,27 +197,21 @@ const builtInTools: BuiltinToolDefinition[] = [
     async execute(input, context) {
       const query = String(input.query ?? "");
       const maxResults = preferredResultCount(input, context);
-      const response = await fetch(
+      const html = await fetchSearchHtml(
         `https://www.bing.com/search?q=${encodeURIComponent(query)}`,
-        {
-          headers: {
-            "user-agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          },
-        },
       );
-      const html = await response.text();
-      const $ = load(html);
-      const results = $("li.b_algo")
-        .slice(0, maxResults)
-        .toArray()
-        .map((element) => ({
-          title: compactWhitespace($(element).find("h2").text()),
-          url: $(element).find("h2 a").attr("href") ?? "",
-          snippet: compactWhitespace($(element).find("p").text()),
-        }))
-        .filter((result) => result.title && result.url);
-      return { query, provider: "bing_native", results };
+      const results = parseBingResults(html, maxResults);
+      if (results.length > 0) {
+        return { query, provider: "bing_native", results };
+      }
+
+      const fallbackResults = await fallbackDuckDuckGoSearch(query, maxResults);
+      return {
+        query,
+        provider: "bing_native",
+        upstream: "duckduckgo_html",
+        results: fallbackResults,
+      };
     },
   },
   {

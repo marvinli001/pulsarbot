@@ -13,6 +13,8 @@ import type {
   ProviderInvocationResult,
 } from "../packages/providers/src/index.js";
 
+const originalFetch = global.fetch;
+
 function createSearchSettings(): SearchSettings {
   return {
     id: "main",
@@ -585,6 +587,138 @@ describe("AgentRuntime", () => {
         ]),
       );
       expect(firstCallInput?.toolChoice).toBe("auto");
+    }
+  });
+
+  it("falls back to browsing bare domains when search providers return empty results", async () => {
+    global.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("https://www.google.com/search?")) {
+        return new Response(
+          "<html><head><title>Google Search</title></head><body>Please click here.</body></html>",
+          {
+            status: 200,
+            headers: { "content-type": "text/html; charset=UTF-8" },
+          },
+        );
+      }
+
+      if (url === "https://html.duckduckgo.com/html/?q=coserlab.io") {
+        return new Response("<html><body></body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html; charset=UTF-8" },
+        });
+      }
+
+      if (url === "https://coserlab.io/") {
+        return new Response(
+          "<html><head><title>CoserLab</title></head><body><article>Official site</article></body></html>",
+          {
+            status: 200,
+            headers: { "content-type": "text/html; charset=UTF-8" },
+          },
+        );
+      }
+
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      const memory = createMemoryStore();
+      const provider = createProviderProfile();
+      const invokeProvider = vi.fn(
+        async (args: {
+          profile: ProviderProfile;
+          apiKey: string;
+          input: ProviderInvocationInput;
+        }): Promise<ProviderInvocationResult> => {
+          void args.profile;
+          void args.apiKey;
+          if (invokeProvider.mock.calls.length === 1) {
+            return {
+              text: "",
+              raw: {},
+              toolCalls: [
+                {
+                  id: "call_search",
+                  toolId: "search_web",
+                  input: { query: "coserlab.io" },
+                },
+              ],
+            };
+          }
+
+          return {
+            text: "final answer",
+            raw: {},
+          };
+        },
+      );
+
+      const runtime = new AgentRuntime(
+        {
+          resolveProviderProfile: async () => provider,
+          resolveApiKey: async () => "sk-test",
+          listEnabledMcpServers: async () => [],
+          listConversationSummaries: async () => [],
+          createMemoryStore: async () => memory,
+          invokeProvider,
+        },
+        "/tmp",
+      );
+
+      const result = await runtime.runTurn({
+        profile: createAgentProfile({
+          enabledPluginIds: ["native-google-search", "web-browse-fetcher"],
+        }),
+        userMessage: "Tell me about coserlab.io",
+        history: [],
+        context: {
+          workspaceId: "main",
+          conversationId: "conversation_1",
+          nowIso: "2026-01-01T00:00:00.000Z",
+          timezone: "UTC",
+          profileId: "agent_1",
+          runtime: {
+            ...createRuntime(),
+            enabledPlugins: [
+              {
+                id: "native-google-search",
+                title: "Google Search",
+                kind: "plugin",
+                source: "market",
+                installId: "install_plugin_google",
+                manifestId: "native-google-search",
+              },
+              {
+                id: "web-browse-fetcher",
+                title: "Web Browse",
+                kind: "plugin",
+                source: "market",
+                installId: "install_plugin_browse",
+                manifestId: "web-browse-fetcher",
+              },
+            ],
+          },
+          searchSettings: {
+            ...createSearchSettings(),
+            providerPriority: ["google_native", "web_browse"],
+          },
+        },
+      });
+
+      expect(result.reply).toBe("final answer");
+      expect(result.toolRuns).toEqual([
+        expect.objectContaining({
+          toolId: "search_web",
+          output: expect.objectContaining({
+            url: "https://coserlab.io/",
+            title: "CoserLab",
+          }),
+        }),
+      ]);
+    } finally {
+      global.fetch = originalFetch;
     }
   });
 });
