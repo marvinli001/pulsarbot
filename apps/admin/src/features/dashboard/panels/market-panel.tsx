@@ -42,7 +42,9 @@ export function MarketPanel({ kind }: { kind: "skills" | "plugins" | "mcp" }) {
   return (
     <Panel
       title={kind === "mcp" ? "MCP Market" : `${kind[0]?.toUpperCase() ?? ""}${kind.slice(1)} Market`}
-      subtitle="仓库内官方 manifest 池，支持 install / uninstall / enable / disable。"
+      subtitle={kind === "mcp"
+        ? "官方 MCP manifest 池。启用后仍需要在 MCP Servers 中查看/同步实例，并在 Profiles 中勾选要暴露给 agent 的 server。"
+        : "仓库内官方 manifest 池，支持 install / uninstall / enable / disable。"}
       actions={<MutationBadge mutation={actionMutation} successLabel="Market Updated" />}
     >
       <div className="space-y-3">
@@ -51,6 +53,18 @@ export function MarketPanel({ kind }: { kind: "skills" | "plugins" | "mcp" }) {
           const install = installs.find((item) => item.manifestId === manifestId);
           const installed = Boolean(install);
           const enabled = Boolean(install?.enabled);
+          const configSchema =
+            manifest.configSchema && typeof manifest.configSchema === "object"
+              ? manifest.configSchema as Record<string, unknown>
+              : {};
+          const authConfig =
+            configSchema.auth && typeof configSchema.auth === "object"
+              ? configSchema.auth as Record<string, unknown>
+              : {};
+          const configNote =
+            typeof authConfig.note === "string" && authConfig.note.trim().length > 0
+              ? authConfig.note.trim()
+              : null;
 
           return (
             <div key={manifestId} className="rounded-2xl border border-slate-200 p-4">
@@ -71,6 +85,11 @@ export function MarketPanel({ kind }: { kind: "skills" | "plugins" | "mcp" }) {
                   <p className="text-xs text-slate-500">
                     Dependencies: {Array.isArray(manifest.dependencies) ? manifest.dependencies.join(", ") || "None" : "None"}
                   </p>
+                  {configNote ? (
+                    <p className="text-xs text-slate-500">
+                      Auth: {configNote}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {!installed ? (

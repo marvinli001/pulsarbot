@@ -146,7 +146,7 @@ export function McpServersPanel() {
 
   return (
     <div className="grid gap-6 xl:grid-cols-[1.05fr,0.95fr]">
-      <Panel title="Configured MCP Servers" subtitle="支持 stdio / streamable_http、自定义 env refs、headers、healthcheck、tools 和 logs。">
+      <Panel title="Configured MCP Servers" subtitle="支持 stdio / streamable_http、自定义 env refs、headers、healthcheck、tools 和 logs。已启用的 Alibaba Bailian manifest 会在这里自动同步市场里的 MCP 实例。">
         <div className="space-y-3">
           {servers.data?.map((server) => (
             <div key={String(server.id)} className="rounded-2xl border border-slate-200 p-4">

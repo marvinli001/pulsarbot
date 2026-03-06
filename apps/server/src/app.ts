@@ -166,6 +166,74 @@ function firstStringField(
   return null;
 }
 
+function firstStringFieldDeep(
+  record: Record<string, unknown>,
+  keys: string[],
+  maxDepth = 2,
+): string | null {
+  const seen = new Set<unknown>();
+  const queue: Array<{ value: unknown; depth: number }> = [{ value: record, depth: 0 }];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || !current.value || typeof current.value !== "object") {
+      continue;
+    }
+    if (seen.has(current.value)) {
+      continue;
+    }
+    seen.add(current.value);
+
+    const currentRecord = current.value as Record<string, unknown>;
+    const direct = firstStringField(currentRecord, keys);
+    if (direct) {
+      return direct;
+    }
+
+    if (current.depth >= maxDepth) {
+      continue;
+    }
+
+    for (const nested of Object.values(currentRecord)) {
+      if (nested && typeof nested === "object") {
+        queue.push({ value: nested, depth: current.depth + 1 });
+      }
+    }
+  }
+
+  return null;
+}
+
+const SECRET_TEMPLATE_PATTERN = /\{\{secret:([^}]+)\}\}/g;
+
+export async function resolveSecretTemplateString(
+  value: string,
+  resolveSecret: (scope: string) => Promise<string | null>,
+): Promise<string> {
+  const matches = [...value.matchAll(SECRET_TEMPLATE_PATTERN)];
+  if (matches.length === 0) {
+    const exact = await resolveSecret(value);
+    return exact ?? value;
+  }
+
+  const replacements = await Promise.all(
+    matches.map(async (match) => {
+      const scope = match[1]?.trim() ?? "";
+      if (!scope) {
+        return [match[0], match[0]] as const;
+      }
+      const secret = await resolveSecret(scope);
+      return [match[0], secret ?? match[0]] as const;
+    }),
+  );
+
+  let output = value;
+  for (const [needle, replacement] of replacements) {
+    output = output.replace(needle, replacement);
+  }
+  return output;
+}
+
 function toBooleanLike(value: unknown): boolean | null {
   if (typeof value === "boolean") {
     return value;
@@ -222,8 +290,11 @@ function collectBailianMcpRecords(
     ]),
   );
   const hasStreamableUrl = Boolean(
-    firstStringField(record, [
+    firstStringFieldDeep(record, [
       "url",
+      "mcp",
+      "mcpUrl",
+      "mcp_url",
       "sseUrl",
       "sse_url",
       "streamableHttpUrl",
@@ -247,12 +318,41 @@ function collectBailianMcpRecords(
   }
 }
 
-function bailianServerCodeFromUrl(url: string): string | null {
-  const match = /\/api\/v1\/mcps\/([^/?#]+)\/sse/i.exec(url);
+export function bailianServerCodeFromUrl(url: string): string | null {
+  const match = /\/api\/v1\/mcps\/([^/?#]+)\/(?:sse|mcp)(?:[/?#]|$)/i.exec(url);
   if (!match?.[1]) {
     return null;
   }
   return decodeURIComponent(match[1]);
+}
+
+function buildBailianMcpHeaders(apiKeyRef: string): Record<string, string> {
+  return {
+    Authorization: `Bearer {{secret:${apiKeyRef}}}`,
+    api_key: `{{secret:${apiKeyRef}}}`,
+  };
+}
+
+export function resolveBailianMcpEndpointUrl(
+  record: Record<string, unknown>,
+  origin: string,
+  serverCode: string,
+): string {
+  const explicitUrl = firstStringFieldDeep(record, [
+    "url",
+    "mcp",
+    "mcpUrl",
+    "mcp_url",
+    "sseUrl",
+    "sse_url",
+    "streamableHttpUrl",
+    "streamable_http_url",
+    "endpoint",
+  ]);
+  if (explicitUrl?.startsWith("/")) {
+    return new URL(explicitUrl, origin).toString();
+  }
+  return explicitUrl ?? `${origin}/api/v1/mcps/${encodeURIComponent(serverCode)}/mcp`;
 }
 
 function bailianServerId(serverCode: string): string {
@@ -333,6 +433,18 @@ interface TelegramWebhookInfo {
 interface ActiveTurnQueueItem {
   promise: Promise<void>;
   resolve: () => void;
+}
+
+interface BailianMcpSyncStatus {
+  status: "idle" | "ok" | "error" | "skipped";
+  reason: string | null;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  endpoint: string | null;
+  providerId: string | null;
+  manifestEnabled: boolean | null;
+  discoveredServers: number;
+  syncedServers: number;
 }
 
 function normalizePublicBaseUrl(input: string | undefined): string | null {
@@ -517,6 +629,17 @@ class RuntimeState {
   private bailianMcpSyncPromise: Promise<void> | null = null;
   private bailianMcpLastSyncAtMs = 0;
   private readonly bailianMcpSyncIntervalMs = 120_000;
+  private bailianMcpSyncStatus: BailianMcpSyncStatus = {
+    status: "idle",
+    reason: null,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    endpoint: null,
+    providerId: null,
+    manifestEnabled: null,
+    discoveredServers: 0,
+    syncedServers: 0,
+  };
 
   public constructor(
     public readonly env = loadEnv(),
@@ -603,7 +726,7 @@ class RuntimeState {
   private async fetchBailianMcpMarketServers(args: {
     profile: ProviderProfile;
     apiKey: string;
-  }): Promise<McpServerConfig[]> {
+  }): Promise<{ servers: McpServerConfig[]; endpoint: string | null }> {
     const fallbackBaseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1";
     const origin = resolveBailianOrigin(args.profile.apiBaseUrl || fallbackBaseUrl);
     const endpointCandidates = [
@@ -659,14 +782,6 @@ class RuntimeState {
       let activationSignals = 0;
 
       for (const record of candidateRecords) {
-        const explicitUrl = firstStringField(record, [
-          "url",
-          "sseUrl",
-          "sse_url",
-          "streamableHttpUrl",
-          "streamable_http_url",
-          "endpoint",
-        ]);
         const serverCode =
           firstStringField(record, [
             "serverCode",
@@ -677,7 +792,20 @@ class RuntimeState {
           (typeof record.code === "string" && firstStringField(record, ["serverName", "name", "title"])
             ? record.code.trim()
             : null) ??
-          (explicitUrl ? bailianServerCodeFromUrl(explicitUrl) : null);
+          (() => {
+            const resolvedUrl = firstStringFieldDeep(record, [
+              "url",
+              "mcp",
+              "mcpUrl",
+              "mcp_url",
+              "sseUrl",
+              "sse_url",
+              "streamableHttpUrl",
+              "streamable_http_url",
+              "endpoint",
+            ]);
+            return resolvedUrl ? bailianServerCodeFromUrl(resolvedUrl) : null;
+          })();
         if (!serverCode) {
           continue;
         }
@@ -704,9 +832,7 @@ class RuntimeState {
           "desc",
           "summary",
         ]) ?? "Synced from Alibaba Bailian MCP Market.";
-        const resolvedUrl = explicitUrl?.startsWith("/")
-          ? new URL(explicitUrl, origin).toString()
-          : explicitUrl ?? `${origin}/api/v1/mcps/${encodeURIComponent(serverCode)}/sse`;
+        const resolvedUrl = resolveBailianMcpEndpointUrl(record, origin, serverCode);
 
         entries.set(serverCode, {
           serverCode,
@@ -726,54 +852,104 @@ class RuntimeState {
       }
 
       const timestamp = nowIso();
-      return parsedEntries.map((entry) =>
-        McpServerConfigSchema.parse({
-          id: bailianServerId(entry.serverCode),
-          label: entry.label,
-          description: `${entry.description}\n\nSynced from Alibaba Bailian MCP Market.`,
-          manifestId: null,
-          transport: "streamable_http",
-          url: entry.url,
-          envRefs: {},
-          headers: {
-            Authorization: args.profile.apiKeyRef,
-          },
-          restartPolicy: "on-failure",
-          toolCache: {},
-          lastHealthStatus: "unknown",
-          lastHealthCheckedAt: null,
-          enabled: true,
-          source: "bailian_market",
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        })
-      );
+      return {
+        endpoint,
+        servers: parsedEntries.map((entry) =>
+          McpServerConfigSchema.parse({
+            id: bailianServerId(entry.serverCode),
+            label: entry.label,
+            description: `${entry.description}\n\nSynced from Alibaba Bailian MCP Market.`,
+            manifestId: "alibaba-bailian",
+            transport: "streamable_http",
+            url: entry.url,
+            envRefs: {},
+            headers: buildBailianMcpHeaders(args.profile.apiKeyRef),
+            restartPolicy: "on-failure",
+            toolCache: {},
+            lastHealthStatus: "unknown",
+            lastHealthCheckedAt: null,
+            enabled: true,
+            source: "bailian_market",
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          })
+        ),
+      };
     }
 
-    return [];
+    return { servers: [], endpoint: endpointCandidates[0] ?? null };
   }
 
   private async syncBailianMcpServersFromProvider(): Promise<void> {
+    const attemptAt = nowIso();
+    const mcpInstalls = await this.repository.listInstallRecords("mcp");
+    const bailianInstallEnabled = mcpInstalls.some((install) =>
+      install.manifestId === "alibaba-bailian" && install.enabled
+    );
+    this.bailianMcpSyncStatus = {
+      ...this.bailianMcpSyncStatus,
+      lastAttemptAt: attemptAt,
+      manifestEnabled: bailianInstallEnabled,
+      discoveredServers: 0,
+      syncedServers: 0,
+      endpoint: null,
+      reason: null,
+    };
+    if (!bailianInstallEnabled) {
+      this.bailianMcpSyncStatus = {
+        ...this.bailianMcpSyncStatus,
+        status: "skipped",
+        reason: "Alibaba Bailian MCP manifest is not enabled",
+        providerId: null,
+      };
+      return;
+    }
+
     const providerProfiles = await this.repository.listProviderProfiles();
     const bailianProvider = providerProfiles.find((provider) =>
       provider.kind === "bailian" && provider.enabled
     );
     if (!bailianProvider) {
+      this.bailianMcpSyncStatus = {
+        ...this.bailianMcpSyncStatus,
+        status: "skipped",
+        reason: "Enabled Bailian provider not found",
+        providerId: null,
+      };
       return;
     }
+    this.bailianMcpSyncStatus = {
+      ...this.bailianMcpSyncStatus,
+      providerId: bailianProvider.id,
+    };
 
     let apiKey: string;
     try {
       apiKey = await this.resolveApiKey(bailianProvider.apiKeyRef);
-    } catch {
+    } catch (error) {
+      this.bailianMcpSyncStatus = {
+        ...this.bailianMcpSyncStatus,
+        status: "error",
+        reason: error instanceof Error ? error.message : "Bailian provider API key is missing",
+      };
       return;
     }
 
-    const syncedServers = await this.fetchBailianMcpMarketServers({
+    const result = await this.fetchBailianMcpMarketServers({
       profile: bailianProvider,
       apiKey,
     });
-    if (syncedServers.length === 0) {
+    this.bailianMcpSyncStatus = {
+      ...this.bailianMcpSyncStatus,
+      endpoint: result.endpoint,
+      discoveredServers: result.servers.length,
+    };
+    if (result.servers.length === 0) {
+      this.bailianMcpSyncStatus = {
+        ...this.bailianMcpSyncStatus,
+        status: "skipped",
+        reason: "No activated Bailian MCP servers were returned",
+      };
       return;
     }
 
@@ -782,7 +958,7 @@ class RuntimeState {
     const syncedIds = new Set<string>();
     const timestamp = nowIso();
 
-    for (const server of syncedServers) {
+    for (const server of result.servers) {
       syncedIds.add(server.id);
       const existing = existingById.get(server.id);
       await this.repository.saveMcpServer(
@@ -813,6 +989,14 @@ class RuntimeState {
         updatedAt: timestamp,
       });
     }
+
+    this.bailianMcpSyncStatus = {
+      ...this.bailianMcpSyncStatus,
+      status: "ok",
+      reason: null,
+      lastSuccessAt: timestamp,
+      syncedServers: result.servers.length,
+    };
   }
 
   public async ensureBailianMcpServersSynced(
@@ -835,6 +1019,11 @@ class RuntimeState {
 
     this.bailianMcpSyncPromise = this.syncBailianMcpServersFromProvider()
       .catch((error) => {
+        this.bailianMcpSyncStatus = {
+          ...this.bailianMcpSyncStatus,
+          status: "error",
+          reason: error instanceof Error ? error.message : String(error),
+        };
         logger.warn(
           {
             reason: error instanceof Error ? error.message : String(error),
@@ -866,10 +1055,10 @@ class RuntimeState {
       return server;
     }
 
-    const resolveValue = async (value: string) => {
-      const secret = await this.repository.getSecretByScope(workspace.id, value);
+    const resolveSecretValue = async (scope: string) => {
+      const secret = await this.repository.getSecretByScope(workspace.id, scope);
       if (!secret) {
-        return value;
+        return null;
       }
       try {
         return decryptSecret({
@@ -878,14 +1067,17 @@ class RuntimeState {
           envelope: secret,
         });
       } catch {
-        return value;
+        return null;
       }
     };
 
     const resolveStringRecord = async (record: Record<string, string>) =>
       Object.fromEntries(
         await Promise.all(
-          Object.entries(record).map(async ([key, value]) => [key, await resolveValue(value)]),
+          Object.entries(record).map(async ([key, value]) => [
+            key,
+            await resolveSecretTemplateString(value, resolveSecretValue),
+          ]),
         ),
       );
 
@@ -894,6 +1086,10 @@ class RuntimeState {
       envRefs: await resolveStringRecord(server.envRefs),
       headers: await resolveStringRecord(server.headers),
     };
+  }
+
+  public getBailianMcpSyncStatus(): BailianMcpSyncStatus {
+    return { ...this.bailianMcpSyncStatus };
   }
 
   public async runProvider(args: {
@@ -5198,6 +5394,7 @@ export async function createApp(
   );
 
   app.get("/api/system/health", { preHandler: requireOwner }, async (request) => {
+    await state.ensureBailianMcpServersSynced();
     const jobs = await state.repository.listJobs();
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpServers = await state.repository.listMcpServers();
@@ -5319,6 +5516,7 @@ export async function createApp(
           String(right.lastHealthCheckedAt).localeCompare(String(left.lastHealthCheckedAt))
         )
         .slice(0, 5),
+      bailianMcpSync: state.getBailianMcpSyncStatus(),
       marketCounts: {
         skills: state.catalog.skills.length,
         plugins: state.catalog.plugins.length,

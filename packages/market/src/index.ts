@@ -237,13 +237,15 @@ export function resolveRuntimeSnapshot(args: {
       });
       return [];
     }
-    if (server.source === "official" && server.manifestId) {
+    if (server.manifestId) {
       const manifest = mcpManifests.get(server.manifestId);
       if (!manifest) {
         blocked.push({
           scope: "mcp",
           id,
-          reason: "Official MCP manifest not found",
+          reason: server.source === "official"
+            ? "Official MCP manifest not found"
+            : "Linked MCP manifest not found",
         });
         return [];
       }
@@ -251,7 +253,9 @@ export function resolveRuntimeSnapshot(args: {
         blocked.push({
           scope: "mcp",
           id,
-          reason: "Official MCP manifest is not installed or not enabled",
+          reason: server.source === "official"
+            ? "Official MCP manifest is not installed or not enabled"
+            : "Linked MCP manifest is not installed or not enabled",
         });
         return [];
       }

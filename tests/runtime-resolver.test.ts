@@ -91,6 +91,32 @@ function createOfficialMcpServer(): McpServerConfig {
   };
 }
 
+function createBailianSyncedServer(): McpServerConfig {
+  const timestamp = new Date().toISOString();
+  return {
+    id: "mcp_bailian_weather",
+    label: "Bailian Weather",
+    description: "",
+    manifestId: "alibaba-bailian",
+    transport: "streamable_http",
+    url: "https://dashscope.aliyuncs.com/api/v1/mcps/weather/mcp",
+    args: [],
+    envRefs: {},
+    headers: {
+      Authorization: "Bearer {{secret:provider:bailian:apiKey}}",
+      api_key: "{{secret:provider:bailian:apiKey}}",
+    },
+    restartPolicy: "on-failure",
+    toolCache: {},
+    lastHealthStatus: "unknown",
+    lastHealthCheckedAt: null,
+    enabled: true,
+    source: "bailian_market",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
 describe("runtime resolver", () => {
   it("resolves enabled skills and plugins from installed manifests only", async () => {
     const catalog = await loadMarketCatalog(path.resolve(process.cwd(), "market"));
@@ -175,6 +201,59 @@ describe("runtime resolver", () => {
       expect.objectContaining({
         id: "mcp-exa",
         manifestId: "exa-search",
+      }),
+    ]);
+  });
+
+  it("gates Bailian-synced MCP servers on the linked market manifest", async () => {
+    const catalog = await loadMarketCatalog(path.resolve(process.cwd(), "market"));
+    const installs = createDefaultInstallRecords(catalog);
+    setInstallEnabled(installs, "skills", "core-agent", true);
+    setInstallEnabled(installs, "skills", "memory-core", true);
+    setInstallEnabled(installs, "mcp", "alibaba-bailian", false);
+
+    const blockedSnapshot = resolveRuntimeSnapshot({
+      workspaceId: "main",
+      profile: createProfile({
+        enabledPluginIds: [],
+        enabledMcpServerIds: ["mcp_bailian_weather"],
+      }),
+      searchSettings: createSearchSettings(),
+      catalog,
+      installs,
+      mcpServers: [createBailianSyncedServer()],
+    });
+
+    expect(blockedSnapshot.enabledMcpServers).toEqual([]);
+    expect(blockedSnapshot.blocked).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          scope: "mcp",
+          id: "mcp_bailian_weather",
+          reason: "Linked MCP manifest is not installed or not enabled",
+        }),
+      ]),
+    );
+
+    setInstallEnabled(installs, "mcp", "alibaba-bailian", true);
+
+    const enabledSnapshot = resolveRuntimeSnapshot({
+      workspaceId: "main",
+      profile: createProfile({
+        enabledPluginIds: [],
+        enabledMcpServerIds: ["mcp_bailian_weather"],
+      }),
+      searchSettings: createSearchSettings(),
+      catalog,
+      installs,
+      mcpServers: [createBailianSyncedServer()],
+    });
+
+    expect(enabledSnapshot.enabledMcpServers).toEqual([
+      expect.objectContaining({
+        id: "mcp_bailian_weather",
+        manifestId: "alibaba-bailian",
+        source: "bailian_market",
       }),
     ]);
   });
