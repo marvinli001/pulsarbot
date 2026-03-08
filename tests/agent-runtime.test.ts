@@ -367,6 +367,57 @@ describe("AgentRuntime", () => {
     expect(seenTimeouts[0]).toBe(45_000);
   });
 
+  it("uses a longer planner timeout floor than the generic tool timeout", async () => {
+    const memory = createMemoryStore();
+    const provider = createProviderProfile();
+    const seenTimeouts: number[] = [];
+    const runtime = new AgentRuntime(
+      {
+        resolveProviderProfile: async () => provider,
+        resolveApiKey: async () => "sk-test",
+        listEnabledMcpServers: async () => [],
+        listConversationSummaries: async () => [],
+        createMemoryStore: async () => memory,
+        invokeProvider: vi.fn(
+          async (args: {
+            profile: ProviderProfile;
+            apiKey: string;
+            input: ProviderInvocationInput;
+            timeoutMs?: number;
+          }): Promise<ProviderInvocationResult> => {
+            void args.profile;
+            void args.apiKey;
+            seenTimeouts.push(args.timeoutMs ?? 0);
+            return {
+              text: "done",
+              raw: {},
+            };
+          },
+        ),
+      },
+      "/tmp",
+    );
+
+    await runtime.runTurn({
+      profile: createAgentProfile({
+        maxToolDurationMs: 30_000,
+      }),
+      userMessage: "Hello",
+      history: [],
+      context: {
+        workspaceId: "main",
+        conversationId: "conversation_1",
+        nowIso: "2026-01-01T00:00:00.000Z",
+        timezone: "UTC",
+        profileId: "agent_1",
+        runtime: createRuntime(),
+        searchSettings: createSearchSettings(),
+      },
+    });
+
+    expect(seenTimeouts[0]).toBe(45_000);
+  });
+
   it("injects the current runtime capability snapshot into the system prompt", async () => {
     const memory = createMemoryStore();
     const provider = createProviderProfile();

@@ -758,6 +758,88 @@ async function upsertPrimaryProviderApiKey(
   return String(primary.id);
 }
 
+async function createProviderRecord(
+  app: Awaited<ReturnType<typeof bootstrapApp>>["app"],
+  cookie: string,
+  overrides: Record<string, unknown> = {},
+) {
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/providers",
+    headers: {
+      cookie,
+    },
+    payload: {
+      label: "Primary Provider",
+      kind: "openai",
+      apiBaseUrl: "https://api.openai.com/v1",
+      defaultModel: "gpt-4.1-mini",
+      stream: true,
+      ...overrides,
+    },
+  });
+  expect(created.statusCode).toBe(200);
+  return created.json<Record<string, any>>();
+}
+
+async function createAgentProfileRecord(
+  app: Awaited<ReturnType<typeof bootstrapApp>>["app"],
+  cookie: string,
+  overrides: Record<string, unknown> = {},
+) {
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/agent-profiles",
+    headers: {
+      cookie,
+    },
+    payload: {
+      label: "balanced",
+      description: "Default interactive Telegram profile.",
+      systemPrompt:
+        "You are Pulsarbot, a Telegram-native personal agent with tools, memory, and concise answers.",
+      primaryModelProfileId: "missing-provider",
+      backgroundModelProfileId: null,
+      embeddingModelProfileId: null,
+      enabledSkillIds: [],
+      enabledPluginIds: [],
+      enabledMcpServerIds: [],
+      maxPlanningSteps: 8,
+      maxToolCalls: 6,
+      maxTurnDurationMs: 60_000,
+      maxToolDurationMs: 30_000,
+      compactSoftThreshold: 0.7,
+      compactHardThreshold: 0.85,
+      allowNetworkTools: true,
+      allowWriteTools: true,
+      allowMcpTools: true,
+      ...overrides,
+    },
+  });
+  expect(created.statusCode).toBe(200);
+  return created.json<Record<string, any>>();
+}
+
+async function updateWorkspaceProfiles(
+  app: Awaited<ReturnType<typeof bootstrapApp>>["app"],
+  cookie: string,
+  payload: {
+    primaryModelProfileId?: string | null;
+    activeAgentProfileId?: string | null;
+  },
+) {
+  const updated = await app.inject({
+    method: "PUT",
+    url: "/api/workspace",
+    headers: {
+      cookie,
+    },
+    payload,
+  });
+  expect(updated.statusCode).toBe(200);
+  return updated.json<Record<string, any>>();
+}
+
 async function ensurePrimaryProviderWithoutApiKey(
   app: Awaited<ReturnType<typeof bootstrapApp>>["app"],
   cookie: string,
@@ -1975,6 +2057,129 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
+  it("returns a planner-specific timeout reply to Telegram", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const plannerTimeoutProviderInvoker = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderInvocationInput;
+        timeoutMs?: number;
+      }): Promise<ProviderInvocationResult> => {
+        void args.profile;
+        void args.apiKey;
+        void args.timeoutMs;
+        if (args.input.jsonMode || args.input.toolChoice === "auto") {
+          throw new Error("Planner model timed out");
+        }
+        return {
+          text: "OK",
+          raw: {},
+        };
+      },
+    );
+
+    const appState = await bootstrapApp(dataDir, {
+      providerInvoker: plannerTimeoutProviderInvoker,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const response = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "trigger planner timeout",
+          chat: { id: 7103 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+      response:
+        "Planning timed out before the agent could decide the next step. Please try again, or increase the planner timeout for the active profile.",
+    });
+
+    await appState.app.close();
+  });
+
+  it("returns a provider-profile-specific reply to Telegram when the active profile points to a missing provider", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    const profile = await createAgentProfileRecord(appState.app, appState.cookie, {
+      label: "missing-provider",
+      primaryModelProfileId: "provider_missing",
+    });
+    await updateWorkspaceProfiles(appState.app, appState.cookie, {
+      primaryModelProfileId: "provider_missing",
+      activeAgentProfileId: String(profile.id),
+    });
+
+    const response = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "missing provider",
+          chat: { id: 7104 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+      response: "No provider is configured for the active profile yet. Open the Mini App to add one.",
+    });
+
+    await appState.app.close();
+  });
+
+  it("returns an API-key-specific reply to Telegram when the provider secret is missing", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    const provider = await createProviderRecord(appState.app, appState.cookie);
+    const profile = await createAgentProfileRecord(appState.app, appState.cookie, {
+      label: "missing-secret",
+      primaryModelProfileId: String(provider.id),
+    });
+    await updateWorkspaceProfiles(appState.app, appState.cookie, {
+      primaryModelProfileId: String(provider.id),
+      activeAgentProfileId: String(profile.id),
+    });
+
+    const response = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "missing api key",
+          chat: { id: 7105 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+      response:
+        "Provider API key is not configured. Open Mini App > Providers and save a valid API key.",
+    });
+
+    await appState.app.close();
+  });
+
   it("exposes active runtime diagnostics and blocked capability reasons in system health", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
@@ -2002,6 +2207,7 @@ describe("server flows", () => {
     const payload = health.json<Record<string, any>>();
 
     expect(payload.runtime?.activeProfile?.label).toBe("balanced");
+    expect(payload.runtime?.activeProfile?.effectiveMaxPlannerDurationMs).toBe(45_000);
     expect(Array.isArray(payload.runtime?.tools)).toBe(true);
     expect(
       payload.runtime.tools.some((tool: Record<string, unknown>) => tool.id === "memory_search"),

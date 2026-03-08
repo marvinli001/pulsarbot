@@ -550,8 +550,9 @@ function toTurnError(args: {
   code?: string;
 }): NonNullable<TurnState["error"]> {
   const message = args.error instanceof Error ? args.error.message : String(args.error);
+  const errorCode = args.code ?? (args.error instanceof AppError ? args.error.code : "TURN_NODE_FAILED");
   return {
-    code: args.code ?? "TURN_NODE_FAILED",
+    code: errorCode,
     message,
     nodeId: args.nodeId,
     retryable: args.retryable ?? false,
@@ -559,6 +560,47 @@ function toTurnError(args: {
       message,
     }),
   };
+}
+
+function turnErrorIncludes(
+  error: TurnState["error"] | null | undefined,
+  pattern: string,
+): boolean {
+  return Boolean(error?.message.toLowerCase().includes(pattern.toLowerCase()));
+}
+
+function describeTelegramTurnFailure(
+  error: TurnState["error"] | null | undefined,
+  status: TurnState["status"],
+): string {
+  if (error?.code === "TURN_LOCK_CONFLICT") {
+    return "A previous agent turn is still running for this chat. Please try again in a moment.";
+  }
+  if (error?.code === "NO_AGENT_PROFILE") {
+    return "No agent profile is configured yet. Open the Mini App first.";
+  }
+  if (error?.code === "NO_PROVIDER_PROFILE") {
+    return "No provider is configured for the active profile yet. Open the Mini App to add one.";
+  }
+  if (error?.code === "SECRET_NOT_FOUND") {
+    return "Provider API key is not configured. Open Mini App > Providers and save a valid API key.";
+  }
+  if (
+    turnErrorIncludes(error, "planner model timed out")
+  ) {
+    return "Planning timed out before the agent could decide the next step. Please try again, or increase the planner timeout for the active profile.";
+  }
+  if (
+    error?.code === "AGENT_PROVIDER_TIMEOUT" ||
+    turnErrorIncludes(error, "provider request timed out") ||
+    turnErrorIncludes(error, "final response generation timed out")
+  ) {
+    return "The model timed out before it could finish the request. Please try again, or increase the timeout for the active profile.";
+  }
+  if (status === "aborted") {
+    return "The request was cancelled before completion.";
+  }
+  return "The agent turn failed. Open the Mini App health page for details.";
 }
 
 function syncTurnToolResultsFromAgentState(
@@ -4241,6 +4283,13 @@ export async function createApp(
                     result.agentState,
                   );
                 } catch (error) {
+                  if (isMissingProviderProfileError(error)) {
+                    throw new AppError(
+                      "NO_PROVIDER_PROFILE",
+                      error instanceof Error ? error.message : String(error),
+                      400,
+                    );
+                  }
                   if (isMissingSecretError(error)) {
                     turnState.status = "aborted";
                     turnState.error = {
@@ -4303,10 +4352,10 @@ export async function createApp(
               id: "emit_reply",
               run: async () => {
                 if (!turnState.output.replyText) {
-                  turnState.output.replyText =
-                    turnState.status === "aborted"
-                      ? "The request was cancelled before completion."
-                      : "The agent turn failed. Open the Mini App health page for details.";
+                  turnState.output.replyText = describeTelegramTurnFailure(
+                    turnState.error,
+                    turnState.status,
+                  );
                 }
               },
             },
@@ -4342,8 +4391,10 @@ export async function createApp(
                   });
                 }
                 if (!turnState.output.replyText) {
-                  turnState.output.replyText =
-                    "The agent turn failed. Open the Mini App health page for details.";
+                  turnState.output.replyText = describeTelegramTurnFailure(
+                    turnState.error,
+                    turnState.status,
+                  );
                 }
               },
             },
@@ -4359,8 +4410,10 @@ export async function createApp(
           });
           turnState.recovery.resumeEligible = false;
           if (!turnState.output.replyText) {
-            turnState.output.replyText =
-              "The agent turn failed. Open the Mini App health page for details.";
+            turnState.output.replyText = describeTelegramTurnFailure(
+              turnState.error,
+              turnState.status,
+            );
           }
           await persistTurnState();
         } finally {
@@ -6198,6 +6251,10 @@ export async function createApp(
               maxTurnDurationMs: activeProfile.maxTurnDurationMs,
               maxToolDurationMs: activeProfile.maxToolDurationMs,
               effectiveMaxTurnDurationMs: Math.max(activeProfile.maxTurnDurationMs, 60_000),
+              effectiveMaxPlannerDurationMs: Math.min(
+                Math.max(activeProfile.maxTurnDurationMs, 60_000),
+                Math.max(activeProfile.maxToolDurationMs, 45_000),
+              ),
               effectiveMaxToolDurationMs: Math.max(activeProfile.maxToolDurationMs, 30_000),
               allowNetworkTools: activeProfile.allowNetworkTools,
               allowWriteTools: activeProfile.allowWriteTools,

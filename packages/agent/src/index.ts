@@ -382,6 +382,7 @@ export class AgentRuntime {
   public async runTurn(input: AgentTurnInput): Promise<AgentTurnResult> {
     const turnId = input.context.turnId ?? createId("turn");
     const effectiveMaxTurnDurationMs = this.effectiveMaxTurnDurationMs(input.profile);
+    const effectiveMaxPlannerDurationMs = this.effectiveMaxPlannerDurationMs(input.profile);
     const effectiveMaxToolDurationMs = this.effectiveMaxToolDurationMs(input.profile);
     const turnDeadlineAt = Date.now() + effectiveMaxTurnDurationMs;
     const memory = await this.services.createMemoryStore(input.context.workspaceId);
@@ -434,6 +435,7 @@ export class AgentRuntime {
       primaryProvider,
       primaryApiKey,
       backgroundProvider,
+      effectiveMaxPlannerDurationMs,
       effectiveMaxToolDurationMs,
       turnDeadlineAt,
       skillPrompts,
@@ -460,6 +462,7 @@ export class AgentRuntime {
     primaryProvider: ProviderProfile;
     primaryApiKey: string;
     backgroundProvider: { profile: ProviderProfile; apiKey: string } | null;
+    effectiveMaxPlannerDurationMs: number;
     effectiveMaxToolDurationMs: number;
     turnDeadlineAt: number;
     skillPrompts: string[];
@@ -888,9 +891,12 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
                       ? "none"
                       : "auto",
                   },
-                  timeoutMs: this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+                  timeoutMs: this.operationTimeoutMs(
+                    args.effectiveMaxPlannerDurationMs,
+                    args.turnDeadlineAt,
+                  ),
                 }),
-              this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+              this.operationTimeoutMs(args.effectiveMaxPlannerDurationMs, args.turnDeadlineAt),
               "AGENT_PROVIDER_TIMEOUT",
               "Planner model timed out",
             );
@@ -930,9 +936,12 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
                       messages: planningMessages(),
                       jsonMode: true,
                     },
-                    timeoutMs: this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+                    timeoutMs: this.operationTimeoutMs(
+                      args.effectiveMaxPlannerDurationMs,
+                      args.turnDeadlineAt,
+                    ),
                   }),
-                this.operationTimeoutMs(args.effectiveMaxToolDurationMs, args.turnDeadlineAt),
+                this.operationTimeoutMs(args.effectiveMaxPlannerDurationMs, args.turnDeadlineAt),
                 "AGENT_PROVIDER_TIMEOUT",
                 "Planner model timed out",
               )
@@ -1805,6 +1814,13 @@ Produce the final user-facing answer for Telegram. Keep it concise and grounded 
 
   private effectiveMaxToolDurationMs(profile: AgentProfile): number {
     return Math.max(profile.maxToolDurationMs, 30_000);
+  }
+
+  private effectiveMaxPlannerDurationMs(profile: AgentProfile): number {
+    return Math.min(
+      this.effectiveMaxTurnDurationMs(profile),
+      Math.max(profile.maxToolDurationMs, 45_000),
+    );
   }
 
   private buildRuntimeCapabilitySummary(
