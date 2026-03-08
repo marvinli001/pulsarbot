@@ -603,6 +603,97 @@ function describeTelegramTurnFailure(
   return "The agent turn failed. Open the Mini App health page for details.";
 }
 
+function titleCaseWords(input: string): string {
+  return input
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function humanizeToolId(toolId: string): string {
+  return titleCaseWords(
+    toolId
+      .replace(/^mcp:/, "")
+      .split(/[:_/-]+/)
+      .filter(Boolean)
+      .join(" "),
+  );
+}
+
+function describeTurnProgressForGraphNode(nodeId: string): string | null {
+  switch (nodeId) {
+    case "ingest_input":
+    case "preprocess_content":
+    case "load_runtime":
+    case "persist_user_message":
+      return "Getting things ready...";
+    case "run_agent_graph":
+      return "Planning the next steps...";
+    case "persist_assistant_artifacts":
+    case "finalize_turn":
+      return "Finalizing the reply...";
+    default:
+      return null;
+  }
+}
+
+function describeTurnProgressForSubgraph(subgraph: string): string | null {
+  switch (subgraph) {
+    case "research":
+      return "Researching the topic...";
+    case "memory":
+      return "Checking memory...";
+    case "document":
+      return "Reading the document...";
+    default:
+      return null;
+  }
+}
+
+function describeTurnProgressForAgentNode(nodeId: string, subgraph?: string): string | null {
+  if (subgraph) {
+    const specialistStatus = describeTurnProgressForSubgraph(subgraph);
+    if (specialistStatus) {
+      return specialistStatus;
+    }
+  }
+
+  switch (nodeId) {
+    case "plan_step":
+      return "Planning the next steps...";
+    case "route_action":
+      return "Choosing the next action...";
+    case "generate_final_response":
+      return "Writing the answer...";
+    case "refresh_summary":
+      return "Refreshing context...";
+    case "merge_specialist_result":
+      return "Combining the results...";
+    default:
+      return null;
+  }
+}
+
+function describeTurnProgressForTool(toolId: string): string {
+  switch (toolId) {
+    case "search_web":
+      return "Searching the web...";
+    case "web_browse":
+      return "Browsing a web page...";
+    case "document_extract_text":
+      return "Reading the document...";
+    case "memory_search":
+      return "Checking memory...";
+    case "memory_append_daily":
+    case "memory_upsert_longterm":
+    case "memory_refresh_before_compact":
+      return "Updating memory...";
+    default:
+      return `Using ${humanizeToolId(toolId)}...`;
+  }
+}
+
 function syncTurnToolResultsFromAgentState(
   turnState: TurnState,
   agentState: AgentGraphState,
@@ -3860,6 +3951,23 @@ export async function createApp(
         });
       };
 
+      let lastProgressPreview = "";
+      const emitProgressPreview = async (message: string | null | undefined) => {
+        if (!streamController.enabled || turnState.output.lastRenderedChars > 0 || turnState.output.replyText) {
+          return;
+        }
+        const next = message?.trim();
+        if (!next || next === lastProgressPreview) {
+          return;
+        }
+        lastProgressPreview = next;
+        try {
+          await streamController.emit(next);
+        } catch {
+          // Ignore preview streaming failures and continue the turn.
+        }
+      };
+
       const agentObserver: NonNullable<Parameters<typeof state.agent.runTurn>[0]["observer"]> = {
         onNodeStarted: async ({ nodeId, subgraph, state: nextAgentState, attempt }) => {
           turnState.agent = nextAgentState;
@@ -3876,6 +3984,7 @@ export async function createApp(
               subgraph,
             },
           });
+          await emitProgressPreview(describeTurnProgressForAgentNode(nodeId, subgraph));
         },
         onNodeSucceeded: async ({ nodeId, subgraph, state: nextAgentState, attempt }) => {
           turnState.agent = nextAgentState;
@@ -3956,6 +4065,9 @@ export async function createApp(
                 subgraph: tool.subgraph,
               },
             });
+            if (tool.status === "pending") {
+              await emitProgressPreview(describeTurnProgressForTool(tool.toolId));
+            }
           }
         },
         onStatePatched: async ({ state: nextAgentState }) => {
@@ -3980,6 +4092,7 @@ export async function createApp(
               subgraph,
             },
           });
+          await emitProgressPreview(describeTurnProgressForSubgraph(subgraph));
         },
         onSubgraphExited: async ({ subgraph, state: nextAgentState, status }) => {
           turnState.agent = nextAgentState;
@@ -4054,6 +4167,7 @@ export async function createApp(
                   status: turnState.status,
                 },
               });
+              await emitProgressPreview(describeTurnProgressForGraphNode(nodeId));
             },
             onNodeSucceeded: async ({ nodeId, attempt }) => {
               await persistTurnState();

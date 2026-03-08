@@ -2057,6 +2057,37 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
+  it("streams progress previews before the final Telegram reply when draft streaming is enabled", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const response = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        enableStream: true,
+        message: {
+          text: "show progress",
+          chat: { id: 7106 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const payload = response.json<Record<string, any>>();
+    expect(payload.ok).toBe(true);
+    expect(Array.isArray(payload.streamed)).toBe(true);
+    expect(payload.streamed).toContain("Planning the next steps...");
+    expect(payload.streamed).toContain("Writing the answer...");
+    expect(payload.response).toBe("OK");
+
+    await appState.app.close();
+  });
+
   it("returns a planner-specific timeout reply to Telegram", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);

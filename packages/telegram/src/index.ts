@@ -245,45 +245,55 @@ async function dispatchMessage(args: {
   const updateRecord = ctx.update as unknown as Record<string, unknown>;
   const updateId = parseUpdateId(updateRecord.update_id);
   const threadContext = readThreadContext(updateRecord.message ?? ctx.msg);
-  try {
-    await ctx.api.sendChatAction(
-      ctx.chat!.id,
-      "typing",
-      threadContext.replyOptions,
-    );
-  } catch {
-    // Ignore typing indicator errors to keep webhook processing resilient.
-  }
+  const sendTypingIndicator = async () => {
+    try {
+      await ctx.api.sendChatAction(
+        ctx.chat!.id,
+        "typing",
+        threadContext.replyOptions,
+      );
+    } catch {
+      // Ignore typing indicator errors to keep webhook processing resilient.
+    }
+  };
+  await sendTypingIndicator();
+  const typingTimer = setInterval(() => {
+    void sendTypingIndicator();
+  }, 5_000);
   const controller = createTelegramStreamController({
     ctx,
     ...(threadContext.replyOptions
       ? { replyOptions: threadContext.replyOptions }
       : {}),
   });
-  const reply = await onMessage(
-    {
-      updateId,
-      chatId: ctx.chat!.id,
-      threadId: threadContext.threadId,
-      userId: ctx.from!.id,
-      username: ctx.from?.username ?? undefined,
-      messageId: ctx.msg?.message_id ?? null,
-      content,
-    },
-    controller,
-  );
-
-  await controller.finalize(reply);
-  if (onFinalizedReply) {
-    try {
-      await onFinalizedReply({
+  try {
+    const reply = await onMessage(
+      {
+        updateId,
         chatId: ctx.chat!.id,
         threadId: threadContext.threadId,
-        replyText: reply,
-      });
-    } catch {
-      // Ignore topic-renaming failures so the webhook response remains resilient.
+        userId: ctx.from!.id,
+        username: ctx.from?.username ?? undefined,
+        messageId: ctx.msg?.message_id ?? null,
+        content,
+      },
+      controller,
+    );
+
+    await controller.finalize(reply);
+    if (onFinalizedReply) {
+      try {
+        await onFinalizedReply({
+          chatId: ctx.chat!.id,
+          threadId: threadContext.threadId,
+          replyText: reply,
+        });
+      } catch {
+        // Ignore topic-renaming failures so the webhook response remains resilient.
+      }
     }
+  } finally {
+    clearInterval(typingTimer);
   }
 
   if (content.kind !== "text") {
