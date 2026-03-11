@@ -70,8 +70,15 @@ type ThreadReplyOptions = {
 type FinalizedReplyContext = {
   chatId: number;
   threadId: number | null;
+  requestText: string;
   replyText: string;
 };
+
+type ForumTopicNameResolver = (
+  context: FinalizedReplyContext,
+) => Promise<string | null> | string | null;
+
+const IMPLICIT_FORUM_TOPIC_RENAME_MESSAGE_THRESHOLD = 2;
 
 function parseThreadId(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -257,6 +264,7 @@ async function dispatchMessage(args: {
     }
   };
   await sendTypingIndicator();
+  const requestText = buildForumTopicRequestText(content);
   const typingTimer = setInterval(() => {
     void sendTypingIndicator();
   }, 5_000);
@@ -286,6 +294,7 @@ async function dispatchMessage(args: {
         await onFinalizedReply({
           chatId: ctx.chat!.id,
           threadId: threadContext.threadId,
+          requestText,
           replyText: reply,
         });
       } catch {
@@ -337,25 +346,61 @@ export function getImplicitForumTopicThreadId(message: unknown): number | null {
 }
 
 export function buildForumTopicNameFromReply(replyText: string): string | null {
-  const normalized = replyText.replace(/\s+/g, "").trim();
+  const normalized = Array.from(replyText.normalize("NFKC"))
+    .map((character) => (/[\p{L}\p{N}\s]/u.test(character) ? character : " "))
+    .join("")
+    .replace(/\s+/gu, "")
+    .trim();
   if (!normalized) {
     return null;
   }
-  return Array.from(normalized).slice(0, 8).join("");
+  return Array.from(normalized).slice(0, 10).join("");
+}
+
+function buildForumTopicRequestText(content: TelegramInboundContent): string {
+  if (content.kind === "text") {
+    return content.text?.trim() ?? "";
+  }
+
+  const metadata = content.metadata ?? {};
+  const parts = [
+    content.caption?.trim() ?? "",
+    typeof metadata.fileName === "string" ? metadata.fileName : "",
+    typeof metadata.title === "string" ? metadata.title : "",
+    typeof metadata.performer === "string" ? metadata.performer : "",
+  ].filter(Boolean);
+
+  if (parts.length > 0) {
+    return parts.join("\n");
+  }
+
+  switch (content.kind) {
+    case "image":
+      return "image message";
+    case "voice":
+      return "voice message";
+    case "audio":
+      return "audio message";
+    case "document":
+      return "document message";
+    default:
+      return "";
+  }
+}
+
+function isMeaningfulForumTopicMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const record = message as Record<string, unknown>;
+  if (typeof record.text === "string") {
+    return record.text.trim().length > 0;
+  }
+  return "voice" in record || "photo" in record || "document" in record || "audio" in record;
 }
 
 function createTopicKey(chatId: number, threadId: number): string {
   return `${chatId}:${threadId}`;
-}
-
-function createNonZeroDraftId(seed?: number): number {
-  const MAX_INT_31 = 2_147_483_647;
-  if (typeof seed === "number" && Number.isFinite(seed)) {
-    const normalized = Math.abs(Math.trunc(seed)) % MAX_INT_31;
-    return normalized === 0 ? 1 : normalized;
-  }
-  const fallback = Date.now() % MAX_INT_31;
-  return fallback === 0 ? 1 : fallback;
 }
 
 export function createTelegramStreamController(args: {
@@ -367,27 +412,38 @@ export function createTelegramStreamController(args: {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let lastFlushAt = 0;
   let closed = false;
-  const throttleMs = 300;
-  const draftId = createNonZeroDraftId(args.ctx.msg?.message_id ?? Date.now());
-  const draftThreadId = args.replyOptions?.message_thread_id ??
-    args.replyOptions?.direct_messages_topic_id;
+  let streamedMessageId: number | null = null;
+  let editCount = 0;
+  const throttleMs = 800;
+  const maxEdits = 30;
 
-  const flush = async (): Promise<boolean> => {
-    if (closed || !latestText || latestText === lastRenderedText) {
+  const flush = async (force = false): Promise<boolean> => {
+    if (closed || !latestText) {
+      return true;
+    }
+    if (streamedMessageId !== null && latestText === lastRenderedText) {
       return true;
     }
 
     try {
-      await args.ctx.api.sendMessageDraft(
+      if (streamedMessageId === null) {
+        const message = await args.ctx.reply(latestText, args.replyOptions);
+        streamedMessageId = message.message_id;
+        lastRenderedText = latestText;
+        lastFlushAt = Date.now();
+        return true;
+      }
+      if (!force && editCount >= maxEdits) {
+        return true;
+      }
+      await args.ctx.api.editMessageText(
         args.ctx.chat!.id,
-        draftId,
+        streamedMessageId,
         latestText,
-        typeof draftThreadId === "number"
-          ? { message_thread_id: draftThreadId }
-          : undefined,
       );
       lastRenderedText = latestText;
       lastFlushAt = Date.now();
+      editCount += 1;
       return true;
     } catch {
       return false;
@@ -399,14 +455,14 @@ export function createTelegramStreamController(args: {
       return;
     }
     const delay = Math.max(0, throttleMs - (Date.now() - lastFlushAt));
-    timer = setTimeout(() => {
-      timer = null;
-      void flush().then(() => {
-        if (latestText !== lastRenderedText) {
-          scheduleFlush();
-        }
-      });
-    }, delay);
+      timer = setTimeout(() => {
+        timer = null;
+        void flush().then(() => {
+          if (latestText !== lastRenderedText && editCount < maxEdits) {
+            scheduleFlush();
+          }
+        });
+      }, delay);
   };
 
   return {
@@ -416,6 +472,9 @@ export function createTelegramStreamController(args: {
         return;
       }
       latestText = partialText;
+      if (streamedMessageId !== null && editCount >= maxEdits) {
+        return;
+      }
       scheduleFlush();
     },
     async finalize(finalText: string) {
@@ -432,22 +491,21 @@ export function createTelegramStreamController(args: {
         return;
       }
       try {
-        const rawApi = args.ctx.api.raw as unknown as {
-          sendMessage(payload: Record<string, unknown>): Promise<unknown>;
-        };
-        await rawApi.sendMessage({
-          chat_id: args.ctx.chat!.id,
-          text: latestText,
-          ...(args.replyOptions ?? {}),
-          draft_id: draftId,
-        });
-        lastRenderedText = latestText;
-      } catch {
-        try {
-          await args.ctx.reply(latestText, args.replyOptions);
+        const flushed = await flush(true);
+        if (!flushed || latestText !== lastRenderedText) {
+          const message = await args.ctx.reply(latestText, args.replyOptions);
+          streamedMessageId = streamedMessageId ?? message.message_id;
           lastRenderedText = latestText;
-        } catch {
-          // Do not throw from finalize if Telegram rejects fallback send.
+        }
+      } catch {
+        lastRenderedText = latestText;
+        if (streamedMessageId === null) {
+          try {
+            const message = await args.ctx.reply(latestText, args.replyOptions);
+            streamedMessageId = message.message_id;
+          } catch {
+            // Do not throw from finalize if Telegram rejects fallback send.
+          }
         }
       }
       closed = true;
@@ -458,9 +516,10 @@ export function createTelegramStreamController(args: {
 export function createTelegramBot(args: {
   token: string;
   onMessage: TelegramUpdateHandler;
+  resolveForumTopicName?: ForumTopicNameResolver;
 }) {
   const bot = new Bot(args.token);
-  const implicitTopicNames = new Map<string, true>();
+  const implicitTopicNames = new Map<string, { effectiveMessageCount: number }>();
   const webhookState: {
     updatedAt: string;
     status: "ready";
@@ -504,10 +563,19 @@ export function createTelegramBot(args: {
     }
     const implicitThreadId = getImplicitForumTopicThreadId(ctx.message);
     if (implicitThreadId !== null) {
-      implicitTopicNames.set(createTopicKey(ctx.chat!.id, implicitThreadId), true);
+      implicitTopicNames.set(createTopicKey(ctx.chat!.id, implicitThreadId), {
+        effectiveMessageCount: 0,
+      });
     }
     if (isForumTopicServiceMessage(ctx.message)) {
       return;
+    }
+    const { threadId } = readThreadContext(ctx.message);
+    if (threadId !== null) {
+      const topicState = implicitTopicNames.get(createTopicKey(ctx.chat!.id, threadId));
+      if (topicState && isMeaningfulForumTopicMessage(ctx.message)) {
+        topicState.effectiveMessageCount += 1;
+      }
     }
     await next();
   });
@@ -517,16 +585,18 @@ export function createTelegramBot(args: {
       return;
     }
     const key = createTopicKey(context.chatId, context.threadId);
-    if (!implicitTopicNames.has(key)) {
+    const topicState = implicitTopicNames.get(key);
+    if (!topicState || topicState.effectiveMessageCount < IMPLICIT_FORUM_TOPIC_RENAME_MESSAGE_THRESHOLD) {
       return;
     }
-    implicitTopicNames.delete(key);
-    const nextName = buildForumTopicNameFromReply(context.replyText);
+    const nextName = await args.resolveForumTopicName?.(context) ||
+      buildForumTopicNameFromReply(context.replyText);
     if (!nextName) {
       return;
     }
     try {
       await bot.api.editForumTopic(context.chatId, context.threadId, { name: nextName });
+      implicitTopicNames.delete(key);
     } catch {
       // Ignore topic-editing errors because this is a post-reply enhancement.
     }

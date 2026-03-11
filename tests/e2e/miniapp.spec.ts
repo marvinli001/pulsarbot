@@ -13,6 +13,28 @@ async function readBootstrapState(page: Page) {
   });
 }
 
+async function enableDefaultRuntimeDependencies(page: Page) {
+  return page.evaluate(async () => {
+    const targets = [
+      ["skills", "core-agent"],
+      ["skills", "memory-core"],
+      ["plugins", "time-context"],
+      ["plugins", "native-google-search"],
+      ["plugins", "native-bing-search"],
+      ["plugins", "web-browse-fetcher"],
+      ["plugins", "document-processor"],
+    ] as const;
+
+    return Promise.all(targets.map(async ([kind, manifestId]) => {
+      const response = await fetch(`/api/market/${kind}/${manifestId}/enable`, {
+        method: "POST",
+        credentials: "include",
+      });
+      return response.status;
+    }));
+  });
+}
+
 test.describe("Mini App", () => {
   test("bootstraps the workspace and previews the runtime on mobile", async ({ page }) => {
     await page.goto("/miniapp/");
@@ -66,21 +88,32 @@ test.describe("Mini App", () => {
     await expect(
       page.getByRole("heading", { name: "Configured Providers" }),
     ).toBeVisible();
-    await page.getByRole("button", { name: "Load" }).first().click();
     await page
-      .getByPlaceholder("Leave blank to keep existing API key")
+      .getByPlaceholder("API key")
       .fill("test-provider-key");
     await page
       .getByPlaceholder("Access token confirmation")
       .fill("dev-access-token");
-    await page.getByRole("button", { name: "Update Provider" }).click();
+    await page.getByRole("button", { name: "Create Provider" }).click();
     await expect(page.getByText("Provider Saved")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Text" }).first()).toBeVisible();
     await page.getByRole("button", { name: "Text" }).first().click();
     await expect(page.getByText("All Passed")).toBeVisible();
 
+    expect(await enableDefaultRuntimeDependencies(page)).toEqual([
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+    ]);
+
     await page.getByRole("button", { name: "Profiles" }).click();
     await expect(page.getByRole("heading", { name: "Agent Profiles" })).toBeVisible();
-    await page.getByRole("button", { name: "Load" }).first().click();
+    await page.getByRole("button", { name: "Create Profile" }).click();
+    await expect(page.getByText("Profile Saved")).toBeVisible();
     await expect(page.getByRole("heading", { name: "Runtime Preview" })).toBeVisible();
     await expect(page.locator("pre").last()).toContainText("generatedAt");
   });

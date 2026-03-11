@@ -233,4 +233,38 @@ describe("runtime resolver", () => {
       }),
     ]);
   });
+
+  it("blocks skills whose manifest dependencies are not enabled in the runtime", async () => {
+    const catalog = await loadMarketCatalog(path.resolve(process.cwd(), "market"));
+    const installs = createDefaultInstallRecords(catalog);
+    setInstallEnabled(installs, "skills", "core-agent", true);
+    setInstallEnabled(installs, "skills", "web-search", true);
+    setInstallEnabled(installs, "plugins", "native-google-search", true);
+    setInstallEnabled(installs, "plugins", "native-bing-search", true);
+
+    const snapshot = resolveRuntimeSnapshot({
+      workspaceId: "main",
+      profile: createProfile({
+        enabledSkillIds: ["core-agent", "web-search"],
+        enabledPluginIds: [],
+      }),
+      searchSettings: createSearchSettings(),
+      catalog,
+      installs,
+      mcpServers: [],
+    });
+
+    expect(snapshot.enabledSkills.map((item) => item.id)).toEqual([
+      "core-agent",
+    ]);
+    expect(snapshot.blocked).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          scope: "skill",
+          id: "web-search",
+          reason: expect.stringContaining("native-google-search"),
+        }),
+      ]),
+    );
+  });
 });

@@ -252,6 +252,36 @@ describe("D1AppRepository", () => {
     );
   });
 
+  it("clears imported workspace state before a full restore", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => []);
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    await repository.clearWorkspaceForImport("workspace_1");
+
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM provider_profile",
+      undefined,
+    );
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM secret_envelope WHERE workspace_id = ?",
+      ["workspace_1"],
+    );
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM workspace",
+      undefined,
+    );
+  });
+
   it("replays stable migrations when legacy ordinal ids are already recorded", async () => {
     const executeD1 = vi.fn(async () => undefined);
     const queryD1 = vi.fn(async () => [

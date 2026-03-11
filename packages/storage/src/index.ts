@@ -428,6 +428,7 @@ export interface AppRepository {
   listSecrets(): Promise<SecretEnvelope[]>;
   getSecretByScope(workspaceId: string, scope: string): Promise<SecretEnvelope | null>;
   saveSecret(secret: SecretEnvelope): Promise<void>;
+  clearWorkspaceForImport(workspaceId: string): Promise<void>;
   listDocuments(): Promise<DocumentMetadata[]>;
   saveDocument(document: DocumentMetadata): Promise<void>;
   listMemoryDocuments(): Promise<MemoryDocument[]>;
@@ -875,6 +876,46 @@ export class D1AppRepository implements AppRepository {
         parsed.updatedAt,
       ],
     );
+  }
+
+  public async clearWorkspaceForImport(workspaceId: string): Promise<void> {
+    const statements: Array<{ sql: string; params?: unknown[] }> = [
+      { sql: "DELETE FROM turn_event" },
+      { sql: "DELETE FROM turn_state_snapshot" },
+      { sql: "DELETE FROM tool_run" },
+      { sql: "DELETE FROM conversation_turn" },
+      { sql: "DELETE FROM conversation_summary" },
+      { sql: "DELETE FROM message" },
+      { sql: "DELETE FROM conversation" },
+      { sql: "DELETE FROM job" },
+      { sql: "DELETE FROM provider_test_run" },
+      { sql: "DELETE FROM audit_event" },
+      { sql: "DELETE FROM import_export_run" },
+      { sql: "DELETE FROM document_metadata" },
+      { sql: "DELETE FROM memory_chunk" },
+      { sql: "DELETE FROM memory_document" },
+      { sql: "DELETE FROM mcp_server" },
+      { sql: "DELETE FROM mcp_provider" },
+      { sql: "DELETE FROM install_record" },
+      { sql: "DELETE FROM provider_profile" },
+      { sql: "DELETE FROM agent_profile" },
+      { sql: "DELETE FROM search_settings" },
+      { sql: "DELETE FROM admin_identity" },
+      {
+        sql: "DELETE FROM secret_envelope WHERE workspace_id = ?",
+        params: [workspaceId],
+      },
+      { sql: "DELETE FROM workspace" },
+      { sql: "DELETE FROM telegram_update_receipt" },
+    ];
+
+    for (const statement of statements) {
+      await this.client.executeD1(
+        this.databaseId,
+        statement.sql,
+        statement.params,
+      );
+    }
   }
 
   public async listDocuments(): Promise<DocumentMetadata[]> {
@@ -1558,6 +1599,34 @@ export class InMemoryAppRepository implements AppRepository {
         }
       : parsed;
     this.secrets.set(next.id, next);
+  }
+
+  public async clearWorkspaceForImport(workspaceId: string): Promise<void> {
+    void workspaceId;
+    this.workspace = null;
+    this.adminIdentity = null;
+    this.providerProfiles.clear();
+    this.agentProfiles.clear();
+    this.installs.clear();
+    this.searchSettings = null;
+    this.mcpProviders.clear();
+    this.mcpServers.clear();
+    this.secrets.clear();
+    this.documents.clear();
+    this.memoryDocuments.clear();
+    this.memoryChunks.clear();
+    this.conversationSummaries.clear();
+    this.conversationTurns.clear();
+    this.toolRuns.clear();
+    this.jobs.clear();
+    this.conversations.clear();
+    this.messages.clear();
+    this.turnStateSnapshots.clear();
+    this.turnEvents.clear();
+    this.auditEvents.clear();
+    this.importExportRuns.clear();
+    this.providerTestRuns.clear();
+    this.telegramUpdates.clear();
   }
 
   public async listDocuments(): Promise<DocumentMetadata[]> {

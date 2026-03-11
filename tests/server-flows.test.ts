@@ -245,6 +245,13 @@ const fakeProviderInvoker = vi.fn(
       };
     }
 
+    if (system.includes("10 字内标题")) {
+      return {
+        text: "会话标题",
+        raw: {},
+      };
+    }
+
     return {
       text: "OK",
       raw: {},
@@ -266,6 +273,8 @@ const fakeProviderMediaInvoker = vi.fn(
     };
   },
 );
+
+const IMPLICIT_THREAD_RENAME_THRESHOLD = 2;
 
 function buildFakeTelegramContent(message: Record<string, any>, body: Record<string, any>) {
   if (typeof message.text === "string" || typeof body.text === "string") {
@@ -342,7 +351,35 @@ function buildFakeTelegramContent(message: Record<string, any>, body: Record<str
   };
 }
 
-const fakeTelegramFactory = ({ onMessage }: {
+function buildFakeForumTopicRequestText(content: ReturnType<typeof buildFakeTelegramContent>) {
+  if (content.kind === "text") {
+    return content.text ?? "";
+  }
+  if ("caption" in content && typeof content.caption === "string" && content.caption) {
+    return content.caption;
+  }
+  return String(content.metadata.fileName ?? content.metadata.title ?? content.kind);
+}
+
+function isFakeForumTopicServiceMessage(message: Record<string, any>): boolean {
+  return Boolean(
+    message.forum_topic_created ||
+    message.forum_topic_edited ||
+    message.forum_topic_closed ||
+    message.forum_topic_reopened ||
+    message.general_forum_topic_hidden ||
+    message.general_forum_topic_unhidden,
+  );
+}
+
+function isFakeMeaningfulForumMessage(content: ReturnType<typeof buildFakeTelegramContent>) {
+  if (content.kind === "text") {
+    return Boolean(content.text?.trim());
+  }
+  return true;
+}
+
+const fakeTelegramFactory = ({ onMessage, resolveForumTopicName }: {
   onMessage: (
     payload: {
       updateId: number | null;
@@ -359,39 +396,80 @@ const fakeTelegramFactory = ({ onMessage }: {
       finalize(finalText: string): Promise<void>;
     },
   ) => Promise<string>;
-}) => ({
-  handler: async (request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
-    const body = request.body ?? {};
-    const message = body.message ?? body;
-    const streamed: string[] = [];
-    const rawThreadId = message.message_thread_id ?? body.messageThreadId ?? body.threadId;
-    const parsedThreadId = Number(rawThreadId);
-    const response = await onMessage({
-      updateId: Number.isFinite(Number(body.update_id))
-        ? Math.trunc(Number(body.update_id))
-        : null,
-      chatId: Number(message.chat?.id ?? body.chatId ?? 1),
-      threadId: Number.isFinite(parsedThreadId) ? Math.trunc(parsedThreadId) : null,
-      username: message.from?.username ?? body.username,
-      userId: Number(message.from?.id ?? body.userId ?? 1),
-      messageId: Number(message.message_id ?? body.messageId ?? 1),
-      content: buildFakeTelegramContent(message, body),
-    }, {
-      enabled: Boolean(body.enableStream),
-      async emit(partialText: string) {
-        streamed.push(partialText);
-      },
-      async finalize(finalText: string) {
-        streamed.push(finalText);
-      },
-    });
-    return reply.send({ ok: true, response, streamed });
-  },
-  describeWebhookState: () => ({
-    updatedAt: new Date().toISOString(),
-    status: "ready",
-  }),
-});
+  resolveForumTopicName?: (context: {
+    chatId: number;
+    threadId: number | null;
+    requestText: string;
+    replyText: string;
+  }) => Promise<string | null>;
+}) => {
+  const implicitTopicStates = new Map<string, { effectiveMessageCount: number }>();
+  const topicKey = (chatId: number, threadId: number) => `${chatId}:${threadId}`;
+
+  return {
+    handler: async (request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
+      const body = request.body ?? {};
+      const message = body.message ?? body;
+      const streamed: string[] = [];
+      const rawThreadId = message.message_thread_id ?? body.messageThreadId ?? body.threadId;
+      const parsedThreadId = Number(rawThreadId);
+      const chatId = Number(message.chat?.id ?? body.chatId ?? 1);
+      const content = buildFakeTelegramContent(message, body);
+      if (message.forum_topic_created?.is_name_implicit === true && Number.isFinite(parsedThreadId)) {
+        implicitTopicStates.set(topicKey(chatId, Math.trunc(parsedThreadId)), {
+          effectiveMessageCount: 0,
+        });
+      }
+      if (!isFakeForumTopicServiceMessage(message) && Number.isFinite(parsedThreadId)) {
+        const state = implicitTopicStates.get(topicKey(chatId, Math.trunc(parsedThreadId)));
+        if (state && isFakeMeaningfulForumMessage(content)) {
+          state.effectiveMessageCount += 1;
+        }
+      }
+      const response = await onMessage({
+        updateId: Number.isFinite(Number(body.update_id))
+          ? Math.trunc(Number(body.update_id))
+          : null,
+        chatId,
+        threadId: Number.isFinite(parsedThreadId) ? Math.trunc(parsedThreadId) : null,
+        username: message.from?.username ?? body.username,
+        userId: Number(message.from?.id ?? body.userId ?? 1),
+        messageId: Number(message.message_id ?? body.messageId ?? 1),
+        content,
+      }, {
+        enabled: Boolean(body.enableStream),
+        async emit(partialText: string) {
+          streamed.push(partialText);
+        },
+        async finalize(finalText: string) {
+          streamed.push(finalText);
+        },
+      });
+      const state = Number.isFinite(parsedThreadId)
+        ? implicitTopicStates.get(topicKey(chatId, Math.trunc(parsedThreadId)))
+        : null;
+      const topicName = Number.isFinite(parsedThreadId) &&
+        body.resolveForumTopicName !== false &&
+        state &&
+        state.effectiveMessageCount >= IMPLICIT_THREAD_RENAME_THRESHOLD
+        ? await resolveForumTopicName?.({
+            chatId,
+            threadId: Math.trunc(parsedThreadId),
+            requestText: buildFakeForumTopicRequestText(content),
+            replyText: response,
+          }) ?? null
+        : null;
+      if (topicName && Number.isFinite(parsedThreadId)) {
+        implicitTopicStates.delete(topicKey(chatId, Math.trunc(parsedThreadId)));
+      }
+      return reply.send({ ok: true, response, streamed, topicName });
+    },
+    describeWebhookState: () => ({
+      updatedAt: new Date().toISOString(),
+      status: "ready",
+    }),
+  };
+};
 
 const crashingTelegramFactory = ({ onMessage }: {
   onMessage: (
@@ -410,32 +488,39 @@ const crashingTelegramFactory = ({ onMessage }: {
       finalize(finalText: string): Promise<void>;
     },
   ) => Promise<string>;
-}) => ({
-  handler: async (request: { body?: any }, _reply: { send: (payload: unknown) => unknown }) => {
-    const body = request.body ?? {};
-    const message = body.message ?? body;
-    await onMessage({
-      updateId: Number.isFinite(Number(body.update_id))
-        ? Math.trunc(Number(body.update_id))
-        : null,
-      chatId: Number(message.chat?.id ?? body.chatId ?? 1),
-      threadId: null,
-      username: message.from?.username ?? body.username,
-      userId: Number(message.from?.id ?? body.userId ?? 1),
-      messageId: Number(message.message_id ?? body.messageId ?? 1),
-      content: buildFakeTelegramContent(message, body),
-    }, {
-      enabled: false,
-      async emit() {},
-      async finalize() {},
-    });
-    throw new Error("telegram handler crashed after processing update");
-  },
-  describeWebhookState: () => ({
-    updatedAt: new Date().toISOString(),
-    status: "ready",
-  }),
-});
+}) => {
+  let crashedOnce = false;
+  return {
+    handler: async (request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
+      const body = request.body ?? {};
+      const message = body.message ?? body;
+      const response = await onMessage({
+        updateId: Number.isFinite(Number(body.update_id))
+          ? Math.trunc(Number(body.update_id))
+          : null,
+        chatId: Number(message.chat?.id ?? body.chatId ?? 1),
+        threadId: null,
+        username: message.from?.username ?? body.username,
+        userId: Number(message.from?.id ?? body.userId ?? 1),
+        messageId: Number(message.message_id ?? body.messageId ?? 1),
+        content: buildFakeTelegramContent(message, body),
+      }, {
+        enabled: false,
+        async emit() {},
+        async finalize() {},
+      });
+      if (!crashedOnce) {
+        crashedOnce = true;
+        throw new Error("telegram handler crashed after processing update");
+      }
+      return reply.send({ ok: true, response });
+    },
+    describeWebhookState: () => ({
+      updatedAt: new Date().toISOString(),
+      status: "ready",
+    }),
+  };
+};
 
 const invalidPayloadTelegramFactory = ({ onMessage }: {
   onMessage: (
@@ -1302,6 +1387,31 @@ describe("server flows", () => {
 
     const restoredBundle = restoredExport.json<Record<string, any>>();
     expect(restoredBundle.memories[0].content).toContain("project codename is nova");
+    expect(
+      restoredBundle.providers.map((provider: Record<string, any>) => provider.id).sort(),
+    ).toEqual(
+      bundle.providers.map((provider: Record<string, any>) => provider.id).sort(),
+    );
+    expect(
+      restoredBundle.profiles.map((profile: Record<string, any>) => profile.id).sort(),
+    ).toEqual(
+      bundle.profiles.map((profile: Record<string, any>) => profile.id).sort(),
+    );
+    expect(
+      restoredBundle.documents.map((document: Record<string, any>) => document.id).sort(),
+    ).toEqual(
+      bundle.documents.map((document: Record<string, any>) => document.id).sort(),
+    );
+    expect(
+      restoredBundle.installs.map((install: Record<string, any>) => install.id).sort(),
+    ).toEqual(
+      bundle.installs.map((install: Record<string, any>) => install.id).sort(),
+    );
+    expect(
+      restoredBundle.encryptedSecrets.map((secret: Record<string, any>) => secret.scope).sort(),
+    ).toEqual(
+      bundle.encryptedSecrets.map((secret: Record<string, any>) => secret.scope).sort(),
+    );
 
     const reindex = await second.app.inject({
       method: "POST",
@@ -1778,6 +1888,20 @@ describe("server flows", () => {
     expect(invalidSave.statusCode).toBe(400);
     expect(invalidSave.body).toContain("Invalid runtime references");
 
+    const invalidProviderRef = await appState.app.inject({
+      method: "PUT",
+      url: `/api/agent-profiles/${String(profile!.id)}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        ...profile,
+        primaryModelProfileId: "provider_missing",
+      },
+    });
+    expect(invalidProviderRef.statusCode).toBe(400);
+    expect(invalidProviderRef.body).toContain("Provider reference is missing");
+
     await appState.app.close();
   });
 
@@ -1991,7 +2115,7 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
-  it("keeps the Telegram update receipt completed even when the webhook handler crashes", async () => {
+  it("releases the Telegram update receipt when the webhook handler crashes so Telegram can retry", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
 
@@ -2025,8 +2149,7 @@ describe("server flows", () => {
     expect(duplicateDelivery.statusCode).toBe(200);
     expect(duplicateDelivery.json()).toMatchObject({
       ok: true,
-      ignored: true,
-      reason: "duplicate",
+      response: expect.any(String),
     });
 
     await appState.app.close();
@@ -2088,6 +2211,105 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
+  it("generates threaded forum topic titles with the configured title prompt", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const topicTitleInvoker = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderInvocationInput;
+        timeoutMs?: number;
+      }): Promise<ProviderInvocationResult> => {
+        void args.profile;
+        void args.apiKey;
+        void args.timeoutMs;
+        const system = args.input.messages.find((message) => message.role === "system")?.content ?? "";
+        const user = args.input.messages.find((message) => message.role === "user")?.content ?? "";
+        if (system.includes("10 字内标题")) {
+          expect(system).toContain("语言为 中文");
+          expect(user).toContain("用户消息：我感冒了怎么办");
+          expect(user).toContain("助手消息：OK");
+          expect(user).toContain("用户消息：还有咳嗽");
+          return {
+            text: "感冒建议！！！",
+            raw: {},
+          };
+        }
+        return fakeProviderInvoker(args as never);
+      },
+    );
+
+    const appState = await bootstrapApp(dataDir, {
+      providerInvoker: topicTitleInvoker,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const topicCreated = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          message_id: 900,
+          message_thread_id: 777,
+          forum_topic_created: {
+            name: "New Topic",
+            icon_color: 0x6fb9f0,
+            is_name_implicit: true,
+          },
+          chat: { id: 7107 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+    expect(topicCreated.statusCode).toBe(200);
+
+    const firstResponse = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "我感冒了怎么办",
+          message_id: 901,
+          message_thread_id: 777,
+          chat: { id: 7107 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(firstResponse.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+      response: "OK",
+      topicName: null,
+    });
+
+    const secondResponse = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "还有咳嗽",
+          message_id: 902,
+          message_thread_id: 777,
+          chat: { id: 7107 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(secondResponse.statusCode).toBe(200);
+    expect(secondResponse.json<Record<string, unknown>>()).toMatchObject({
+      ok: true,
+      response: "OK",
+      topicName: "感冒建议",
+    });
+
+    await appState.app.close();
+  });
+
   it("returns a planner-specific timeout reply to Telegram", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
@@ -2144,12 +2366,21 @@ describe("server flows", () => {
     createdDirs.push(dataDir);
 
     const appState = await bootstrapApp(dataDir);
+    const provider = await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
     const profile = await createAgentProfileRecord(appState.app, appState.cookie, {
       label: "missing-provider",
-      primaryModelProfileId: "provider_missing",
+      primaryModelProfileId: String(provider),
     });
+    const deletedProvider = await appState.app.inject({
+      method: "DELETE",
+      url: `/api/providers/${String(provider)}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(deletedProvider.statusCode).toBe(200);
     await updateWorkspaceProfiles(appState.app, appState.cookie, {
-      primaryModelProfileId: "provider_missing",
+      primaryModelProfileId: String(provider),
       activeAgentProfileId: String(profile.id),
     });
 
@@ -2553,6 +2784,7 @@ describe("server flows", () => {
         {
           fileId: "voice-1",
           expectedStatus: "telegram_voice_transcribe",
+          attemptKey: "audio",
           payload: {
             message: {
               chat: { id: 8001 },
@@ -2570,6 +2802,7 @@ describe("server flows", () => {
         {
           fileId: "photo-1",
           expectedStatus: "telegram_image_describe",
+          attemptKey: "image",
           payload: {
             message: {
               chat: { id: 8002 },
@@ -2590,6 +2823,7 @@ describe("server flows", () => {
         {
           fileId: "doc-1",
           expectedStatus: "telegram_file_fetch",
+          attemptKey: "document",
           payload: {
             message: {
               chat: { id: 8003 },
@@ -2614,30 +2848,57 @@ describe("server flows", () => {
         });
         expect(webhook.statusCode).toBe(200);
 
+        let document: Record<string, any> | null = null;
         await waitForCondition(async () => {
-          const jobsResponse = await appState.app.inject({
+          const documentsResponse = await appState.app.inject({
             method: "GET",
-            url: `/api/jobs?kind=${encodeURIComponent(testCase.expectedStatus)}`,
+            url: "/api/documents",
             headers: {
               cookie: appState.cookie,
             },
           });
-          return jobsResponse
+          document = documentsResponse
             .json<Array<Record<string, any>>>()
-            .some((job) => job.kind === testCase.expectedStatus && job.status === "completed");
+            .find((item) => item.fileId === testCase.fileId) ?? null;
+          return Boolean(document);
         }, 5_000, 50);
+        expect(document).toBeTruthy();
 
-        const documentsResponse = await appState.app.inject({
+        const jobsResponse = await appState.app.inject({
           method: "GET",
-          url: "/api/documents",
+          url: "/api/jobs",
           headers: {
             cookie: appState.cookie,
           },
         });
-        const document = documentsResponse
+        let queuedJob = jobsResponse
           .json<Array<Record<string, any>>>()
-          .find((item) => item.fileId === testCase.fileId);
-        expect(document).toBeTruthy();
+          .find((job) =>
+            job.payload?.documentId === document?.id && job.kind === testCase.expectedStatus
+          ) ?? null;
+
+        if (queuedJob && queuedJob.status !== "completed") {
+          const refreshedJobsResponse = await appState.app.inject({
+            method: "GET",
+            url: "/api/jobs",
+            headers: {
+              cookie: appState.cookie,
+            },
+          });
+          queuedJob = refreshedJobsResponse
+            .json<Array<Record<string, any>>>()
+            .find((job) => job.id === queuedJob?.id) ?? queuedJob;
+        }
+        if (queuedJob && queuedJob.status !== "completed") {
+          const retry = await appState.app.inject({
+            method: "POST",
+            url: `/api/jobs/${String(queuedJob.id)}/retry`,
+            headers: {
+              cookie: appState.cookie,
+            },
+          });
+          expect(retry.statusCode).toBe(200);
+        }
       }
 
       expect(flakyProviderMediaInvoker).toHaveBeenCalled();

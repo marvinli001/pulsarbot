@@ -181,6 +181,24 @@ function summaryPath(conversationId: string): string {
   return `snapshots/summary/${conversationId}/${Date.now()}.md`;
 }
 
+function isManagedMemoryJobKind(
+  kind: string,
+): kind is "memory_reindex_document" | "memory_reindex_all" | "memory_refresh_before_compact" {
+  return kind === "memory_reindex_document" ||
+    kind === "memory_reindex_all" ||
+    kind === "memory_refresh_before_compact";
+}
+
+function retryDelayMs(attempts: number): number {
+  if (attempts <= 1) {
+    return 30_000;
+  }
+  if (attempts === 2) {
+    return 120_000;
+  }
+  return 600_000;
+}
+
 export class CloudflareMemoryStore implements MemoryStoreLike {
   public constructor(
     private readonly args: {
@@ -386,17 +404,23 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
 
   public async processPendingJobs(limit = 10): Promise<number> {
     const jobs = (await this.args.repository.listJobs({ status: "pending" }))
-      .filter((job) => job.workspaceId === this.args.workspaceId)
+      .filter((job) =>
+        job.workspaceId === this.args.workspaceId &&
+        isManagedMemoryJobKind(job.kind) &&
+        (!job.runAfter || Date.parse(job.runAfter) <= Date.now()) &&
+        !job.lockedAt
+      )
       .slice(0, limit);
 
     for (const job of jobs) {
+      const startedAt = nowIso();
       await this.args.repository.saveJob({
         ...job,
         status: "running",
         attempts: job.attempts + 1,
-        lockedAt: nowIso(),
+        lockedAt: startedAt,
         lockedBy: "memory-store",
-        updatedAt: nowIso(),
+        updatedAt: startedAt,
       });
 
       try {
@@ -420,23 +444,42 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
         await this.args.repository.saveJob({
           ...job,
           status: "completed",
+          attempts: job.attempts + 1,
           result: {
             processedAt: nowIso(),
           },
+          error: undefined,
           lockedAt: null,
           lockedBy: null,
           completedAt: nowIso(),
           updatedAt: nowIso(),
         });
       } catch (error) {
-        await this.args.repository.saveJob({
-          ...job,
-          status: "failed",
-          error: error instanceof Error ? error.message : "Unknown error",
-          lockedAt: null,
-          lockedBy: null,
-          updatedAt: nowIso(),
-        });
+        const attempts = job.attempts + 1;
+        const message = error instanceof Error ? error.message : "Unknown error";
+        if (attempts < 3) {
+          await this.args.repository.saveJob({
+            ...job,
+            status: "pending",
+            attempts,
+            error: message,
+            lockedAt: null,
+            lockedBy: null,
+            runAfter: new Date(Date.now() + retryDelayMs(attempts)).toISOString(),
+            updatedAt: nowIso(),
+          });
+        } else {
+          await this.args.repository.saveJob({
+            ...job,
+            status: "failed",
+            attempts,
+            error: message,
+            lockedAt: null,
+            lockedBy: null,
+            completedAt: null,
+            updatedAt: nowIso(),
+          });
+        }
       }
     }
 

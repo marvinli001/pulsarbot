@@ -179,9 +179,37 @@ export function resolveRuntimeSnapshot(args: {
   const enabledPluginInstalls = enabledInstallByManifestId(args.installs, "plugins");
   const enabledMcpInstalls = enabledInstallByManifestId(args.installs, "mcp");
   const serversById = new Map(args.mcpServers.map((server) => [server.id, server]));
+  const selectedSkillIds = new Set(args.profile.enabledSkillIds);
+  const selectedPluginIds = new Set(args.profile.enabledPluginIds);
+  const selectedMcpServerIds = new Set(args.profile.enabledMcpServerIds);
   const promptFragments: string[] = [];
   const allowedToolIds: string[] = [];
   const blocked: ResolvedRuntimeSnapshot["blocked"] = [];
+
+  const missingDependenciesFor = (dependencies: string[]): string[] =>
+    dependencies.filter((dependencyId) => {
+      if (skillManifests.has(dependencyId)) {
+        return !selectedSkillIds.has(dependencyId) || !enabledSkillInstalls.has(dependencyId);
+      }
+      if (pluginManifests.has(dependencyId)) {
+        return !selectedPluginIds.has(dependencyId) || !enabledPluginInstalls.has(dependencyId);
+      }
+      if (mcpManifests.has(dependencyId)) {
+        return !args.mcpServers.some((server) =>
+          selectedMcpServerIds.has(server.id) &&
+          server.enabled &&
+          server.manifestId === dependencyId &&
+          enabledMcpInstalls.has(dependencyId)
+        );
+      }
+      const server = serversById.get(dependencyId);
+      if (server) {
+        return !selectedMcpServerIds.has(server.id) ||
+          !server.enabled ||
+          Boolean(server.manifestId && !enabledMcpInstalls.has(server.manifestId));
+      }
+      return true;
+    });
 
   const enabledSkills = args.profile.enabledSkillIds.flatMap((id) => {
     const manifest = skillManifests.get(id);
@@ -199,6 +227,15 @@ export function resolveRuntimeSnapshot(args: {
         scope: "skill",
         id,
         reason: "Skill is not installed or not enabled",
+      });
+      return [];
+    }
+    const missingDependencies = missingDependenciesFor(manifest.dependencies);
+    if (missingDependencies.length > 0) {
+      blocked.push({
+        scope: "skill",
+        id,
+        reason: `Missing runtime dependencies: ${missingDependencies.join(", ")}`,
       });
       return [];
     }
@@ -230,6 +267,15 @@ export function resolveRuntimeSnapshot(args: {
         scope: "plugin",
         id,
         reason: "Plugin is not installed or not enabled",
+      });
+      return [];
+    }
+    const missingDependencies = missingDependenciesFor(manifest.dependencies);
+    if (missingDependencies.length > 0) {
+      blocked.push({
+        scope: "plugin",
+        id,
+        reason: `Missing runtime dependencies: ${missingDependencies.join(", ")}`,
       });
       return [];
     }
@@ -280,6 +326,15 @@ export function resolveRuntimeSnapshot(args: {
           reason: server.source === "official"
             ? "Official MCP manifest is not installed or not enabled"
             : "Linked MCP manifest is not installed or not enabled",
+        });
+        return [];
+      }
+      const missingDependencies = missingDependenciesFor(manifest.dependencies);
+      if (missingDependencies.length > 0) {
+        blocked.push({
+          scope: "mcp",
+          id,
+          reason: `Missing runtime dependencies: ${missingDependencies.join(", ")}`,
         });
         return [];
       }
