@@ -35,6 +35,17 @@ async function enableDefaultRuntimeDependencies(page: Page) {
   });
 }
 
+async function openSection(page: Page, section: string, heading: string) {
+  await page.getByRole("button", { name: section }).click();
+  await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
+}
+
+async function cardByTitle(page: Page, title: string) {
+  const card = page.locator("div.rounded-2xl").filter({ hasText: title }).first();
+  await card.scrollIntoViewIfNeeded();
+  return card;
+}
+
 test.describe("Mini App", () => {
   test("bootstraps the workspace and previews the runtime on mobile", async ({ page }) => {
     await page.goto("/miniapp/");
@@ -116,5 +127,97 @@ test.describe("Mini App", () => {
     await expect(page.getByText("Profile Saved")).toBeVisible();
     await expect(page.getByRole("heading", { name: "Runtime Preview" })).toBeVisible();
     await expect(page.locator("pre").last()).toContainText("generatedAt");
+
+    await openSection(page, "Skills", "Skills Market");
+    await expect(await cardByTitle(page, "Core Agent")).toContainText("Installed");
+    await expect(await cardByTitle(page, "Web Browse")).toBeVisible();
+
+    await openSection(page, "Plugins", "Plugins Market");
+    await expect(await cardByTitle(page, "Time Context")).toContainText("Installed");
+    await expect(await cardByTitle(page, "Export / Import")).toBeVisible();
+
+    await openSection(page, "MCP Market", "MCP Market");
+    const genericMcpCard = await cardByTitle(page, "Generic stdio Template");
+    await expect(genericMcpCard.getByText(/^Installed$/)).toBeVisible();
+    await expect(genericMcpCard.getByText(/^Disabled$/)).toBeVisible();
+    await genericMcpCard.getByRole("button", { name: "Enable" }).click();
+    await expect(genericMcpCard.getByText(/^Installed$/)).toBeVisible();
+    await expect(genericMcpCard.getByText(/^Enabled$/)).toBeVisible();
+
+    await openSection(page, "MCP Servers", "Configured MCP Servers");
+    await expect(page.getByText("Generic stdio Template")).toBeVisible();
+    await page.getByRole("button", { name: "Load" }).first().click();
+    await expect(page.getByRole("heading", { name: "Edit MCP Server" })).toBeVisible();
+
+    await openSection(page, "Import/Export", "Import / Export");
+    await page.getByPlaceholder("Current access token").fill("dev-access-token");
+    await page.getByPlaceholder("Export passphrase").fill("bundle-passphrase");
+    await page.getByRole("button", { name: "Export Bundle" }).click();
+    await expect(page.getByText("Bundle Exported")).toBeVisible();
+
+    const bundleArea = page.locator("textarea").first();
+    const exportedBundle = JSON.parse(await bundleArea.inputValue()) as Record<string, any>;
+    const now = new Date().toISOString();
+    const documentId = "doc-e2e-note";
+    const sourcePath = `documents/${documentId}/source/notes.txt`;
+    exportedBundle.documents = [
+      ...(Array.isArray(exportedBundle.documents) ? exportedBundle.documents : []),
+      {
+        id: documentId,
+        workspaceId: String(exportedBundle.workspace?.id ?? "main"),
+        sourceType: "import",
+        kind: "text",
+        title: "notes.txt",
+        path: sourcePath,
+        derivedTextPath: `documents/${documentId}/derived/content.md`,
+        sourceObjectKey: null,
+        derivedTextObjectKey: null,
+        previewText: "Playwright seeded note",
+        fileId: null,
+        sizeBytes: 24,
+        mimeType: "text/plain",
+        extractionStatus: "completed",
+        extractionProviderProfileId: null,
+        lastExtractionError: null,
+        lastIndexedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ];
+    exportedBundle.documentArtifacts = [
+      ...(Array.isArray(exportedBundle.documentArtifacts) ? exportedBundle.documentArtifacts : []),
+      {
+        documentId,
+        path: sourcePath,
+        contentBase64: Buffer.from("Playwright seeded note", "utf8").toString("base64"),
+        contentType: "text/plain",
+      },
+    ];
+    await bundleArea.fill(JSON.stringify(exportedBundle, null, 2));
+    await page.getByPlaceholder("Import passphrase").fill("bundle-passphrase");
+    await page.getByRole("button", { name: "Import Bundle" }).click();
+    await expect(page.getByText("Bundle Imported")).toBeVisible();
+
+    await openSection(page, "Providers", "Configured Providers");
+    await page.getByRole("button", { name: "Text" }).first().click();
+    await expect(page.getByText("All Passed")).toBeVisible();
+
+    await openSection(page, "Documents", "Documents");
+    await expect(page.getByText("notes.txt")).toBeVisible();
+    await page.getByRole("button", { name: "Inspect" }).first().click();
+    await expect(page.getByRole("heading", { name: "Selected Document" })).toBeVisible();
+    await expect(page.locator("pre").last()).toContainText("doc-e2e-note");
+    await page.getByRole("button", { name: "Reindex" }).first().click();
+    await expect(page.getByText("Reindexed")).toBeVisible();
+
+    await openSection(page, "Logs", "Logs Overview");
+    await expect(page.getByRole("heading", { name: "Recent Jobs" })).toBeVisible();
+    await expect(page.getByText(/memory_reindex_document · /).first()).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Recent Provider Tests" })).toBeVisible();
+
+    await openSection(page, "Health", "System Health Overview");
+    await expect(page.getByRole("heading", { name: "Cloudflare Dependencies" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Telegram Webhook" })).toBeVisible();
+    await expect(page.locator("pre").last()).toContainText("\"providerProfiles\": 1");
   });
 });

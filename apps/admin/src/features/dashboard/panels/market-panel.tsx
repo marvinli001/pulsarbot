@@ -31,8 +31,16 @@ export function MarketPanel({ kind }: { kind: "skills" | "plugins" | "mcp" }) {
       }),
     onSuccess: async () => {
       notificationOccurred("success");
-      await queryClient.invalidateQueries({ queryKey: ["market", kind] });
-      await queryClient.invalidateQueries({ queryKey: ["profiles"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["market", kind] }),
+        queryClient.invalidateQueries({ queryKey: ["profiles"] }),
+        ...(kind === "mcp"
+          ? [
+              queryClient.invalidateQueries({ queryKey: ["mcp-servers"] }),
+              queryClient.invalidateQueries({ queryKey: ["system-health"] }),
+            ]
+          : []),
+      ]);
     },
     onError: () => notificationOccurred("error"),
   });
