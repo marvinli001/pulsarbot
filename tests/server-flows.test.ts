@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CloudflareCredentials, ProviderProfile } from "../packages/shared/src/index.js";
+import { TurnStateSchema } from "../packages/shared/src/index.js";
 import type {
   ProviderInvocationInput,
   ProviderInvocationResult,
@@ -405,8 +406,14 @@ const fakeTelegramFactory = ({ onMessage, resolveForumTopicName }: {
 }) => {
   const implicitTopicStates = new Map<string, { effectiveMessageCount: number }>();
   const topicKey = (chatId: number, threadId: number) => `${chatId}:${threadId}`;
+  const sendMessage = vi.fn(async () => ({ message_id: 9001 }));
 
   return {
+    bot: {
+      api: {
+        sendMessage,
+      },
+    },
     handler: async (request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
       const body = request.body ?? {};
       const message = body.message ?? body;
@@ -490,7 +497,13 @@ const crashingTelegramFactory = ({ onMessage }: {
   ) => Promise<string>;
 }) => {
   let crashedOnce = false;
+  const sendMessage = vi.fn(async () => ({ message_id: 9002 }));
   return {
+    bot: {
+      api: {
+        sendMessage,
+      },
+    },
     handler: async (request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
       const body = request.body ?? {};
       const message = body.message ?? body;
@@ -540,6 +553,11 @@ const invalidPayloadTelegramFactory = ({ onMessage }: {
     },
   ) => Promise<string>;
 }) => ({
+  bot: {
+    api: {
+      sendMessage: vi.fn(async () => ({ message_id: 9003 })),
+    },
+  },
   handler: async (_request: { body?: any }, reply: { send: (payload: unknown) => unknown }) => {
     const response = await onMessage(null as never, {
       enabled: false,
@@ -2115,6 +2133,127 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
+  it("silences retried Telegram deliveries when a matching persisted turn already exists", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    const providerId = await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+    const internals = (appState.app as any).__pulsarbot as {
+      state: {
+        repository: {
+          getWorkspace(): Promise<Record<string, any> | null>;
+          listAgentProfiles(): Promise<Array<Record<string, any>>>;
+          saveConversationTurn(turn: Record<string, any>): Promise<void>;
+          saveTurnStateSnapshot(state: ReturnType<typeof TurnStateSchema.parse>): Promise<void>;
+        };
+      };
+    };
+    const workspace = await internals.state.repository.getWorkspace();
+    const profiles = await internals.state.repository.listAgentProfiles();
+    const profile = profiles.find((item) => item.primaryModelProfileId === providerId) ?? profiles[0];
+
+    expect(workspace).toBeTruthy();
+    expect(profile).toBeTruthy();
+
+    await internals.state.repository.saveConversationTurn({
+      id: "turn_duplicate_delivery",
+      workspaceId: String(workspace!.id),
+      conversationId: "telegram:7103",
+      profileId: String(profile!.id),
+      status: "running",
+      stepCount: 0,
+      toolCallCount: 0,
+      compacted: false,
+      summaryId: null,
+      error: null,
+      graphVersion: "v2",
+      stateSnapshotId: "state_duplicate_delivery",
+      lastEventSeq: 0,
+      currentNode: "run_agent_graph",
+      resumeEligible: true,
+      startedAt: "2026-03-12T00:00:00.000Z",
+      finishedAt: null,
+      lockExpiresAt: "2026-03-12T00:01:30.000Z",
+      updatedAt: "2026-03-12T00:00:00.000Z",
+    });
+    await internals.state.repository.saveTurnStateSnapshot(
+      TurnStateSchema.parse({
+        id: "state_duplicate_delivery",
+        turnId: "turn_duplicate_delivery",
+        workspaceId: String(workspace!.id),
+        conversationId: "telegram:7103",
+        graphVersion: "v2",
+        status: "running",
+        currentNode: "run_agent_graph",
+        version: 1,
+        input: {
+          updateId: 99125,
+          chatId: 7103,
+          threadId: null,
+          userId: 42,
+          username: "owner",
+          messageId: 323,
+          contentKind: "text",
+          normalizedText: "duplicate after persisted turn",
+          rawMetadata: {},
+        },
+        context: {
+          profileId: String(profile!.id),
+          timezone: "UTC",
+          nowIso: "2026-03-12T00:00:00.000Z",
+          runtimeSnapshot: {},
+          searchSettings: null,
+          historyWindow: 0,
+          summaryCursor: null,
+        },
+        budgets: {
+          maxPlanningSteps: 8,
+          maxToolCalls: 6,
+          maxTurnDurationMs: 60_000,
+          stepsUsed: 0,
+          toolCallsUsed: 0,
+          deadlineAt: "2026-03-12T00:01:00.000Z",
+        },
+        output: {
+          replyText: "",
+          telegramReplyMessageId: null,
+          streamingEnabled: false,
+          lastRenderedChars: 0,
+        },
+        recovery: {
+          resumeEligible: true,
+          resumeCount: 0,
+          lastRecoveredAt: null,
+        },
+        createdAt: "2026-03-12T00:00:00.000Z",
+        updatedAt: "2026-03-12T00:00:00.000Z",
+      }),
+    );
+
+    const duplicateDelivery = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        update_id: 99125,
+        message: {
+          message_id: 323,
+          text: "duplicate after persisted turn",
+          chat: { id: 7103 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    expect(duplicateDelivery.statusCode).toBe(200);
+    expect(duplicateDelivery.json()).toMatchObject({
+      ok: true,
+      response: "",
+    });
+
+    await appState.app.close();
+  });
+
   it("releases the Telegram update receipt when the webhook handler crashes so Telegram can retry", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
@@ -2366,19 +2505,19 @@ describe("server flows", () => {
     createdDirs.push(dataDir);
 
     const appState = await bootstrapApp(dataDir);
+    const internals = (appState.app as any).__pulsarbot as {
+      state: {
+        repository: {
+          deleteProviderProfile(id: string): Promise<void>;
+        };
+      };
+    };
     const provider = await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
     const profile = await createAgentProfileRecord(appState.app, appState.cookie, {
       label: "missing-provider",
       primaryModelProfileId: String(provider),
     });
-    const deletedProvider = await appState.app.inject({
-      method: "DELETE",
-      url: `/api/providers/${String(provider)}`,
-      headers: {
-        cookie: appState.cookie,
-      },
-    });
-    expect(deletedProvider.statusCode).toBe(200);
+    await internals.state.repository.deleteProviderProfile(String(provider));
     await updateWorkspaceProfiles(appState.app, appState.cookie, {
       primaryModelProfileId: String(provider),
       activeAgentProfileId: String(profile.id),
@@ -2908,6 +3047,310 @@ describe("server flows", () => {
       fetchSpy.mockRestore();
     }
   }, 15_000);
+
+  it("emits a Telegram reply when recovering an interrupted turn", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    const providerId = await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+    const internals = (appState.app as any).__pulsarbot as {
+      state: {
+        repository: {
+          getWorkspace(): Promise<Record<string, any> | null>;
+          getSearchSettings(): Promise<Record<string, any>>;
+          listAgentProfiles(): Promise<Array<Record<string, any>>>;
+          saveConversation(conversation: Record<string, any>): Promise<void>;
+          saveConversationTurn(turn: Record<string, any>): Promise<void>;
+          saveTurnStateSnapshot(state: ReturnType<typeof TurnStateSchema.parse>): Promise<void>;
+          getConversationTurn(id: string): Promise<Record<string, any> | null>;
+        };
+      };
+      telegram: {
+        bot: {
+          api: {
+            sendMessage: ReturnType<typeof vi.fn>;
+          };
+        };
+      };
+      recoverInterruptedTurns(): Promise<void>;
+    };
+    const workspace = await internals.state.repository.getWorkspace();
+    const profiles = await internals.state.repository.listAgentProfiles();
+    const profile = profiles.find((item) => item.primaryModelProfileId === providerId) ?? profiles[0];
+    expect(workspace).toBeTruthy();
+    expect(profile).toBeTruthy();
+
+    const turnId = "turn_recovery_case";
+    const conversationId = "telegram:4242";
+    const timestamp = "2026-03-12T00:00:00.000Z";
+
+    await internals.state.repository.saveConversation({
+      id: conversationId,
+      workspaceId: String(workspace!.id),
+      telegramChatId: "4242",
+      telegramUserId: "42",
+      mode: "private",
+      activeTurnLock: true,
+      activeTurnLockExpiresAt: "2026-03-12T00:01:30.000Z",
+      lastTurnId: turnId,
+      lastCompactedAt: null,
+      lastSummaryId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await internals.state.repository.saveConversationTurn({
+      id: turnId,
+      workspaceId: String(workspace!.id),
+      conversationId,
+      profileId: String(profile!.id),
+      status: "running",
+      stepCount: 0,
+      toolCallCount: 0,
+      compacted: false,
+      summaryId: null,
+      error: null,
+      graphVersion: "v2",
+      stateSnapshotId: "state_recovery_case",
+      lastEventSeq: 0,
+      currentNode: "run_agent_graph",
+      resumeEligible: true,
+      startedAt: timestamp,
+      finishedAt: null,
+      lockExpiresAt: "2026-03-12T00:01:30.000Z",
+      updatedAt: timestamp,
+    });
+    await internals.state.repository.saveTurnStateSnapshot(
+      TurnStateSchema.parse({
+        id: "state_recovery_case",
+        turnId,
+        workspaceId: String(workspace!.id),
+        conversationId,
+        graphVersion: "v2",
+        status: "running",
+        currentNode: "run_agent_graph",
+        version: 1,
+        input: {
+          updateId: 100,
+          chatId: 4242,
+          threadId: null,
+          userId: 42,
+          username: "owner",
+          messageId: 9,
+          contentKind: "text",
+          normalizedText: "hello",
+          rawMetadata: {},
+        },
+        context: {
+          profileId: String(profile!.id),
+          timezone: "UTC",
+          nowIso: timestamp,
+          runtimeSnapshot: {},
+          searchSettings: await internals.state.repository.getSearchSettings(),
+          historyWindow: 0,
+          summaryCursor: null,
+        },
+        budgets: {
+          maxPlanningSteps: 8,
+          maxToolCalls: 6,
+          maxTurnDurationMs: 30_000,
+          stepsUsed: 0,
+          toolCallsUsed: 0,
+          deadlineAt: "2026-03-12T00:00:30.000Z",
+        },
+        output: {
+          replyText: "",
+          telegramReplyMessageId: null,
+          streamingEnabled: false,
+          lastRenderedChars: 0,
+        },
+        recovery: {
+          resumeEligible: true,
+          resumeCount: 0,
+          lastRecoveredAt: null,
+        },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+
+    await internals.recoverInterruptedTurns();
+
+    expect(internals.telegram.bot.api.sendMessage).toHaveBeenCalledWith(4242, "OK");
+    const recoveredTurn = await internals.state.repository.getConversationTurn(turnId);
+    expect(recoveredTurn).toMatchObject({
+      id: turnId,
+      status: "completed",
+      resumeEligible: false,
+    });
+
+    await appState.app.close();
+  });
+
+  it("marks import and export runs as failed when execution throws", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    const internals = (appState.app as any).__pulsarbot as {
+      state: {
+        exportBundle: (passphrase: string) => Promise<unknown>;
+        importBundle: (bundle: unknown, passphrase: string) => Promise<void>;
+        repository: {
+          listImportExportRuns(limit?: number): Promise<Array<Record<string, any>>>;
+        };
+      };
+    };
+
+    const exportSpy = vi.spyOn(internals.state, "exportBundle").mockRejectedValueOnce(
+      new Error("export failed"),
+    );
+    const exported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/export",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+      },
+    });
+    expect(exported.statusCode).toBe(500);
+    const exportRun = (await internals.state.repository.listImportExportRuns(10))
+      .find((run) => run.type === "export");
+    expect(exportRun).toMatchObject({
+      status: "failed",
+      error: "export failed",
+    });
+    exportSpy.mockRestore();
+
+    const importSpy = vi.spyOn(internals.state, "importBundle").mockRejectedValueOnce(
+      new Error("import failed"),
+    );
+    const imported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/import",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        bundle: {},
+      },
+    });
+    expect(imported.statusCode).toBe(500);
+    const importRun = (await internals.state.repository.listImportExportRuns(10))
+      .find((run) => run.type === "import");
+    expect(importRun).toMatchObject({
+      status: "failed",
+      error: "import failed",
+    });
+    importSpy.mockRestore();
+
+    await appState.app.close();
+  });
+
+  it("protects provider deletion and cleans profile references for deleted MCP servers and agent profiles", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+    const providerId = await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const profilesResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/agent-profiles",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const profile = profilesResponse
+      .json<Array<Record<string, any>>>()
+      .find((item) => item.primaryModelProfileId === providerId);
+    expect(profile).toBeTruthy();
+
+    const createdServer = await appState.app.inject({
+      method: "POST",
+      url: "/api/mcp/servers",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        label: "Custom MCP",
+        transport: "stdio",
+        command: "npx",
+        args: ["example-mcp"],
+        enabled: true,
+      },
+    });
+    expect(createdServer.statusCode).toBe(200);
+    const server = createdServer.json<Record<string, any>>();
+
+    const updatedProfile = await appState.app.inject({
+      method: "PUT",
+      url: `/api/agent-profiles/${String(profile!.id)}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        ...profile,
+        enabledMcpServerIds: [...(profile!.enabledMcpServerIds ?? []), String(server.id)],
+      },
+    });
+    expect(updatedProfile.statusCode).toBe(200);
+
+    const deleteProvider = await appState.app.inject({
+      method: "DELETE",
+      url: `/api/providers/${providerId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(deleteProvider.statusCode).toBe(409);
+
+    const deleteServer = await appState.app.inject({
+      method: "DELETE",
+      url: `/api/mcp/servers/${String(server.id)}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(deleteServer.statusCode).toBe(200);
+
+    const refreshedProfiles = await appState.app.inject({
+      method: "GET",
+      url: "/api/agent-profiles",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const refreshedProfile = refreshedProfiles
+      .json<Array<Record<string, any>>>()
+      .find((item) => item.id === profile!.id);
+    expect(refreshedProfile?.enabledMcpServerIds ?? []).not.toContain(String(server.id));
+
+    const deleteProfile = await appState.app.inject({
+      method: "DELETE",
+      url: `/api/agent-profiles/${String(profile!.id)}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(deleteProfile.statusCode).toBe(200);
+
+    const workspaceResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/workspace",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(workspaceResponse.json<Record<string, any>>().workspace).toMatchObject({
+      activeAgentProfileId: null,
+    });
+
+    await appState.app.close();
+  });
 
   it("queues document re-extraction jobs, supports retry, and completes the job in background", async () => {
     const dataDir = await createTempDataDir();

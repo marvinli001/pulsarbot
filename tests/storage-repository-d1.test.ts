@@ -195,6 +195,60 @@ describe("D1AppRepository", () => {
     );
   });
 
+  it("claims conversation turn locks in a dedicated SQL table", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => []);
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    const result = await repository.claimConversationTurnLock({
+      conversationId: "conversation_1",
+      turnId: "turn_1",
+      lockExpiresAt: "2026-01-01T00:01:30.000Z",
+    });
+
+    expect(result).toBe("claimed");
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      expect.stringContaining("INSERT INTO conversation_turn_lock"),
+      expect.arrayContaining([
+        "convturn:conversation_1",
+        "conversation_1",
+        "turn_1",
+        "2026-01-01T00:01:30.000Z",
+      ]),
+    );
+  });
+
+  it("returns in_progress when a live conversation turn lock already exists", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => [{
+      turn_id: "turn_existing",
+      lock_expires_at: "2999-01-01T00:00:00.000Z",
+    }]);
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    const result = await repository.claimConversationTurnLock({
+      conversationId: "conversation_1",
+      turnId: "turn_1",
+      lockExpiresAt: "2026-01-01T00:01:30.000Z",
+    });
+
+    expect(result).toBe("in_progress");
+    expect(executeD1).not.toHaveBeenCalled();
+  });
+
   it("lists turn events by turn + cursor + limit in SQL", async () => {
     const event = makeTurnEvent();
     const executeD1 = vi.fn(async () => undefined);
@@ -268,6 +322,11 @@ describe("D1AppRepository", () => {
     expect(executeD1).toHaveBeenCalledWith(
       "db_1",
       "DELETE FROM provider_profile",
+      undefined,
+    );
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM conversation_turn_lock",
       undefined,
     );
     expect(executeD1).toHaveBeenCalledWith(

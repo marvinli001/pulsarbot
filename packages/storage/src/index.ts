@@ -149,6 +149,14 @@ const createTableStatements = [
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS conversation_turn_lock (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE,
+    turn_id TEXT NOT NULL,
+    lock_expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS conversation_turn (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
@@ -201,6 +209,7 @@ const createIndexStatements = [
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
   "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
   "CREATE INDEX IF NOT EXISTS idx_telegram_update_receipt_status ON telegram_update_receipt(status, updated_at)",
+  "CREATE INDEX IF NOT EXISTS idx_conversation_turn_lock_expires_at ON conversation_turn_lock(lock_expires_at)",
   "CREATE INDEX IF NOT EXISTS idx_turn_event_turn_seq ON turn_event(json_extract(data, '$.turnId'), json_extract(data, '$.seq'))",
   "CREATE INDEX IF NOT EXISTS idx_turn_event_occurred_at ON turn_event(json_extract(data, '$.occurredAt'))",
   "CREATE INDEX IF NOT EXISTS idx_turn_state_turn_id ON turn_state_snapshot(json_extract(data, '$.turnId'))",
@@ -392,6 +401,7 @@ export function rewrapSecret(args: {
 
 export type ConversationMessage = MessageRecord;
 type TelegramUpdateClaimResult = "claimed" | "duplicate" | "in_progress";
+type ConversationTurnLockClaimResult = "claimed" | "in_progress";
 
 export interface AppRepository {
   getWorkspace(): Promise<Workspace | null>;
@@ -453,6 +463,12 @@ export interface AppRepository {
   getConversation(id: string): Promise<ConversationRecord | null>;
   listConversations(): Promise<ConversationRecord[]>;
   saveConversation(conversation: ConversationRecord): Promise<void>;
+  claimConversationTurnLock(args: {
+    conversationId: string;
+    turnId: string;
+    lockExpiresAt: string;
+  }): Promise<ConversationTurnLockClaimResult>;
+  releaseConversationTurnLock(conversationId: string, turnId?: string): Promise<void>;
   listConversationMessages(conversationId: string): Promise<ConversationMessage[]>;
   saveConversationMessage(
     conversationId: string,
@@ -882,6 +898,7 @@ export class D1AppRepository implements AppRepository {
     const statements: Array<{ sql: string; params?: unknown[] }> = [
       { sql: "DELETE FROM turn_event" },
       { sql: "DELETE FROM turn_state_snapshot" },
+      { sql: "DELETE FROM conversation_turn_lock" },
       { sql: "DELETE FROM tool_run" },
       { sql: "DELETE FROM conversation_turn" },
       { sql: "DELETE FROM conversation_summary" },
@@ -1081,6 +1098,84 @@ export class D1AppRepository implements AppRepository {
       id: conversation.id,
       data: ConversationRecordSchema.parse(conversation),
     });
+  }
+
+  public async claimConversationTurnLock(args: {
+    conversationId: string;
+    turnId: string;
+    lockExpiresAt: string;
+  }): Promise<ConversationTurnLockClaimResult> {
+    const lockId = `convturn:${args.conversationId}`;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const existingRows = await this.client.queryD1<{
+        turn_id: string;
+        lock_expires_at: string;
+      }>(
+        this.databaseId,
+        `SELECT turn_id, lock_expires_at
+        FROM conversation_turn_lock
+        WHERE conversation_id = ?
+        LIMIT 1`,
+        [args.conversationId],
+      );
+      const existing = existingRows[0];
+      if (existing && Date.parse(existing.lock_expires_at) > Date.now()) {
+        return "in_progress";
+      }
+      if (existing) {
+        await this.client.executeD1(
+          this.databaseId,
+          "DELETE FROM conversation_turn_lock WHERE conversation_id = ? AND turn_id = ?",
+          [args.conversationId, existing.turn_id],
+        );
+      }
+
+      try {
+        const timestamp = nowIso();
+        await this.client.executeD1(
+          this.databaseId,
+          `INSERT INTO conversation_turn_lock (
+            id, conversation_id, turn_id, lock_expires_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            lockId,
+            args.conversationId,
+            args.turnId,
+            args.lockExpiresAt,
+            timestamp,
+            timestamp,
+          ],
+        );
+        return "claimed";
+      } catch (error) {
+        if (error instanceof Error && /unique|constraint/i.test(error.message)) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    return "in_progress";
+  }
+
+  public async releaseConversationTurnLock(
+    conversationId: string,
+    turnId?: string,
+  ): Promise<void> {
+    if (turnId) {
+      await this.client.executeD1(
+        this.databaseId,
+        "DELETE FROM conversation_turn_lock WHERE conversation_id = ? AND turn_id = ?",
+        [conversationId, turnId],
+      );
+      return;
+    }
+    await this.client.executeD1(
+      this.databaseId,
+      "DELETE FROM conversation_turn_lock WHERE conversation_id = ?",
+      [conversationId],
+    );
   }
 
   public async listConversationMessages(
@@ -1414,6 +1509,11 @@ export class InMemoryAppRepository implements AppRepository {
   private toolRuns = new Map<string, ToolRunRecord>();
   private jobs = new Map<string, JobRecord>();
   private conversations = new Map<string, ConversationRecord>();
+  private conversationTurnLocks = new Map<string, {
+    turnId: string;
+    lockExpiresAt: string;
+    updatedAt: string;
+  }>();
   private messages = new Map<string, ConversationMessage[]>();
   private turnStateSnapshots = new Map<string, TurnState>();
   private turnEvents = new Map<string, TurnEvent>();
@@ -1620,6 +1720,7 @@ export class InMemoryAppRepository implements AppRepository {
     this.toolRuns.clear();
     this.jobs.clear();
     this.conversations.clear();
+    this.conversationTurnLocks.clear();
     this.messages.clear();
     this.turnStateSnapshots.clear();
     this.turnEvents.clear();
@@ -1762,6 +1863,37 @@ export class InMemoryAppRepository implements AppRepository {
   public async saveConversation(conversation: ConversationRecord): Promise<void> {
     const parsed = ConversationRecordSchema.parse(conversation);
     this.conversations.set(parsed.id, parsed);
+  }
+
+  public async claimConversationTurnLock(args: {
+    conversationId: string;
+    turnId: string;
+    lockExpiresAt: string;
+  }): Promise<ConversationTurnLockClaimResult> {
+    const existing = this.conversationTurnLocks.get(args.conversationId);
+    if (existing && Date.parse(existing.lockExpiresAt) > Date.now()) {
+      return "in_progress";
+    }
+    this.conversationTurnLocks.set(args.conversationId, {
+      turnId: args.turnId,
+      lockExpiresAt: args.lockExpiresAt,
+      updatedAt: nowIso(),
+    });
+    return "claimed";
+  }
+
+  public async releaseConversationTurnLock(
+    conversationId: string,
+    turnId?: string,
+  ): Promise<void> {
+    const existing = this.conversationTurnLocks.get(conversationId);
+    if (!existing) {
+      return;
+    }
+    if (turnId && existing.turnId !== turnId) {
+      return;
+    }
+    this.conversationTurnLocks.delete(conversationId);
   }
 
   public async listConversationMessages(
