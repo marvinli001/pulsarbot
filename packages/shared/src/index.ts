@@ -132,6 +132,15 @@ export const AuthSessionSchema = z.object({
   revokedAt: z.string().nullable().default(null),
 });
 
+export const TelegramLoginReceiptSchema = z.object({
+  id: z.string().min(1),
+  receiptKey: z.string().min(1),
+  telegramUserId: z.string().min(1),
+  expiresAt: z.string().min(1),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
 export const SecretEnvelopeSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
@@ -697,8 +706,21 @@ export const DocumentMetadataSchema = z.object({
   extractionStatus: z
     .enum(["pending", "processing", "completed", "failed"])
     .default("pending"),
+  extractionMethod: z
+    .enum([
+      "decode_text",
+      "fallback_text",
+      "provider_vision",
+      "provider_audio",
+      "provider_document",
+      "pdf_parse",
+      "docx_mammoth",
+    ])
+    .nullable()
+    .default(null),
   extractionProviderProfileId: z.string().nullable().default(null),
   lastExtractionError: z.string().nullable().default(null),
+  lastExtractedAt: z.string().nullable().default(null),
   lastIndexedAt: z.string().nullable().default(null),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
@@ -875,6 +897,7 @@ export type Workspace = z.infer<typeof WorkspaceSchema>;
 export type BootstrapState = z.infer<typeof BootstrapStateSchema>;
 export type AdminIdentity = z.infer<typeof AdminIdentitySchema>;
 export type AuthSession = z.infer<typeof AuthSessionSchema>;
+export type TelegramLoginReceipt = z.infer<typeof TelegramLoginReceiptSchema>;
 export type SecretEnvelope = z.infer<typeof SecretEnvelopeSchema>;
 export type ProviderProfile = z.infer<typeof ProviderProfileSchema>;
 export type AgentProfile = z.infer<typeof AgentProfileSchema>;

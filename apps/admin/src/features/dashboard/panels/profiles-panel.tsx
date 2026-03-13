@@ -33,6 +33,37 @@ import {
   useRuntimePreview,
 } from "../shared.js";
 
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function asArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item),
+  );
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0 ? value : "-";
+}
+
+function toneForScope(scope: string): "neutral" | "warning" | "danger" {
+  if (scope === "profile") {
+    return "danger";
+  }
+  if (scope === "skill" || scope === "plugin" || scope === "mcp") {
+    return "warning";
+  }
+  return "neutral";
+}
+
 export function ProfilesPanel() {
   const profiles = useProfiles();
   const providers = useProviders();
@@ -79,6 +110,18 @@ export function ProfilesPanel() {
   }, [form.primaryModelProfileId, providers.data]);
 
   const runtimePreview = useRuntimePreview(editingId);
+  const runtimePayload = asRecord(runtimePreview.data);
+  const runtimeBlocked = asArray(runtimePayload.blocked);
+  const runtimeTools = asArray(runtimePayload.tools);
+  const runtimeEnabledSkills = asArray(runtimePayload.enabledSkills);
+  const runtimeEnabledPlugins = asArray(runtimePayload.enabledPlugins);
+  const runtimeEnabledMcpServers = asArray(runtimePayload.enabledMcpServers);
+  const runtimeSearchSettings = asRecord(runtimePayload.searchSettings);
+  const promptFragmentCount = Array.isArray(runtimePayload.promptFragments)
+    ? runtimePayload.promptFragments.length
+    : typeof runtimePayload.promptFragmentCount === "number"
+      ? runtimePayload.promptFragmentCount
+      : 0;
 
   const providerOptions = [
     { value: "", label: "Select provider" },
@@ -353,12 +396,167 @@ export function ProfilesPanel() {
         </div>
       </Panel>
       {editingId ? (
-        <JsonPanel
-          title="Runtime Preview"
-          subtitle="当前 profile 在运行时真正会启用的 prompt fragments、tools、MCP 和 blocked reasons。"
-          value={runtimePreview.data ?? {}}
-          actions={<MutationBadge mutation={saveMutation} successLabel="Saved" />}
-        />
+        <div className="grid gap-6 xl:col-span-2">
+          <Panel
+            title="Runtime Preview"
+            subtitle="把当前 profile 解析成真正会启用的能力快照，而不是只看原始 JSON。"
+            actions={<MutationBadge mutation={saveMutation} successLabel="Saved" />}
+          >
+            <div className="grid gap-4">
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {[
+                  {
+                    label: "Generated At",
+                    value: asString(runtimePayload.generatedAt),
+                  },
+                  {
+                    label: "Enabled Skills",
+                    value: String(runtimeEnabledSkills.length),
+                  },
+                  {
+                    label: "Enabled Plugins",
+                    value: String(runtimeEnabledPlugins.length),
+                  },
+                  {
+                    label: "Enabled MCP Servers",
+                    value: String(runtimeEnabledMcpServers.length),
+                  },
+                  {
+                    label: "Enabled Tools",
+                    value: String(runtimeTools.length),
+                  },
+                  {
+                    label: "Prompt Fragments",
+                    value: String(promptFragmentCount),
+                  },
+                  {
+                    label: "Blocked Capabilities",
+                    value: String(runtimeBlocked.length),
+                  },
+                  {
+                    label: "Search Fallback",
+                    value: asString(runtimeSearchSettings.fallbackStrategy),
+                  },
+                ].map((item) => (
+                  <div
+                    key={item.label}
+                    className="rounded-2xl border border-slate-200 bg-slate-50 p-4"
+                  >
+                    <p className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      {item.label}
+                    </p>
+                    <p className="mt-2 break-words text-sm font-medium text-slate-900">
+                      {item.value}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <div className="grid gap-6 xl:grid-cols-2">
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium text-slate-900">Blocked Capabilities</p>
+                    <Badge tone={runtimeBlocked.length === 0 ? "success" : "warning"}>
+                      {runtimeBlocked.length === 0 ? "Clear" : `${runtimeBlocked.length} blocked`}
+                    </Badge>
+                  </div>
+                  {runtimeBlocked.length === 0 ? (
+                    <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700">
+                      No blocked capabilities.
+                    </div>
+                  ) : null}
+                  {runtimeBlocked.map((item) => (
+                    <div
+                      key={`${asString(item.scope)}-${asString(item.id)}`}
+                      className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="font-medium text-slate-900">
+                          {asString(item.scope)} · {asString(item.id)}
+                        </p>
+                        <Badge tone={toneForScope(asString(item.scope))}>
+                          {asString(item.scope)}
+                        </Badge>
+                      </div>
+                      <p className="mt-2 text-slate-500">{asString(item.reason)}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium text-slate-900">Enabled Tool Snapshot</p>
+                    <Badge tone="neutral">{runtimeTools.length} tools</Badge>
+                  </div>
+                  {runtimeTools.length === 0 ? (
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">
+                      No tools resolved for this profile.
+                    </div>
+                  ) : null}
+                  {runtimeTools.slice(0, 12).map((tool) => (
+                    <div
+                      key={asString(tool.id)}
+                      className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="font-medium text-slate-900">{asString(tool.title)}</p>
+                        <Badge tone="neutral">{asString(tool.source)}</Badge>
+                      </div>
+                      <p className="mt-2 text-slate-500">{asString(tool.id)}</p>
+                      <p className="mt-1 text-slate-500">
+                        scopes {Array.isArray(tool.permissionScopes)
+                          ? tool.permissionScopes.join(", ")
+                          : "-"}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="grid gap-6 xl:grid-cols-3">
+                {[
+                  {
+                    title: "Enabled Skills",
+                    items: runtimeEnabledSkills,
+                  },
+                  {
+                    title: "Enabled Plugins",
+                    items: runtimeEnabledPlugins,
+                  },
+                  {
+                    title: "Enabled MCP Servers",
+                    items: runtimeEnabledMcpServers,
+                  },
+                ].map((section) => (
+                  <div key={section.title} className="rounded-3xl border border-slate-200 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-medium text-slate-900">{section.title}</p>
+                      <Badge tone="neutral">{section.items.length}</Badge>
+                    </div>
+                    <div className="mt-3 grid gap-2">
+                      {section.items.length === 0 ? (
+                        <p className="text-sm text-slate-500">Nothing enabled.</p>
+                      ) : null}
+                      {section.items.map((item) => (
+                        <div
+                          key={asString(item.id)}
+                          className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-sm"
+                        >
+                          <p className="font-medium text-slate-900">
+                            {asString(item.label ?? item.title ?? item.id)}
+                          </p>
+                          <p className="mt-1 text-slate-500">{asString(item.id)}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Panel>
+          <JsonPanel
+            title="Runtime Preview (Raw JSON)"
+            subtitle="保留完整输出，便于继续排障和验证 runtime resolve。"
+            value={runtimePreview.data ?? {}}
+          />
+        </div>
       ) : null}
     </div>
   );

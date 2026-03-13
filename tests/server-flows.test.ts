@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -587,6 +588,31 @@ function getCookie(response: { headers: Record<string, unknown> }) {
   return raw.split(";")[0];
 }
 
+function createTelegramInitData(args: {
+  botToken: string;
+  userId: string;
+  username?: string;
+  authDate?: number;
+}) {
+  const params = new URLSearchParams();
+  params.set("auth_date", String(args.authDate ?? Math.floor(Date.now() / 1000)));
+  params.set(
+    "user",
+    JSON.stringify({
+      id: Number(args.userId),
+      ...(args.username ? { username: args.username } : {}),
+    }),
+  );
+  const checkString = [...params.entries()]
+    .map(([key, value]) => `${key}=${value}`)
+    .sort()
+    .join("\n");
+  const secret = createHmac("sha256", "WebAppData").update(args.botToken).digest();
+  const hash = createHmac("sha256", secret).update(checkString).digest("hex");
+  params.set("hash", hash);
+  return params.toString();
+}
+
 async function waitForCondition(
   predicate: () => Promise<boolean>,
   timeoutMs = 7_000,
@@ -993,6 +1019,125 @@ afterEach(async () => {
 });
 
 describe("server flows", () => {
+  it("returns stable 401 codes for malformed and expired Telegram initData", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const { createApp } = await importAppModule();
+    const app = await createApp({
+      env: {
+        NODE_ENV: "production",
+        TELEGRAM_BOT_TOKEN: "123456:TESTTOKEN",
+        PULSARBOT_ACCESS_TOKEN: "dev-access-token",
+        DATA_DIR: dataDir,
+        PORT: 3001,
+      },
+      cloudflareClientFactory: (credentials) => new FakeCloudflareClient(credentials) as never,
+      providerInvoker: fakeProviderInvoker,
+      providerMediaInvoker: fakeProviderMediaInvoker,
+      telegramFactory: fakeTelegramFactory as never,
+    });
+
+    const malformed = await app.inject({
+      method: "POST",
+      url: "/api/session/telegram",
+      payload: {
+        initData: "user=%7B%22id%22%3A42%7D&auth_date=123456&hash=ab",
+      },
+    });
+    expect(malformed.statusCode).toBe(401);
+    expect(malformed.json()).toMatchObject({
+      code: "MALFORMED_TELEGRAM_INIT_DATA",
+    });
+
+    const expired = await app.inject({
+      method: "POST",
+      url: "/api/session/telegram",
+      payload: {
+        initData: createTelegramInitData({
+          botToken: "123456:TESTTOKEN",
+          userId: "42",
+          username: "owner",
+          authDate: Math.floor(Date.now() / 1000) - (11 * 60),
+        }),
+      },
+    });
+    expect(expired.statusCode).toBe(401);
+    expect(expired.json()).toMatchObject({
+      code: "EXPIRED_TELEGRAM_INIT_DATA",
+    });
+
+    await app.close();
+  });
+
+  it("blocks replayed Telegram initData while allowing the same browser session to refresh", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const { createApp } = await importAppModule();
+    const app = await createApp({
+      env: {
+        NODE_ENV: "production",
+        TELEGRAM_BOT_TOKEN: "123456:TESTTOKEN",
+        PULSARBOT_ACCESS_TOKEN: "dev-access-token",
+        DATA_DIR: dataDir,
+        PORT: 3001,
+      },
+      cloudflareClientFactory: (credentials) => new FakeCloudflareClient(credentials) as never,
+      providerInvoker: fakeProviderInvoker,
+      providerMediaInvoker: fakeProviderMediaInvoker,
+      telegramFactory: fakeTelegramFactory as never,
+    });
+
+    const initData = createTelegramInitData({
+      botToken: "123456:TESTTOKEN",
+      userId: "42",
+      username: "owner",
+    });
+
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/session/telegram",
+      payload: {
+        initData,
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    const cookie = getCookie(first);
+
+    const replayed = await app.inject({
+      method: "POST",
+      url: "/api/session/telegram",
+      payload: {
+        initData,
+      },
+    });
+    expect(replayed.statusCode).toBe(401);
+    expect(replayed.json()).toMatchObject({
+      code: "REPLAYED_TELEGRAM_INIT_DATA",
+    });
+
+    const sameSession = await app.inject({
+      method: "POST",
+      url: "/api/session/telegram",
+      headers: {
+        cookie,
+      },
+      payload: {
+        initData,
+      },
+    });
+    expect(sameSession.statusCode).toBe(200);
+    expect(sameSession.json()).toMatchObject({
+      user: {
+        userId: "42",
+        username: "owner",
+      },
+    });
+
+    await app.close();
+  });
+
   it("keeps admin API session valid after bootstrap switches repository", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
@@ -3486,4 +3631,361 @@ describe("server flows", () => {
 
     await appState.app.close();
   }, 15_000);
+
+  it("marks a document as failed when re-extraction crashes before completion", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir, {
+      backgroundPollMs: 50,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const exported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/export",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        exportPassphrase: "bundle-passphrase",
+      },
+    });
+    const bundle = exported.json<Record<string, any>>();
+    const documentId = "doc-bad-pdf";
+    const sourcePath = "documents/doc-bad-pdf/source/report.pdf";
+
+    bundle.documents = [
+      ...(Array.isArray(bundle.documents) ? bundle.documents : []),
+      {
+        id: documentId,
+        workspaceId: "main",
+        sourceType: "import",
+        kind: "pdf",
+        title: "report.pdf",
+        path: sourcePath,
+        derivedTextPath: `documents/${documentId}/derived/content.md`,
+        sourceObjectKey: `workspace/main/${sourcePath}`,
+        derivedTextObjectKey: null,
+        previewText: "stale preview",
+        fileId: null,
+        sizeBytes: 24,
+        mimeType: "application/pdf",
+        extractionStatus: "failed",
+        extractionMethod: null,
+        extractionProviderProfileId: null,
+        lastExtractionError: "stale",
+        lastExtractedAt: null,
+        lastIndexedAt: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+    bundle.documentArtifacts = [
+      ...(Array.isArray(bundle.documentArtifacts) ? bundle.documentArtifacts : []),
+      {
+        documentId,
+        path: sourcePath,
+        contentBase64: Buffer.from("not-a-real-pdf", "utf8").toString("base64"),
+        contentType: "application/pdf",
+      },
+    ];
+
+    const imported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/import",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        importPassphrase: "bundle-passphrase",
+        bundle,
+      },
+    });
+    expect(imported.statusCode).toBe(200);
+
+    const reextract = await appState.app.inject({
+      method: "POST",
+      url: `/api/documents/${documentId}/re-extract`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(reextract.statusCode).toBe(200);
+
+    await waitForCondition(async () => {
+      const response = await appState.app.inject({
+        method: "GET",
+        url: `/api/documents/${documentId}`,
+        headers: {
+          cookie: appState.cookie,
+        },
+      });
+      const document = response.json<Record<string, any>>();
+      return document.extractionStatus === "failed" &&
+        typeof document.lastExtractionError === "string" &&
+        document.lastExtractionError.length > 0;
+    });
+
+    const documentResponse = await appState.app.inject({
+      method: "GET",
+      url: `/api/documents/${documentId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(documentResponse.statusCode).toBe(200);
+    expect(documentResponse.json<Record<string, any>>()).toMatchObject({
+      id: documentId,
+      extractionStatus: "failed",
+    });
+
+    const healthResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/system/health",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(healthResponse.statusCode).toBe(200);
+    expect(healthResponse.json<Record<string, any>>()).toMatchObject({
+      documents: {
+        failed: 1,
+        recentFailures: expect.arrayContaining([
+          expect.objectContaining({
+            id: documentId,
+            extractionStatus: "failed",
+          }),
+        ]),
+      },
+    });
+
+    await appState.app.close();
+  }, 15_000);
+
+  it("falls back to provider document extraction when local PDF parsing throws", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const providerDocumentInvoker = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderMediaInvocationInput;
+      }): Promise<ProviderInvocationResult | null> => {
+        void args.profile;
+        void args.apiKey;
+        if (args.input.kind !== "document") {
+          return null;
+        }
+        return {
+          text: "Provider extracted body text from a broken PDF fallback path.",
+          raw: {},
+        };
+      },
+    );
+
+    const appState = await bootstrapApp(dataDir, {
+      providerMediaInvoker: providerDocumentInvoker,
+      backgroundPollMs: 50,
+    });
+    const providerId = await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    await appState.app.inject({
+      method: "PUT",
+      url: `/api/providers/${providerId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        kind: "openrouter",
+        label: "Primary Provider",
+        apiBaseUrl: "https://openrouter.ai/api/v1",
+        defaultModel: "openai/gpt-4.1-mini",
+        documentModel: "google/gemini-2.5-flash",
+        documentInputEnabled: true,
+      },
+    });
+
+    const exported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/export",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        exportPassphrase: "bundle-passphrase",
+      },
+    });
+    const bundle = exported.json<Record<string, any>>();
+    const documentId = "doc-provider-fallback-pdf";
+    const sourcePath = "documents/doc-provider-fallback-pdf/source/report.pdf";
+
+    bundle.documents = [
+      ...(Array.isArray(bundle.documents) ? bundle.documents : []),
+      {
+        id: documentId,
+        workspaceId: "main",
+        sourceType: "import",
+        kind: "pdf",
+        title: "report.pdf",
+        path: sourcePath,
+        derivedTextPath: `documents/${documentId}/derived/content.md`,
+        sourceObjectKey: `workspace/main/${sourcePath}`,
+        derivedTextObjectKey: null,
+        previewText: "stale preview",
+        fileId: null,
+        sizeBytes: 24,
+        mimeType: "application/pdf",
+        extractionStatus: "failed",
+        extractionMethod: null,
+        extractionProviderProfileId: null,
+        lastExtractionError: "stale",
+        lastExtractedAt: null,
+        lastIndexedAt: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+    bundle.documentArtifacts = [
+      ...(Array.isArray(bundle.documentArtifacts) ? bundle.documentArtifacts : []),
+      {
+        documentId,
+        path: sourcePath,
+        contentBase64: Buffer.from("not-a-real-pdf", "utf8").toString("base64"),
+        contentType: "application/pdf",
+      },
+    ];
+
+    const imported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/import",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        importPassphrase: "bundle-passphrase",
+        bundle,
+      },
+    });
+    expect(imported.statusCode).toBe(200);
+
+    const reextract = await appState.app.inject({
+      method: "POST",
+      url: `/api/documents/${documentId}/re-extract`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(reextract.statusCode).toBe(200);
+
+    await waitForCondition(async () => {
+      const response = await appState.app.inject({
+        method: "GET",
+        url: `/api/documents/${documentId}`,
+        headers: {
+          cookie: appState.cookie,
+        },
+      });
+      return response.json<Record<string, any>>().extractionStatus === "completed";
+    });
+
+    const documentResponse = await appState.app.inject({
+      method: "GET",
+      url: `/api/documents/${documentId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(documentResponse.statusCode).toBe(200);
+    expect(documentResponse.json<Record<string, any>>()).toMatchObject({
+      id: documentId,
+      extractionStatus: "completed",
+      extractionMethod: "provider_document",
+    });
+
+    await appState.app.close();
+  }, 15_000);
+
+  it("returns a conflict when a memory document metadata row exists but the R2 object is missing", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+
+    const exported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/export",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        exportPassphrase: "bundle-passphrase",
+      },
+    });
+    const bundle = exported.json<Record<string, any>>();
+    const now = new Date().toISOString();
+    const memoryId = "memorydoc-missing-r2";
+
+    bundle.memories = [
+      ...(Array.isArray(bundle.memories) ? bundle.memories : []),
+      {
+        id: memoryId,
+        workspaceId: "main",
+        kind: "longterm",
+        path: "memory/MISSING.md",
+        title: "MISSING.md",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ];
+
+    const imported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/import",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        importPassphrase: "bundle-passphrase",
+        bundle,
+      },
+    });
+    expect(imported.statusCode).toBe(200);
+
+    const readMissing = await appState.app.inject({
+      method: "GET",
+      url: `/api/memory/documents/${memoryId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(readMissing.statusCode).toBe(409);
+    expect(readMissing.json()).toMatchObject({
+      error: "Memory document object is unavailable in R2",
+    });
+
+    const overwriteMissing = await appState.app.inject({
+      method: "PUT",
+      url: `/api/memory/documents/${memoryId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        content: "# recovered?",
+      },
+    });
+    expect(overwriteMissing.statusCode).toBe(409);
+    expect(overwriteMissing.json()).toMatchObject({
+      error: "Memory document object is unavailable in R2",
+    });
+
+    await appState.app.close();
+  });
 });

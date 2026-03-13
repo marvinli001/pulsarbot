@@ -1,3 +1,5 @@
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import { load } from "cheerio";
@@ -41,6 +43,123 @@ interface SearchResult {
   snippet?: string;
 }
 
+const WEB_BROWSE_TIMEOUT_MS = 10_000;
+const WEB_BROWSE_MAX_BYTES = 2 * 1024 * 1024;
+const WEB_BROWSE_MAX_REDIRECTS = 5;
+
+function ipv4ToNumber(ip: string): number | null {
+  const parts = ip.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return null;
+  }
+  return ((parts[0] ?? 0) << 24 >>> 0) +
+    ((parts[1] ?? 0) << 16) +
+    ((parts[2] ?? 0) << 8) +
+    (parts[3] ?? 0);
+}
+
+function isBlockedIpv4(ip: string): boolean {
+  const value = ipv4ToNumber(ip);
+  if (value === null) {
+    return false;
+  }
+
+  const inRange = (start: string, end: string) => {
+    const startValue = ipv4ToNumber(start);
+    const endValue = ipv4ToNumber(end);
+    return startValue !== null &&
+      endValue !== null &&
+      value >= startValue &&
+      value <= endValue;
+  };
+
+  return inRange("0.0.0.0", "0.255.255.255") ||
+    inRange("10.0.0.0", "10.255.255.255") ||
+    inRange("100.64.0.0", "100.127.255.255") ||
+    inRange("127.0.0.0", "127.255.255.255") ||
+    inRange("169.254.0.0", "169.254.255.255") ||
+    inRange("172.16.0.0", "172.31.255.255") ||
+    inRange("192.0.0.0", "192.0.0.255") ||
+    inRange("192.0.2.0", "192.0.2.255") ||
+    inRange("192.168.0.0", "192.168.255.255") ||
+    inRange("198.18.0.0", "198.19.255.255") ||
+    inRange("198.51.100.0", "198.51.100.255") ||
+    inRange("203.0.113.0", "203.0.113.255") ||
+    inRange("224.0.0.0", "255.255.255.255");
+}
+
+function isBlockedIpv6(ip: string): boolean {
+  const normalized = ip.toLowerCase().split("%")[0] ?? ip.toLowerCase();
+  return normalized === "::" ||
+    normalized === "::1" ||
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    normalized.startsWith("fe8") ||
+    normalized.startsWith("fe9") ||
+    normalized.startsWith("fea") ||
+    normalized.startsWith("feb");
+}
+
+function isBlockedResolvedAddress(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    return isBlockedIpv4(address);
+  }
+  if (family === 6) {
+    return isBlockedIpv6(address);
+  }
+  return false;
+}
+
+async function ensureSafeBrowseUrl(rawUrl: string): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("Browse URL is invalid");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Only http and https URLs are allowed");
+  }
+
+  const hostname = parsed.hostname.trim().toLowerCase();
+  if (!hostname) {
+    throw new Error("Browse URL hostname is missing");
+  }
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local")
+  ) {
+    throw new Error("Localhost and local network hostnames are not allowed");
+  }
+  if (isIP(hostname)) {
+    throw new Error("IP literal URLs are not allowed");
+  }
+
+  try {
+    const records = await Promise.race([
+      lookup(hostname, { all: true, verbatim: true }),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("DNS lookup timed out")), 2_000);
+      }),
+    ]);
+    if (records.some((record) => isBlockedResolvedAddress(record.address))) {
+      throw new Error("Resolved address points to a private or reserved network");
+    }
+  } catch (error) {
+    if (error instanceof Error && (
+      error.message === "DNS lookup timed out" ||
+      error.message.includes("private or reserved network")
+    )) {
+      throw error;
+    }
+  }
+
+  return parsed;
+}
+
 async function fetchSearchHtml(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: {
@@ -52,6 +171,44 @@ async function fetchSearchHtml(url: string): Promise<string> {
     throw new Error(`Search request failed: HTTP ${response.status}`);
   }
   return response.text();
+}
+
+async function fetchBrowseResponse(initialUrl: URL): Promise<{
+  response: Response;
+  finalUrl: URL;
+}> {
+  const signal = AbortSignal.timeout(WEB_BROWSE_TIMEOUT_MS);
+  let currentUrl = initialUrl;
+
+  for (let redirectCount = 0; redirectCount <= WEB_BROWSE_MAX_REDIRECTS; redirectCount += 1) {
+    const response = await fetch(currentUrl, {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      },
+      redirect: "manual",
+      signal,
+    });
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      if (redirectCount === WEB_BROWSE_MAX_REDIRECTS) {
+        throw new Error("Browse request exceeded redirect limit");
+      }
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error("Browse redirect location is missing");
+      }
+      currentUrl = await ensureSafeBrowseUrl(new URL(location, currentUrl).toString());
+      continue;
+    }
+
+    return {
+      response,
+      finalUrl: await ensureSafeBrowseUrl(response.url || currentUrl.toString()),
+    };
+  }
+
+  throw new Error("Browse request exceeded redirect limit");
 }
 
 function parseGoogleResults(html: string, maxResults: number): SearchResult[] {
@@ -231,21 +388,27 @@ const builtInTools: BuiltinToolDefinition[] = [
       source: "plugin",
     },
     async execute(input) {
-      const url = String(input.url ?? "");
-      const response = await fetch(url, {
-        headers: {
-          "user-agent":
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        },
-      });
-      const html = await response.text();
-      const dom = new JSDOM(html, { url });
+      const safeUrl = await ensureSafeBrowseUrl(String(input.url ?? ""));
+      const { response, finalUrl } = await fetchBrowseResponse(safeUrl);
+      if (!response.ok) {
+        throw new Error(`Browse request failed: HTTP ${response.status}`);
+      }
+      const contentLength = Number(response.headers.get("content-length") ?? "0");
+      if (Number.isFinite(contentLength) && contentLength > WEB_BROWSE_MAX_BYTES) {
+        throw new Error("Browse response is too large");
+      }
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > WEB_BROWSE_MAX_BYTES) {
+        throw new Error("Browse response is too large");
+      }
+      const html = Buffer.from(buffer).toString("utf8");
+      const dom = new JSDOM(html, { url: finalUrl.toString() });
       const readable = new Readability(dom.window.document).parse();
       const text =
         readable?.textContent ??
         compactWhitespace(load(html).text()).slice(0, 10_000);
       return {
-        url,
+        url: finalUrl.toString(),
         title: readable?.title ?? dom.window.document.title,
         content: compactWhitespace(text).slice(0, 10_000),
       };

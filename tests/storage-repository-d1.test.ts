@@ -147,6 +147,36 @@ describe("D1AppRepository", () => {
     );
   });
 
+  it("claims telegram login receipts in a dedicated SQL table", async () => {
+    const executeD1 = vi.fn(async () => undefined);
+    const queryD1 = vi.fn(async () => []);
+    const repository = new D1AppRepository(
+      {
+        executeD1,
+        queryD1,
+      } as never,
+      "db_1",
+    );
+
+    const result = await repository.claimTelegramLoginReceipt({
+      receiptKey: "receipt_1",
+      telegramUserId: "42",
+      expiresAt: "2026-01-01T00:15:00.000Z",
+    });
+
+    expect(result).toBe("claimed");
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      "DELETE FROM telegram_login_receipt WHERE expires_at <= ?",
+      expect.any(Array),
+    );
+    expect(executeD1).toHaveBeenCalledWith(
+      "db_1",
+      expect.stringContaining("INSERT INTO telegram_login_receipt"),
+      expect.arrayContaining(["receipt_1", "42", "2026-01-01T00:15:00.000Z"]),
+    );
+  });
+
   it("filters memory chunks in SQL instead of full-table post-filtering", async () => {
     const chunk = makeMemoryChunk();
     const executeD1 = vi.fn(async () => undefined);

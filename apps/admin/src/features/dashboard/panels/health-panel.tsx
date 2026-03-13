@@ -19,6 +19,16 @@ function asNumber(value: unknown): number {
   return typeof value === "number" ? value : 0;
 }
 
+function asArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item),
+  );
+}
+
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "-";
 }
@@ -27,15 +37,45 @@ function statusBadge(ok: boolean) {
   return <Badge tone={ok ? "success" : "warning"}>{ok ? "OK" : "Check"}</Badge>;
 }
 
+function toneForStatus(status: string): "success" | "warning" | "danger" | "neutral" {
+  if (status === "completed" || status === "ok") {
+    return "success";
+  }
+  if (status === "failed" || status === "error") {
+    return "danger";
+  }
+  if (status === "pending" || status === "running" || status === "processing") {
+    return "warning";
+  }
+  return "neutral";
+}
+
 export function HealthPanel() {
   const health = useSystemHealth();
   const payload = asRecord(health.data);
   const jobs = asRecord(payload.jobs);
+  const documents = asRecord(payload.documents);
   const marketCounts = asRecord(payload.marketCounts);
   const telegram = asRecord(payload.telegram);
   const cloudflare = asRecord(payload.cloudflare);
+  const runtime = asRecord(payload.runtime);
+  const graph = asRecord(payload.graph);
   const activeTurnLocks = Array.isArray(payload.activeTurnLocks)
     ? payload.activeTurnLocks.length
+    : 0;
+  const recentDocumentFailures = asArray(documents.recentFailures);
+  const recentMcpHealth = asArray(payload.recentMcpHealth);
+  const runtimeBlocked = asArray(runtime.blocked);
+  const runtimeTools = asArray(runtime.tools);
+  const recentTurnFailures = asArray(graph.recentTurnFailures);
+  const enabledSkills = Array.isArray(runtime.enabledSkills)
+    ? runtime.enabledSkills.length
+    : 0;
+  const enabledPlugins = Array.isArray(runtime.enabledPlugins)
+    ? runtime.enabledPlugins.length
+    : 0;
+  const enabledMcpServers = Array.isArray(runtime.enabledMcpServers)
+    ? runtime.enabledMcpServers.length
     : 0;
 
   const dependencyRows = ["d1", "r2", "vectorize", "aiSearch"].map((key) => {
@@ -107,6 +147,184 @@ export function HealthPanel() {
           ))}
         </div>
       </Panel>
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Panel
+          title="Document Extraction"
+          subtitle="抽取状态必须收口到 completed 或 failed，不允许长期停在 processing。"
+        >
+          <KeyValueGrid
+            items={[
+              { label: "Documents", value: String(asNumber(documents.total)) },
+              { label: "Pending", value: String(asNumber(documents.pending)) },
+              { label: "Processing", value: String(asNumber(documents.processing)) },
+              { label: "Failed", value: String(asNumber(documents.failed)) },
+              { label: "Completed", value: String(asNumber(documents.completed)) },
+              { label: "Recent Failures", value: String(recentDocumentFailures.length) },
+            ]}
+          />
+        </Panel>
+        <Panel
+          title="Runtime Diagnostics"
+          subtitle="展示当前 active profile 实际会启用什么，以及为什么会被 block。"
+        >
+          <KeyValueGrid
+            items={[
+              {
+                label: "Active Profile",
+                value: asString(asRecord(runtime.activeProfile).label),
+              },
+              { label: "Enabled Skills", value: String(enabledSkills) },
+              { label: "Enabled Plugins", value: String(enabledPlugins) },
+              { label: "Enabled MCP", value: String(enabledMcpServers) },
+              { label: "Enabled Tools", value: String(runtimeTools.length) },
+              {
+                label: "Prompt Fragments",
+                value: String(asNumber(runtime.promptFragmentCount)),
+              },
+              { label: "Blocked", value: String(runtimeBlocked.length) },
+              { label: "Generated At", value: asString(runtime.generatedAt) },
+            ]}
+          />
+          <div className="mt-4 grid gap-2">
+            {runtimeBlocked.length === 0 ? (
+              <p className="text-sm text-slate-500">No blocked capabilities.</p>
+            ) : null}
+            {runtimeBlocked.slice(0, 6).map((item) => (
+              <div
+                key={`${asString(item.scope)}-${asString(item.id)}`}
+                className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-medium text-slate-900">
+                    {asString(item.scope)} · {asString(item.id)}
+                  </p>
+                  <Badge tone="warning">blocked</Badge>
+                </div>
+                <p className="mt-1 text-slate-500">{asString(item.reason)}</p>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </div>
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Panel
+          title="Recent Document Failures"
+          subtitle="面向 owner 的最近失败原因，便于确认后台重试是否有效。"
+        >
+          <div className="grid gap-2">
+            {recentDocumentFailures.length === 0 ? (
+              <p className="text-sm text-slate-500">No document failures.</p>
+            ) : null}
+            {recentDocumentFailures.map((item) => (
+              <div
+                key={asString(item.id)}
+                className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-medium text-slate-900">{asString(item.title)}</p>
+                  <Badge tone={toneForStatus(asString(item.extractionStatus))}>
+                    {asString(item.extractionStatus)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-slate-500">
+                  method {asString(item.extractionMethod)} · updated {asString(item.updatedAt)}
+                </p>
+                <p className="mt-1 break-words text-rose-600">
+                  {asString(item.lastExtractionError)}
+                </p>
+              </div>
+            ))}
+          </div>
+        </Panel>
+        <Panel
+          title="Recent MCP Health"
+          subtitle="最近健康检查结果，失败时在这里先暴露，不要求用户手动重试。"
+        >
+          <div className="grid gap-2">
+            {recentMcpHealth.length === 0 ? (
+              <p className="text-sm text-slate-500">No MCP health checks recorded.</p>
+            ) : null}
+            {recentMcpHealth.map((item) => (
+              <div
+                key={asString(item.id)}
+                className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-medium text-slate-900">{asString(item.label)}</p>
+                  <Badge tone={toneForStatus(asString(item.lastHealthStatus))}>
+                    {asString(item.lastHealthStatus)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-slate-500">
+                  {asString(item.transport)} · checked {asString(item.lastHealthCheckedAt)}
+                </p>
+                <p className="mt-1 text-slate-500">{asString(item.description)}</p>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </div>
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Panel
+          title="Turn Graph"
+          subtitle="查看 threaded turn 当前运行、卡住和最近失败情况。"
+        >
+          <KeyValueGrid
+            items={[
+              { label: "Running Turns", value: String(asNumber(graph.runningTurns)) },
+              { label: "Resumable Turns", value: String(asNumber(graph.resumableTurns)) },
+              { label: "Stuck Turns", value: String(asNumber(graph.stuckTurns)) },
+              { label: "Recent Failures", value: String(recentTurnFailures.length) },
+            ]}
+          />
+          <div className="mt-4 grid gap-2">
+            {recentTurnFailures.length === 0 ? (
+              <p className="text-sm text-slate-500">No recent turn failures.</p>
+            ) : null}
+            {recentTurnFailures.map((item) => (
+              <div
+                key={asString(item.turnId)}
+                className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
+              >
+                <p className="font-medium text-slate-900">
+                  {asString(item.turnId)} · {asString(item.currentNode)}
+                </p>
+                <p className="mt-1 text-slate-500">
+                  conversation {asString(item.conversationId)} · updated {asString(item.updatedAt)}
+                </p>
+                <p className="mt-1 break-words text-rose-600">{asString(item.error)}</p>
+              </div>
+            ))}
+          </div>
+        </Panel>
+        <Panel
+          title="Enabled Tool Snapshot"
+          subtitle="当前 active runtime 真正暴露给 agent 的工具快照。"
+        >
+          <div className="grid gap-2">
+            {runtimeTools.length === 0 ? (
+              <p className="text-sm text-slate-500">No tools resolved.</p>
+            ) : null}
+            {runtimeTools.slice(0, 10).map((tool) => (
+              <div
+                key={asString(tool.id)}
+                className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <p className="font-medium text-slate-900">{asString(tool.title)}</p>
+                  <Badge tone="neutral">{asString(tool.source)}</Badge>
+                </div>
+                <p className="mt-1 text-slate-500">{asString(tool.id)}</p>
+                <p className="mt-1 text-slate-500">
+                  scopes {Array.isArray(tool.permissionScopes)
+                    ? tool.permissionScopes.join(", ")
+                    : "-"}
+                </p>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </div>
       <Panel
         title="Cloudflare Dependencies"
         subtitle="D1 / R2 / Vectorize / AI Search 的健康状态。"

@@ -23,6 +23,7 @@ import {
   deriveHkdfKeyMaterial,
   loadEnv,
   nowIso,
+  sha256,
 } from "@pulsarbot/core";
 import {
   createDefaultInstallRecords,
@@ -56,6 +57,7 @@ import {
   WorkspaceExportBundleSchema,
   WorkspaceSchema,
   type AgentProfile,
+  type AuthSession,
   type CloudflareCredentials,
   type ConversationTurn,
   type DocumentArtifact,
@@ -525,6 +527,9 @@ function isMissingProviderProfileError(error: unknown): boolean {
 
 const TURN_GRAPH_VERSION = "v2";
 const TURN_EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TELEGRAM_INIT_DATA_MAX_AGE_SECONDS = 10 * 60;
+const TELEGRAM_INIT_DATA_REPLAY_WINDOW_MS = 15 * 60 * 1000;
+const TELEGRAM_INIT_DATA_CLOCK_SKEW_SECONDS = 60;
 const TURN_GRAPH_RECOVERABLE_NODES_V1 = new Set([
   "persist_assistant_message",
   "persist_tool_runs",
@@ -2107,6 +2112,59 @@ class RuntimeState {
     return this.cloudflare;
   }
 
+  public async readMemoryDocumentContent(documentId: string): Promise<{
+    document: MemoryDocument;
+    content: string;
+  }> {
+    const document = (await this.repository.listMemoryDocuments()).find(
+      (item) => item.id === documentId,
+    );
+    if (!document) {
+      throw new Error("Memory document not found");
+    }
+    const cloudflare = this.cloudflare;
+    let content = document.content ?? null;
+    if (cloudflare?.credentials.r2BucketName) {
+      content = await cloudflare.client.getR2Object({
+        bucketName: cloudflare.credentials.r2BucketName,
+        key: this.documentObjectKey(document.workspaceId, document.path),
+      });
+      if (content === null) {
+        throw new Error("Memory document object is unavailable in R2");
+      }
+    }
+    return {
+      document,
+      content: content ?? "",
+    };
+  }
+
+  public async updateMemoryDocumentContent(documentId: string, content: string): Promise<MemoryDocument> {
+    const { document } = await this.readMemoryDocumentContent(documentId);
+    const cloudflare = this.requireCloudflare();
+    await cloudflare.client.putR2Object({
+      bucketName: cloudflare.credentials.r2BucketName!,
+      key: this.documentObjectKey(document.workspaceId, document.path),
+      body: content,
+    });
+    const next = {
+      ...document,
+      contentHash: sha256(content),
+      updatedAt: nowIso(),
+    };
+    await this.repository.saveMemoryDocument(next);
+    await this.queueJob({
+      workspaceId: document.workspaceId,
+      kind: "memory_reindex_document",
+      payload: {
+        documentId: document.id,
+      },
+    });
+    const memory = await this.createMemoryStore(document.workspaceId);
+    await memory.processPendingJobs(1);
+    return next;
+  }
+
   private async readMemoryDocumentsForExport(
     workspaceId: string,
   ): Promise<MemoryDocument[]> {
@@ -2227,18 +2285,82 @@ function parseTelegramInitData(initData: string, botToken: string) {
     .sort()
     .join("\n");
 
+  if (!hash || !/^[a-f0-9]{64}$/i.test(hash)) {
+    throw new AppError(
+      "MALFORMED_TELEGRAM_INIT_DATA",
+      "Telegram initData hash is malformed",
+      401,
+    );
+  }
+
   const secret = createHmac("sha256", "WebAppData").update(botToken).digest();
   const digest = createHmac("sha256", secret).update(checkString).digest();
+  const hashBuffer = Buffer.from(hash, "hex");
 
-  if (!hash || !timingSafeEqual(Buffer.from(hash, "hex"), digest)) {
-    throw new Error("Telegram initData verification failed");
+  if (hashBuffer.byteLength !== digest.byteLength || !timingSafeEqual(hashBuffer, digest)) {
+    throw new AppError(
+      "MALFORMED_TELEGRAM_INIT_DATA",
+      "Telegram initData verification failed",
+      401,
+    );
+  }
+
+  const authDateRaw = params.get("auth_date");
+  const authDate = Number(authDateRaw);
+  if (!Number.isInteger(authDate) || authDate <= 0) {
+    throw new AppError(
+      "MALFORMED_TELEGRAM_INIT_DATA",
+      "Telegram initData is missing auth_date",
+      401,
+    );
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (
+    authDate < nowSeconds - TELEGRAM_INIT_DATA_MAX_AGE_SECONDS ||
+    authDate > nowSeconds + TELEGRAM_INIT_DATA_CLOCK_SKEW_SECONDS
+  ) {
+    throw new AppError(
+      "EXPIRED_TELEGRAM_INIT_DATA",
+      "Telegram initData has expired",
+      401,
+    );
   }
 
   const userRaw = params.get("user");
-  const user = userRaw ? JSON.parse(userRaw) : null;
+  let user: Record<string, unknown> | null = null;
+  if (!userRaw) {
+    throw new AppError(
+      "MALFORMED_TELEGRAM_INIT_DATA",
+      "Telegram initData is missing user",
+      401,
+    );
+  }
+  try {
+    const parsed = JSON.parse(userRaw) as unknown;
+    user = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    throw new AppError(
+      "MALFORMED_TELEGRAM_INIT_DATA",
+      "Telegram initData user payload is malformed",
+      401,
+    );
+  }
+  if (!user || (!user.id && user.id !== 0)) {
+    throw new AppError(
+      "MALFORMED_TELEGRAM_INIT_DATA",
+      "Telegram initData user payload is missing id",
+      401,
+    );
+  }
+
   return {
-    userId: String(user?.id ?? ""),
-    username: user?.username as string | undefined,
+    userId: String(user.id),
+    username: typeof user.username === "string" ? user.username : undefined,
+    authDate,
+    receiptKey: sha256(`${checkString}\n${hash.toLowerCase()}`),
   };
 }
 
@@ -3084,6 +3206,38 @@ export async function createApp(
     }
   };
 
+  const getCurrentAuthSession = async (
+    request: FastifyRequest,
+  ): Promise<AuthSession | null> => {
+    try {
+      await request.jwtVerify();
+    } catch {
+      return null;
+    }
+
+    const user = request.user as { jti?: string; sub?: string } | undefined;
+    if (!user?.jti || !user.sub) {
+      return null;
+    }
+    const session = await state.repository.getAuthSessionByJti(user.jti);
+    if (
+      !session ||
+      session.revokedAt ||
+      session.telegramUserId !== user.sub ||
+      Date.parse(session.expiresAt) <= Date.now()
+    ) {
+      return null;
+    }
+    return session;
+  };
+
+  const buildSessionPayload = async (user: { userId: string; username?: string }) => ({
+    user,
+    bootstrapState: await state.repository.getBootstrapState(),
+    workspace: await state.repository.getWorkspace(),
+    adminIdentity: await state.repository.getAdminIdentity(),
+  });
+
   const issueSession = async (
     reply: FastifyReply,
     args: { userId: string; username?: string },
@@ -3554,22 +3708,39 @@ export async function createApp(
     rawBody: Uint8Array | null;
     kind: DocumentMetadata["kind"];
     profile: AgentProfile;
-  }): Promise<string | null> => {
+  }): Promise<{
+    text: string | null;
+    method: DocumentMetadata["extractionMethod"];
+    providerProfileId: string | null;
+  }> => {
     if (!args.rawBody) {
-      return null;
+      return {
+        text: null,
+        method: null,
+        providerProfileId: null,
+      };
     }
 
     const fileName = `${safePathSegment(args.title)}.${fileExtensionForContent(args.content)}`;
     const mediaTimeoutMs = Math.max(args.profile.maxToolDurationMs, 30_000);
+    const hasSufficientText = (value: string | null | undefined) => Boolean(value?.trim() && value.trim().length >= 80);
 
     if (args.kind === "text" || args.kind === "json" || args.kind === "csv") {
-      return decodeBestEffortText(args.rawBody).trim() || null;
+      return {
+        text: decodeBestEffortText(args.rawBody).trim() || null,
+        method: "decode_text",
+        providerProfileId: null,
+      };
     }
 
     if (args.content.kind === "image") {
       const mediaProvider = await resolveMediaProvider(args.profile, "vision");
       if (!mediaProvider) {
-        return null;
+        return {
+          text: null,
+          method: null,
+          providerProfileId: null,
+        };
       }
       try {
         const result = await state.runProviderMedia({
@@ -3590,7 +3761,11 @@ export async function createApp(
           },
           timeoutMs: mediaTimeoutMs,
         });
-        return result?.text.trim() || null;
+        return {
+          text: result?.text.trim() || null,
+          method: "provider_vision",
+          providerProfileId: mediaProvider.profile.id,
+        };
       } catch (error) {
         logger.warn(
           {
@@ -3599,14 +3774,22 @@ export async function createApp(
           },
           "Image extraction failed",
         );
-        return null;
+        return {
+          text: null,
+          method: null,
+          providerProfileId: null,
+        };
       }
     }
 
     if (args.content.kind === "voice" || args.content.kind === "audio") {
       const mediaProvider = await resolveMediaProvider(args.profile, "audio");
       if (!mediaProvider) {
-        return null;
+        return {
+          text: null,
+          method: null,
+          providerProfileId: null,
+        };
       }
       try {
         const result = await state.runProviderMedia({
@@ -3624,7 +3807,11 @@ export async function createApp(
           },
           timeoutMs: mediaTimeoutMs,
         });
-        return result?.text.trim() || null;
+        return {
+          text: result?.text.trim() || null,
+          method: "provider_audio",
+          providerProfileId: mediaProvider.profile.id,
+        };
       } catch (error) {
         logger.warn(
           {
@@ -3633,8 +3820,45 @@ export async function createApp(
           },
           "Audio transcription failed",
         );
-        return null;
+        return {
+          text: null,
+          method: null,
+          providerProfileId: null,
+        };
       }
+    }
+
+    let localText: string | null = null;
+    let localMethod: DocumentMetadata["extractionMethod"] = null;
+
+    if (args.kind === "pdf") {
+      try {
+        localText = (await extractPdfText(args.rawBody)).trim() || null;
+        localMethod = "pdf_parse";
+      } catch (error) {
+        logger.warn({ error, title: args.title }, "Local PDF extraction failed");
+      }
+    }
+
+    if (args.kind === "docx") {
+      try {
+        localText = (await extractDocxText({
+          rawBody: args.rawBody,
+          dataDir: state.dataDir,
+          title: args.title,
+        })).trim() || null;
+        localMethod = "docx_mammoth";
+      } catch (error) {
+        logger.warn({ error, title: args.title }, "Local DOCX extraction failed");
+      }
+    }
+
+    if (hasSufficientText(localText)) {
+      return {
+        text: localText,
+        method: localMethod,
+        providerProfileId: null,
+      };
     }
 
     const documentProvider = await resolveMediaProvider(args.profile, "document", {
@@ -3661,7 +3885,11 @@ export async function createApp(
           timeoutMs: mediaTimeoutMs,
         });
         if (result?.text.trim()) {
-          return result.text.trim();
+          return {
+            text: result.text.trim(),
+            method: "provider_document",
+            providerProfileId: documentProvider.profile.id,
+          };
         }
       } catch (error) {
         logger.warn(
@@ -3675,19 +3903,19 @@ export async function createApp(
       }
     }
 
-    if (args.kind === "pdf") {
-      return (await extractPdfText(args.rawBody)).trim() || null;
+    if (localText?.trim()) {
+      return {
+        text: localText.trim(),
+        method: localMethod,
+        providerProfileId: null,
+      };
     }
 
-    if (args.kind === "docx") {
-      return (await extractDocxText({
-        rawBody: args.rawBody,
-        dataDir: state.dataDir,
-        title: args.title,
-      })).trim() || null;
-    }
-
-    return null;
+    return {
+      text: null,
+      method: null,
+      providerProfileId: null,
+    };
   };
 
   const registerDocument = async (
@@ -3741,9 +3969,13 @@ export async function createApp(
       });
     }
 
-    let extractedText: string | null = null;
+    let extracted = {
+      text: null as string | null,
+      method: null as DocumentMetadata["extractionMethod"],
+      providerProfileId: null as string | null,
+    };
     try {
-      extractedText = await extractDocumentBodyText({
+      extracted = await extractDocumentBodyText({
         title,
         content: payload.content,
         rawBody,
@@ -3754,12 +3986,14 @@ export async function createApp(
       logger.warn({ error, documentId, kind }, "Failed to extract document body text");
     }
 
-    const derivedText = (extractedText?.trim() || deriveDocumentText({
+    const extractedText = extracted.text?.trim() || null;
+    const fallbackDerivedText = deriveDocumentText({
       content: payload.content,
       kind,
       normalizedText: fallbackText,
       rawBody,
-    })).slice(0, 30_000);
+    });
+    const derivedText = (extractedText || fallbackDerivedText).slice(0, 30_000);
     const extractionCompleted = hasCompletedDocumentExtraction({
       kind,
       extractedText,
@@ -3775,7 +4009,7 @@ export async function createApp(
               ? "telegram_file_fetch"
               : null
         : null;
-    const extractionStatus: DocumentMetadata["extractionStatus"] = extractedText?.trim()
+    const extractionStatus: DocumentMetadata["extractionStatus"] = extractedText
       ? "completed"
       : queuedRetryKind
         ? "pending"
@@ -3784,6 +4018,12 @@ export async function createApp(
             ? "completed"
             : "failed"
           : "pending";
+    const extractionMethod = extractedText
+      ? extracted.method
+      : derivedText.trim()
+        ? "fallback_text"
+        : null;
+    const extractedAt = extractionCompleted ? nowIso() : null;
 
     const document = {
       id: documentId,
@@ -3802,7 +4042,8 @@ export async function createApp(
         : rawBody?.byteLength ?? null,
       mimeType: payload.content.mimeType ?? null,
       extractionStatus,
-      extractionProviderProfileId: null,
+      extractionMethod,
+      extractionProviderProfileId: extractedText ? extracted.providerProfileId : null,
       lastExtractionError:
         extractionCompleted
           ? null
@@ -3811,6 +4052,7 @@ export async function createApp(
             : rawBody
               ? "Extraction returned no content"
               : "Source file unavailable"),
+      lastExtractedAt: extractedAt,
       lastIndexedAt: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -3841,6 +4083,17 @@ export async function createApp(
       });
     } catch (error) {
       logger.warn({ error, documentId }, "Failed to ingest document into memory store");
+      if (extractionCompleted) {
+        await state.repository.saveDocument({
+          ...document,
+          extractionStatus: "failed",
+          lastExtractionError: error instanceof Error
+            ? `Document ingest failed: ${error.message}`
+            : "Document ingest failed",
+          lastIndexedAt: null,
+          updatedAt: nowIso(),
+        });
+      }
     }
 
     return {
@@ -3879,6 +4132,20 @@ export async function createApp(
     };
   };
 
+  const saveDocumentExtractionFailure = async (
+    document: DocumentMetadata,
+    message: string,
+    overrides: Partial<DocumentMetadata> = {},
+  ) => {
+    await state.repository.saveDocument({
+      ...document,
+      extractionStatus: "failed",
+      lastExtractionError: message,
+      ...overrides,
+      updatedAt: nowIso(),
+    });
+  };
+
   const reExtractDocument = async (documentId: string) => {
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
@@ -3895,6 +4162,7 @@ export async function createApp(
       key: sourceObjectKey,
     });
     if (!raw) {
+      await saveDocumentExtractionFailure(document, "Document source object is unavailable in R2");
       throw new Error("Document source object is unavailable in R2");
     }
 
@@ -3903,6 +4171,7 @@ export async function createApp(
       profiles.find((item) => item.id === workspace.activeAgentProfileId) ??
       profiles[0];
     if (!profile) {
+      await saveDocumentExtractionFailure(document, "No agent profile is configured");
       throw new Error("No agent profile is configured");
     }
 
@@ -3913,46 +4182,101 @@ export async function createApp(
       updatedAt: nowIso(),
     });
 
-    const content = buildInboundContentForStoredDocument(document, raw.body);
-    const extractedText = await extractDocumentBodyText({
-      title: document.title,
-      content,
-      rawBody: raw.body,
-      kind: document.kind,
-      profile,
-    });
-    const derivedText = (extractedText?.trim() || deriveDocumentText({
-      content,
-      kind: document.kind,
-      normalizedText: document.previewText ?? document.title,
-      rawBody: raw.body,
-    })).slice(0, 30_000);
-    const extractionCompleted = hasCompletedDocumentExtraction({
-      kind: document.kind,
-      extractedText,
-      derivedText,
-    });
+    try {
+      const content = buildInboundContentForStoredDocument(document, raw.body);
+      const extracted = await extractDocumentBodyText({
+        title: document.title,
+        content,
+        rawBody: raw.body,
+        kind: document.kind,
+        profile,
+      });
+      const extractedText = extracted.text?.trim() || null;
+      const fallbackDerivedText = deriveDocumentText({
+        content,
+        kind: document.kind,
+        normalizedText: document.previewText ?? document.title,
+        rawBody: raw.body,
+      });
+      const derivedText = (extractedText || fallbackDerivedText).slice(0, 30_000);
+      const extractionCompleted = hasCompletedDocumentExtraction({
+        kind: document.kind,
+        extractedText,
+        derivedText,
+      });
+      const extractionMethod = extractedText
+        ? extracted.method
+        : derivedText.trim()
+          ? "fallback_text"
+          : null;
+      const lastExtractedAt = extractionCompleted ? nowIso() : null;
 
-    const memory = await state.createMemoryStore(workspace.id);
-    await memory.ingestDocument({
-      documentId: document.id,
-      title: document.title,
-      path: document.derivedTextPath ?? `documents/${document.id}/derived/content.md`,
-      content: derivedText,
-    });
-    await state.repository.saveDocument({
-      ...document,
-      previewText: derivedText.slice(0, 500),
-      extractionStatus: extractionCompleted ? "completed" : "failed",
-      derivedTextObjectKey:
-        document.derivedTextObjectKey ??
-        `workspace/${workspace.id}/${document.derivedTextPath ?? `documents/${document.id}/derived/content.md`}`,
-      lastExtractionError: extractionCompleted ? null : "Extraction returned no content",
-      lastIndexedAt: nowIso(),
-      updatedAt: nowIso(),
-    });
-    if (!extractionCompleted) {
-      throw new Error("Extraction returned no content");
+      if (!extractionCompleted) {
+        await saveDocumentExtractionFailure(
+          document,
+          "Extraction returned no content",
+          {
+            previewText: derivedText.slice(0, 500),
+            extractionMethod,
+            extractionProviderProfileId: extractedText ? extracted.providerProfileId : null,
+            lastExtractedAt,
+            derivedTextObjectKey:
+              document.derivedTextObjectKey ??
+              `workspace/${workspace.id}/${document.derivedTextPath ?? `documents/${document.id}/derived/content.md`}`,
+          },
+        );
+        throw new Error("Extraction returned no content");
+      }
+
+      const memory = await state.createMemoryStore(workspace.id);
+      try {
+        await memory.ingestDocument({
+          documentId: document.id,
+          title: document.title,
+          path: document.derivedTextPath ?? `documents/${document.id}/derived/content.md`,
+          content: derivedText,
+        });
+      } catch (error) {
+        const message = error instanceof Error
+          ? `Document ingest failed: ${error.message}`
+          : "Document ingest failed";
+        await saveDocumentExtractionFailure(
+          document,
+          message,
+          {
+            previewText: derivedText.slice(0, 500),
+            extractionMethod,
+            extractionProviderProfileId: extracted.providerProfileId,
+            lastExtractedAt,
+            derivedTextObjectKey:
+              document.derivedTextObjectKey ??
+              `workspace/${workspace.id}/${document.derivedTextPath ?? `documents/${document.id}/derived/content.md`}`,
+            lastIndexedAt: null,
+          },
+        );
+        throw error;
+      }
+
+      await state.repository.saveDocument({
+        ...document,
+        previewText: derivedText.slice(0, 500),
+        extractionStatus: "completed",
+        extractionMethod,
+        extractionProviderProfileId: extracted.providerProfileId,
+        derivedTextObjectKey:
+          document.derivedTextObjectKey ??
+          `workspace/${workspace.id}/${document.derivedTextPath ?? `documents/${document.id}/derived/content.md`}`,
+        lastExtractionError: null,
+        lastExtractedAt,
+        lastIndexedAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+    } catch (error) {
+      if (!(error instanceof Error && error.message === "Extraction returned no content")) {
+        const message = error instanceof Error ? error.message : "Document extraction failed";
+        await saveDocumentExtractionFailure(document, message);
+      }
+      throw error;
     }
   };
 
@@ -4050,6 +4374,20 @@ export async function createApp(
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown job error";
         const attempts = job.attempts + 1;
+        if (
+          [
+            "document_extract",
+            "telegram_file_fetch",
+            "telegram_voice_transcribe",
+            "telegram_image_describe",
+          ].includes(job.kind)
+        ) {
+          const documentId = String(job.payload.documentId ?? "");
+          const document = (await state.repository.listDocuments()).find((item) => item.id === documentId);
+          if (document) {
+            await saveDocumentExtractionFailure(document, message);
+          }
+        }
         if (attempts < 3) {
           await state.repository.saveJob({
             ...job,
@@ -5482,13 +5820,29 @@ export async function createApp(
 
   app.post("/api/session/telegram", async (request, reply) => {
     const body = request.body as { initData?: string; userId?: string; username?: string };
+    let parsedInitData: ReturnType<typeof parseTelegramInitData> | null = null;
     let user = {
       userId: body?.userId ?? "",
       username: body?.username,
     };
 
     if (body?.initData) {
-      user = parseTelegramInitData(body.initData, state.env.TELEGRAM_BOT_TOKEN);
+      try {
+        parsedInitData = parseTelegramInitData(body.initData, state.env.TELEGRAM_BOT_TOKEN);
+        user = {
+          userId: parsedInitData.userId,
+          username: parsedInitData.username,
+        };
+      } catch (error) {
+        const code = error instanceof AppError ? error.code : "MALFORMED_TELEGRAM_INIT_DATA";
+        const message = error instanceof Error
+          ? error.message
+          : "Telegram initData verification failed";
+        return reply.code(401).send({
+          error: message,
+          code,
+        });
+      }
     } else if (!["development", "test"].includes(state.env.NODE_ENV)) {
       return reply.code(400).send({ error: "initData is required outside development" });
     }
@@ -5506,7 +5860,28 @@ export async function createApp(
       userId: user.userId || "dev-owner",
       ...(user.username ? { username: user.username } : {}),
     };
-    await issueSession(reply, sessionUser);
+    const currentSession = await getCurrentAuthSession(request);
+
+    if (parsedInitData) {
+      const receipt = await state.repository.claimTelegramLoginReceipt({
+        receiptKey: parsedInitData.receiptKey,
+        telegramUserId: sessionUser.userId,
+        expiresAt: isoAfter(TELEGRAM_INIT_DATA_REPLAY_WINDOW_MS),
+      });
+      if (receipt === "duplicate") {
+        if (currentSession?.telegramUserId === sessionUser.userId) {
+          return buildSessionPayload(sessionUser);
+        }
+        return reply.code(401).send({
+          error: "Telegram initData has already been used",
+          code: "REPLAYED_TELEGRAM_INIT_DATA",
+        });
+      }
+    }
+
+    if (currentSession?.telegramUserId !== sessionUser.userId) {
+      await issueSession(reply, sessionUser);
+    }
 
     return {
       user: sessionUser,
@@ -5839,6 +6214,194 @@ export async function createApp(
       return { ok: true };
     },
   );
+
+  const resolveRequestedProviderCapabilities = (
+    capabilities?: string[],
+  ): ProviderTestCapability[] => {
+    const requested = Array.isArray(capabilities)
+      ? capabilities.filter((value): value is ProviderTestCapability => {
+          const parsed = ProviderTestCapabilitySchema.safeParse(value);
+          return parsed.success && providerTestCapabilities.includes(parsed.data);
+        })
+      : [];
+    return requested.length > 0 ? requested : ["text"];
+  };
+
+  const runProviderCapabilityTests = async (args: {
+    profile: ProviderProfile;
+    apiKey: string | null;
+    capabilities: ProviderTestCapability[];
+    apiKeyError?: string | null;
+  }): Promise<ProviderTestRunResult[]> => {
+    if (!args.apiKey) {
+      return args.capabilities.map((capability) => ({
+        capability,
+        status: "failed" as const,
+        error: args.apiKeyError ?? "Provider API key is missing",
+      }));
+    }
+
+    return Promise.all(
+      args.capabilities.map(async (capability) => {
+        if (capability === "text") {
+          try {
+            const result = await state.runProvider({
+              profile: args.profile,
+              apiKey: args.apiKey!,
+              input: {
+                messages: [
+                  {
+                    role: "system",
+                    content: "Reply with OK.",
+                  },
+                  {
+                    role: "user",
+                    content: "Ping",
+                  },
+                ],
+              },
+            });
+            return {
+              capability,
+              status: "ok" as const,
+              outputPreview: result.text.slice(0, 200),
+            };
+          } catch (error) {
+            return {
+              capability,
+              status: "failed" as const,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }
+
+        if (capability === "vision" && !args.profile.visionEnabled) {
+          return {
+            capability,
+            status: "skipped" as const,
+            reason: "vision-disabled",
+          };
+        }
+        if (capability === "audio" && !args.profile.audioInputEnabled) {
+          return {
+            capability,
+            status: "skipped" as const,
+            reason: "audio-disabled",
+          };
+        }
+        if (capability === "document" && !args.profile.documentInputEnabled) {
+          return {
+            capability,
+            status: "skipped" as const,
+            reason: "document-disabled",
+          };
+        }
+
+        const mediaCapability = capability as Exclude<ProviderTestCapability, "text">;
+        const input = providerMediaTestInput(mediaCapability);
+        const supported = supportsProviderCapability(args.profile, mediaCapability, {
+          fileName: input.fileName,
+          mimeType: input.mimeType,
+        });
+        if (!supported) {
+          return {
+            capability,
+            status: "unsupported" as const,
+          };
+        }
+
+        try {
+          const result = await state.runProviderMedia({
+            profile: args.profile,
+            apiKey: args.apiKey!,
+            input,
+          });
+          if (!result) {
+            return {
+              capability,
+              status: "unsupported" as const,
+            };
+          }
+          return {
+            capability,
+            status: "ok" as const,
+            outputPreview: result.text.slice(0, 200),
+          };
+        } catch (error) {
+          return {
+            capability,
+            status: "failed" as const,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }),
+    );
+  };
+
+  app.post(
+    "/api/providers/test-draft",
+    { preHandler: requireOwner },
+    async (request) => {
+      const body = (request.body ?? {}) as Partial<ProviderProfile> & { apiKey?: string; capabilities?: string[] };
+      const timestamp = nowIso();
+      const existing = body.id
+        ? (await state.repository.listProviderProfiles()).find((item) => item.id === body.id)
+        : undefined;
+      const profile = ProviderProfileSchema.parse({
+        id: body.id ?? "provider_draft",
+        kind: body.kind ?? "openai",
+        label: body.label ?? "Provider Draft",
+        apiBaseUrl: body.apiBaseUrl ?? "",
+        apiKeyRef: existing?.apiKeyRef ?? "provider:provider_draft:apiKey",
+        defaultModel: body.defaultModel ?? "gpt-5",
+        visionModel: body.visionModel ?? null,
+        audioModel: body.audioModel ?? null,
+        documentModel: body.documentModel ?? null,
+        stream: body.stream ?? true,
+        reasoningEnabled: body.reasoningEnabled ?? false,
+        reasoningLevel: body.reasoningLevel ?? "off",
+        thinkingBudget: body.thinkingBudget ?? null,
+        temperature: body.temperature ?? 0.2,
+        topP: body.topP ?? null,
+        maxOutputTokens: body.maxOutputTokens ?? 2048,
+        toolCallingEnabled: body.toolCallingEnabled ?? true,
+        jsonModeEnabled: body.jsonModeEnabled ?? true,
+        visionEnabled: body.visionEnabled ?? false,
+        audioInputEnabled: body.audioInputEnabled ?? false,
+        documentInputEnabled: body.documentInputEnabled ?? false,
+        headers: body.headers ?? {},
+        extraBody: body.extraBody ?? {},
+        enabled: true,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      const capabilities = resolveRequestedProviderCapabilities(body.capabilities);
+      let apiKey: string | null = body.apiKey ?? null;
+      let apiKeyError: string | null = body.apiKey ? null : "Provider API key is missing";
+      if (!apiKey && existing) {
+        try {
+          apiKey = await state.resolveApiKey(existing.apiKeyRef);
+          apiKeyError = null;
+        } catch (error) {
+          apiKeyError = error instanceof Error ? error.message : "Provider API key is missing";
+        }
+      }
+      const results = await runProviderCapabilityTests({
+        profile,
+        apiKey,
+        apiKeyError,
+        capabilities,
+      });
+      return {
+        ok: results.every((item) => item.status === "ok"),
+        providerId: profile.id,
+        providerKind: profile.kind,
+        requestedCapabilities: capabilities,
+        results,
+      };
+    },
+  );
+
   app.post(
     "/api/providers/:id/test",
     { preHandler: requireOwner },
@@ -5849,16 +6412,7 @@ export async function createApp(
       const body = (request.body ?? {}) as {
         capabilities?: string[];
       };
-      const requested = Array.isArray(body.capabilities)
-        ? body.capabilities.filter((value): value is ProviderTestCapability => {
-            const parsed = ProviderTestCapabilitySchema.safeParse(value);
-            return parsed.success &&
-              providerTestCapabilities.includes(parsed.data);
-          })
-        : [];
-      const capabilities: ProviderTestCapability[] = requested.length > 0
-        ? requested
-        : ["text"];
+      const capabilities = resolveRequestedProviderCapabilities(body.capabilities);
 
       let apiKey: string | null = null;
       let apiKeyError: string | null = null;
@@ -5870,107 +6424,12 @@ export async function createApp(
           : "Provider API key is missing";
       }
 
-      const results: ProviderTestRunResult[] = apiKey
-        ? await Promise.all(
-            capabilities.map(async (capability) => {
-              if (capability === "text") {
-                try {
-                  const result = await state.runProvider({
-                    profile,
-                    apiKey,
-                    input: {
-                      messages: [
-                        {
-                          role: "system",
-                          content: "Reply with OK.",
-                        },
-                        {
-                          role: "user",
-                          content: "Ping",
-                        },
-                      ],
-                    },
-                  });
-                  return {
-                    capability,
-                    status: "ok" as const,
-                    outputPreview: result.text.slice(0, 200),
-                  };
-                } catch (error) {
-                  return {
-                    capability,
-                    status: "failed" as const,
-                    error: error instanceof Error ? error.message : String(error),
-                  };
-                }
-              }
-
-              if (capability === "vision" && !profile.visionEnabled) {
-                return {
-                  capability,
-                  status: "skipped" as const,
-                  reason: "vision-disabled",
-                };
-              }
-              if (capability === "audio" && !profile.audioInputEnabled) {
-                return {
-                  capability,
-                  status: "skipped" as const,
-                  reason: "audio-disabled",
-                };
-              }
-              if (capability === "document" && !profile.documentInputEnabled) {
-                return {
-                  capability,
-                  status: "skipped" as const,
-                  reason: "document-disabled",
-                };
-              }
-
-              const mediaCapability = capability as Exclude<ProviderTestCapability, "text">;
-              const input = providerMediaTestInput(mediaCapability);
-              const supported = supportsProviderCapability(profile, mediaCapability, {
-                fileName: input.fileName,
-                mimeType: input.mimeType,
-              });
-              if (!supported) {
-                return {
-                  capability: capability as ProviderTestCapability,
-                  status: "unsupported" as const,
-                };
-              }
-
-              try {
-                const result = await state.runProviderMedia({
-                  profile,
-                  apiKey,
-                  input,
-                });
-                if (!result) {
-                  return {
-                    capability: capability as ProviderTestCapability,
-                    status: "unsupported" as const,
-                  };
-                }
-                return {
-                  capability,
-                  status: "ok" as const,
-                  outputPreview: result.text.slice(0, 200),
-                };
-              } catch (error) {
-                return {
-                  capability,
-                  status: "failed" as const,
-                  error: error instanceof Error ? error.message : String(error),
-                };
-              }
-            }),
-          )
-        : capabilities.map((capability) => ({
-            capability,
-            status: "failed" as const,
-            error: apiKeyError ?? "Provider API key is missing",
-          }));
+      const results = await runProviderCapabilityTests({
+        profile,
+        apiKey,
+        apiKeyError,
+        capabilities,
+      });
 
       const workspace = await state.repository.getWorkspace();
       requireWorkspace(workspace);
@@ -6574,6 +7033,62 @@ export async function createApp(
     };
   });
 
+  app.get("/api/memory/documents", { preHandler: requireOwner }, async () => {
+    return (await state.repository.listMemoryDocuments())
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  });
+
+  app.get(
+    "/api/memory/documents/:id",
+    { preHandler: requireOwner },
+    async (request, reply) => {
+      try {
+        const detail = await state.readMemoryDocumentContent(
+          (request.params as { id: string }).id,
+        );
+        return detail;
+      } catch (error) {
+        if (error instanceof Error && error.message === "Memory document not found") {
+          return reply.code(404).send({ error: error.message });
+        }
+        if (error instanceof Error && error.message === "Memory document object is unavailable in R2") {
+          return reply.code(409).send({ error: error.message });
+        }
+        throw error;
+      }
+    },
+  );
+
+  app.put(
+    "/api/memory/documents/:id",
+    { preHandler: requireOwner },
+    async (request, reply) => {
+      const body = request.body as { content?: string };
+      if (typeof body.content !== "string") {
+        return reply.code(400).send({ error: "Memory content is required" });
+      }
+      try {
+        const document = await state.updateMemoryDocumentContent(
+          (request.params as { id: string }).id,
+          body.content,
+        );
+        return {
+          ok: true,
+          document,
+          queuedAt: nowIso(),
+        };
+      } catch (error) {
+        if (error instanceof Error && error.message === "Memory document not found") {
+          return reply.code(404).send({ error: error.message });
+        }
+        if (error instanceof Error && error.message === "Memory document object is unavailable in R2") {
+          return reply.code(409).send({ error: error.message });
+        }
+        throw error;
+      }
+    },
+  );
+
   app.post("/api/memory/reindex", { preHandler: requireOwner }, async () => {
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
@@ -6602,7 +7117,47 @@ export async function createApp(
       if (!document) {
         return reply.code(404).send({ error: "Document not found" });
       }
-      return document;
+      const cloudflare = state.cloudflare;
+      let sourcePreview: string | null = null;
+      let derivedText: string | null = null;
+      let sourceAvailable = false;
+
+      if (cloudflare?.credentials.r2BucketName) {
+        if (document.sourceObjectKey) {
+          const raw = await cloudflare.client.getR2ObjectRaw({
+            bucketName: cloudflare.credentials.r2BucketName,
+            key: document.sourceObjectKey,
+          });
+          sourceAvailable = Boolean(raw);
+          if (
+            raw &&
+            (
+              ["text", "json", "csv"].includes(document.kind) ||
+              document.mimeType?.startsWith("text/")
+            )
+          ) {
+            sourcePreview = decodeBestEffortText(raw.body).slice(0, 4_000);
+          }
+        }
+
+        if (document.derivedTextObjectKey) {
+          derivedText = await cloudflare.client.getR2Object({
+            bucketName: cloudflare.credentials.r2BucketName,
+            key: document.derivedTextObjectKey,
+          });
+        }
+      }
+
+      return {
+        ...document,
+        sourceAvailable,
+        sourcePreview,
+        derivedText,
+        indexState: {
+          indexed: Boolean(document.lastIndexedAt),
+          lastIndexedAt: document.lastIndexedAt,
+        },
+      };
     },
   );
   app.post(
@@ -6807,6 +7362,7 @@ export async function createApp(
 
   app.get("/api/system/logs", { preHandler: requireOwner }, async () => {
     const servers = await state.repository.listMcpServers();
+    const documents = await state.repository.listDocuments();
     return {
       note: "Structured logs stream to stdout. Runtime job, import/export, provider test, and MCP summaries are returned here for diagnostics.",
       importExportRuns: await state.repository.listImportExportRuns(20),
@@ -6819,9 +7375,15 @@ export async function createApp(
         servers.slice(0, 10).map(async (server) => ({
           serverId: server.id,
           label: server.label,
+          lastHealthStatus: server.lastHealthStatus,
+          lastHealthCheckedAt: server.lastHealthCheckedAt,
           logs: await mcpSupervisor.readServerLogs(server.id, { tailLines: 40 }),
         })),
       ),
+      recentDocumentFailures: documents
+        .filter((document) => document.extractionStatus === "failed" || document.lastExtractionError)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, 20),
     };
   });
 
@@ -6867,6 +7429,7 @@ export async function createApp(
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpProviders = await state.repository.listMcpProviders();
     const mcpServers = await state.repository.listMcpServers();
+    const documents = await state.repository.listDocuments();
     const workspace = await state.repository.getWorkspace();
     const providerProfiles = await state.repository.listProviderProfiles();
     const agentProfiles = await state.repository.listAgentProfiles();
@@ -6982,6 +7545,25 @@ export async function createApp(
         running: jobs.filter((job) => job.status === "running").length,
         failed: jobs.filter((job) => job.status === "failed").length,
         completed: jobs.filter((job) => job.status === "completed").length,
+      },
+      documents: {
+        total: documents.length,
+        pending: documents.filter((document) => document.extractionStatus === "pending").length,
+        processing: documents.filter((document) => document.extractionStatus === "processing").length,
+        failed: documents.filter((document) => document.extractionStatus === "failed").length,
+        completed: documents.filter((document) => document.extractionStatus === "completed").length,
+        recentFailures: documents
+          .filter((document) => document.extractionStatus === "failed" || document.lastExtractionError)
+          .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+          .slice(0, 5)
+          .map((document) => ({
+            id: document.id,
+            title: document.title,
+            extractionStatus: document.extractionStatus,
+            extractionMethod: document.extractionMethod,
+            lastExtractionError: document.lastExtractionError,
+            updatedAt: document.updatedAt,
+          })),
       },
       recentProviderTests: providerTests.slice(0, 5),
       recentMcpHealth: mcpServers

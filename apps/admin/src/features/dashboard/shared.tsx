@@ -438,6 +438,13 @@ export function useMemoryStatus() {
   });
 }
 
+export function useMemoryDocuments() {
+  return useQuery({
+    queryKey: ["memory-documents"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/memory/documents"),
+  });
+}
+
 export function useDocuments() {
   return useQuery({
     queryKey: ["documents"],

@@ -23,6 +23,7 @@ import {
   ProviderTestRunSchema,
   SearchSettingsSchema,
   SecretEnvelopeSchema,
+  TelegramLoginReceiptSchema,
   ToolRunRecordSchema,
   TurnEventSchema,
   TurnStateSchema,
@@ -48,6 +49,7 @@ import {
   type ProviderTestRun,
   type SearchSettings,
   type SecretEnvelope,
+  type TelegramLoginReceipt,
   type ToolRunRecord,
   type TurnEvent,
   type TurnState,
@@ -93,6 +95,14 @@ const createTableStatements = [
   `CREATE TABLE IF NOT EXISTS auth_session (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS telegram_login_receipt (
+    id TEXT PRIMARY KEY,
+    receipt_key TEXT NOT NULL UNIQUE,
+    telegram_user_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS provider_profile (
     id TEXT PRIMARY KEY,
@@ -205,6 +215,7 @@ const createIndexStatements = [
   "CREATE INDEX IF NOT EXISTS idx_message_telegram_message_id ON message(telegram_message_id)",
   "CREATE INDEX IF NOT EXISTS idx_auth_session_jwt_jti ON auth_session(json_extract(data, '$.jwtJti'))",
   "CREATE INDEX IF NOT EXISTS idx_auth_session_expires_at ON auth_session(json_extract(data, '$.expiresAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_telegram_login_receipt_expires_at ON telegram_login_receipt(expires_at)",
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_workspace_id ON memory_chunk(json_extract(data, '$.workspaceId'))",
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
   "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
@@ -418,6 +429,11 @@ export interface AppRepository {
   }): Promise<void>;
   getAuthSessionByJti(jwtJti: string): Promise<AuthSession | null>;
   revokeAuthSession(jwtJti: string): Promise<void>;
+  claimTelegramLoginReceipt(args: {
+    receiptKey: string;
+    telegramUserId: string;
+    expiresAt: string;
+  }): Promise<"claimed" | "duplicate">;
   listProviderProfiles(): Promise<ProviderProfile[]>;
   saveProviderProfile(profile: ProviderProfile): Promise<void>;
   deleteProviderProfile(id: string): Promise<void>;
@@ -684,6 +700,58 @@ export class D1AppRepository implements AppRepository {
     });
   }
 
+  public async claimTelegramLoginReceipt(args: {
+    receiptKey: string;
+    telegramUserId: string;
+    expiresAt: string;
+  }): Promise<"claimed" | "duplicate"> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const currentTimestamp = nowIso();
+      await this.client.executeD1(
+        this.databaseId,
+        "DELETE FROM telegram_login_receipt WHERE expires_at <= ?",
+        [currentTimestamp],
+      );
+
+      const existingRows = await this.client.queryD1<{
+        expires_at: string;
+      }>(
+        this.databaseId,
+        "SELECT expires_at FROM telegram_login_receipt WHERE receipt_key = ? LIMIT 1",
+        [args.receiptKey],
+      );
+      const existing = existingRows[0];
+      if (existing && Date.parse(existing.expires_at) > Date.now()) {
+        return "duplicate";
+      }
+
+      try {
+        await this.client.executeD1(
+          this.databaseId,
+          `INSERT INTO telegram_login_receipt (
+            id, receipt_key, telegram_user_id, expires_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            createId("tglogin"),
+            args.receiptKey,
+            args.telegramUserId,
+            args.expiresAt,
+            currentTimestamp,
+            currentTimestamp,
+          ],
+        );
+        return "claimed";
+      } catch (error) {
+        if (error instanceof Error && /unique|constraint/i.test(error.message)) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    return "duplicate";
+  }
+
   public async listProviderProfiles(): Promise<ProviderProfile[]> {
     return this.listJsonTable("provider_profile", ProviderProfileSchema);
   }
@@ -918,6 +986,7 @@ export class D1AppRepository implements AppRepository {
       { sql: "DELETE FROM agent_profile" },
       { sql: "DELETE FROM search_settings" },
       { sql: "DELETE FROM admin_identity" },
+      { sql: "DELETE FROM telegram_login_receipt" },
       {
         sql: "DELETE FROM secret_envelope WHERE workspace_id = ?",
         params: [workspaceId],
@@ -1525,6 +1594,7 @@ export class InMemoryAppRepository implements AppRepository {
     lockExpiresAt: string | null;
     updatedAt: string;
   }>();
+  private telegramLoginReceipts = new Map<string, TelegramLoginReceipt>();
 
   public async getWorkspace(): Promise<Workspace | null> {
     return this.workspace;
@@ -1584,6 +1654,35 @@ export class InMemoryAppRepository implements AppRepository {
       ...session,
       revokedAt: nowIso(),
     });
+  }
+
+  public async claimTelegramLoginReceipt(args: {
+    receiptKey: string;
+    telegramUserId: string;
+    expiresAt: string;
+  }): Promise<"claimed" | "duplicate"> {
+    for (const [key, receipt] of this.telegramLoginReceipts.entries()) {
+      if (Date.parse(receipt.expiresAt) <= Date.now()) {
+        this.telegramLoginReceipts.delete(key);
+      }
+    }
+    const existing = this.telegramLoginReceipts.get(args.receiptKey);
+    if (existing && Date.parse(existing.expiresAt) > Date.now()) {
+      return "duplicate";
+    }
+    const timestamp = nowIso();
+    this.telegramLoginReceipts.set(
+      args.receiptKey,
+      TelegramLoginReceiptSchema.parse({
+        id: existing?.id ?? createId("tglogin"),
+        receiptKey: args.receiptKey,
+        telegramUserId: args.telegramUserId,
+        expiresAt: args.expiresAt,
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    return "claimed";
   }
 
   public async listProviderProfiles(): Promise<ProviderProfile[]> {
@@ -1728,6 +1827,7 @@ export class InMemoryAppRepository implements AppRepository {
     this.importExportRuns.clear();
     this.providerTestRuns.clear();
     this.telegramUpdates.clear();
+    this.telegramLoginReceipts.clear();
   }
 
   public async listDocuments(): Promise<DocumentMetadata[]> {

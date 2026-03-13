@@ -77,4 +77,78 @@ describe("builtin search plugins", () => {
       }),
     ]);
   });
+
+  it("rejects non-2xx browse responses instead of treating them as readable content", async () => {
+    global.fetch = vi.fn(async () =>
+      new Response("<html><title>404</title><body>missing</body></html>", {
+        status: 404,
+        headers: { "content-type": "text/html; charset=UTF-8" },
+      })
+    ) as typeof fetch;
+
+    const registry = createBuiltinPluginRegistry();
+
+    await expect(
+      registry.executeTool(
+        "web_browse",
+        { url: "https://example.com/missing" },
+        {
+          workspaceId: "main",
+          timezone: "UTC",
+          searchSettings: null,
+        },
+      ),
+    ).rejects.toThrow("Browse request failed: HTTP 404");
+  });
+
+  it("rejects localhost browse targets before making a request", async () => {
+    global.fetch = vi.fn(async () => {
+      throw new Error("fetch should not be called");
+    }) as typeof fetch;
+
+    const registry = createBuiltinPluginRegistry();
+
+    await expect(
+      registry.executeTool(
+        "web_browse",
+        { url: "http://localhost:3000/internal" },
+        {
+          workspaceId: "main",
+          timezone: "UTC",
+          searchSettings: null,
+        },
+      ),
+    ).rejects.toThrow("Localhost and local network hostnames are not allowed");
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects redirect hops to private browse targets before following them", async () => {
+    global.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === "https://example.com/redirect") {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: "http://127.0.0.1/internal",
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const registry = createBuiltinPluginRegistry();
+
+    await expect(
+      registry.executeTool(
+        "web_browse",
+        { url: "https://example.com/redirect" },
+        {
+          workspaceId: "main",
+          timezone: "UTC",
+          searchSettings: null,
+        },
+      ),
+    ).rejects.toThrow("IP literal URLs are not allowed");
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
 });
