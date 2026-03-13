@@ -1,12 +1,16 @@
 import {
   Badge,
+  Button,
   Panel,
 } from "@pulsarbot/ui-kit";
+import { apiFetch, apiFetchText } from "../../../lib/api.js";
+import { notificationOccurred } from "../../../lib/telegram.js";
 import {
   JsonPanel,
   KeyValueGrid,
   useSystemHealth,
 } from "../shared.js";
+import { useState } from "react";
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -48,6 +52,120 @@ function toneForStatus(status: string): "success" | "warning" | "danger" | "neut
     return "warning";
   }
   return "neutral";
+}
+
+function downloadTextFile(filename: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+async function copyToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "absolute";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+function InternalLogsActions() {
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
+
+  const fetchLogsPayload = async (format: "text" | "json") => {
+    if (format === "text") {
+      return apiFetchText("/api/system/internal-logs?format=text&limit=5000");
+    }
+    const payload = await apiFetch<Record<string, unknown>>("/api/system/internal-logs?format=json&limit=5000");
+    return JSON.stringify(payload, null, 2);
+  };
+
+  const handleDownload = async (format: "text" | "json") => {
+    try {
+      const content = await fetchLogsPayload(format);
+      downloadTextFile(
+        `pulsarbot-internal-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.${format === "text" ? "txt" : "json"}`,
+        content,
+        format === "text" ? "text/plain;charset=utf-8" : "application/json;charset=utf-8",
+      );
+      notificationOccurred("success");
+      setDownloadOpen(false);
+    } catch {
+      notificationOccurred("error");
+    }
+  };
+
+  const handleCopy = async (format: "text" | "json") => {
+    try {
+      const content = await fetchLogsPayload(format);
+      await copyToClipboard(content);
+      notificationOccurred("success");
+      setCopyOpen(false);
+    } catch {
+      notificationOccurred("error");
+    }
+  };
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      <div className="relative">
+        <Button type="button" tone="secondary" onClick={() => setDownloadOpen((open) => !open)}>
+          Download logs as...
+        </Button>
+        {downloadOpen ? (
+          <div
+            className="absolute right-0 z-10 mt-2 grid min-w-52 gap-1 rounded-2xl border p-2 shadow-lg"
+            style={{
+              background: "var(--app-surface)",
+              borderColor: "var(--app-border)",
+            }}
+          >
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleDownload("text")}>
+              Plain text (.txt)
+            </Button>
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleDownload("json")}>
+              JSON (.json)
+            </Button>
+          </div>
+        ) : null}
+      </div>
+      <div className="relative">
+        <Button type="button" tone="ghost" onClick={() => setCopyOpen((open) => !open)}>
+          Copy logs as...
+        </Button>
+        {copyOpen ? (
+          <div
+            className="absolute right-0 z-10 mt-2 grid min-w-44 gap-1 rounded-2xl border p-2 shadow-lg"
+            style={{
+              background: "var(--app-surface)",
+              borderColor: "var(--app-border)",
+            }}
+          >
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleCopy("text")}>
+              Plain text
+            </Button>
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleCopy("json")}>
+              JSON
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 export function HealthPanel() {
@@ -362,6 +480,7 @@ export function HealthPanel() {
       <JsonPanel
         title="System Health (Raw JSON)"
         subtitle="用于排障时查看完整原始响应。"
+        actions={<InternalLogsActions />}
         value={health.data ?? {}}
       />
     </div>

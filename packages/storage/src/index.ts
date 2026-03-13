@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { AppError, createId, deriveHkdfKeyMaterial, nowIso } from "@pulsarbot/core";
 import { CloudflareApiClient } from "@pulsarbot/cloudflare";
 import {
+  ApprovalRequestSchema,
   AdminIdentitySchema,
   AgentProfileSchema,
   AuthSessionSchema,
@@ -23,11 +24,16 @@ import {
   ProviderTestRunSchema,
   SearchSettingsSchema,
   SecretEnvelopeSchema,
+  TaskRunSchema,
+  TaskSchema,
   TelegramLoginReceiptSchema,
+  TriggerSchema,
   ToolRunRecordSchema,
   TurnEventSchema,
   TurnStateSchema,
   WorkspaceSchema,
+  ExecutorNodeSchema,
+  type ApprovalRequest,
   type AdminIdentity,
   type AgentProfile,
   type AuthSession,
@@ -49,11 +55,15 @@ import {
   type ProviderTestRun,
   type SearchSettings,
   type SecretEnvelope,
+  type Task,
+  type TaskRun,
   type TelegramLoginReceipt,
+  type Trigger,
   type ToolRunRecord,
   type TurnEvent,
   type TurnState,
   type Workspace,
+  type ExecutorNode,
 } from "@pulsarbot/shared";
 
 const createTableStatements = [
@@ -118,6 +128,26 @@ const createTableStatements = [
     data TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS search_settings (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS task (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS task_run (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS task_trigger (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS approval_request (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS executor_node (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
   )`,
@@ -219,6 +249,13 @@ const createIndexStatements = [
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_workspace_id ON memory_chunk(json_extract(data, '$.workspaceId'))",
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
   "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_status ON task(json_extract(data, '$.status'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_run_status ON task_run(json_extract(data, '$.status'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_run_task_id ON task_run(json_extract(data, '$.taskId'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_trigger_task_id ON task_trigger(json_extract(data, '$.taskId'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_trigger_kind ON task_trigger(json_extract(data, '$.kind'))",
+  "CREATE INDEX IF NOT EXISTS idx_approval_request_status ON approval_request(json_extract(data, '$.status'))",
+  "CREATE INDEX IF NOT EXISTS idx_executor_node_status ON executor_node(json_extract(data, '$.status'))",
   "CREATE INDEX IF NOT EXISTS idx_telegram_update_receipt_status ON telegram_update_receipt(status, updated_at)",
   "CREATE INDEX IF NOT EXISTS idx_conversation_turn_lock_expires_at ON conversation_turn_lock(lock_expires_at)",
   "CREATE INDEX IF NOT EXISTS idx_turn_event_turn_seq ON turn_event(json_extract(data, '$.turnId'), json_extract(data, '$.seq'))",
@@ -445,6 +482,34 @@ export interface AppRepository {
   deleteInstallRecord(kind: InstallRecord["kind"], manifestId: string): Promise<void>;
   getSearchSettings(): Promise<SearchSettings>;
   saveSearchSettings(settings: SearchSettings): Promise<void>;
+  listTasks(): Promise<Task[]>;
+  getTask(id: string): Promise<Task | null>;
+  saveTask(task: Task): Promise<void>;
+  listTaskRuns(args?: {
+    taskId?: string;
+    status?: TaskRun["status"];
+    executorId?: string;
+    limit?: number;
+  }): Promise<TaskRun[]>;
+  getTaskRun(id: string): Promise<TaskRun | null>;
+  saveTaskRun(taskRun: TaskRun): Promise<void>;
+  listTriggers(args?: {
+    taskId?: string;
+    kind?: Trigger["kind"];
+    enabled?: boolean;
+  }): Promise<Trigger[]>;
+  getTrigger(id: string): Promise<Trigger | null>;
+  saveTrigger(trigger: Trigger): Promise<void>;
+  listApprovalRequests(args?: {
+    taskRunId?: string;
+    status?: ApprovalRequest["status"];
+    limit?: number;
+  }): Promise<ApprovalRequest[]>;
+  getApprovalRequest(id: string): Promise<ApprovalRequest | null>;
+  saveApprovalRequest(approval: ApprovalRequest): Promise<void>;
+  listExecutorNodes(): Promise<ExecutorNode[]>;
+  getExecutorNode(id: string): Promise<ExecutorNode | null>;
+  saveExecutorNode(executor: ExecutorNode): Promise<void>;
   listMcpServers(): Promise<McpServerConfig[]>;
   saveMcpServer(server: McpServerConfig): Promise<void>;
   deleteMcpServer(id: string): Promise<void>;
@@ -836,6 +901,138 @@ export class D1AppRepository implements AppRepository {
     await this.saveJsonRow("search_settings", {
       id: parsed.id,
       data: parsed,
+    });
+  }
+
+  public async listTasks(): Promise<Task[]> {
+    return this.listJsonTable("task", TaskSchema);
+  }
+
+  public async getTask(id: string): Promise<Task | null> {
+    const tasks = await this.listTasks();
+    return tasks.find((task) => task.id === id) ?? null;
+  }
+
+  public async saveTask(task: Task): Promise<void> {
+    await this.saveJsonRow("task", {
+      id: task.id,
+      data: TaskSchema.parse(task),
+    });
+  }
+
+  public async listTaskRuns(args?: {
+    taskId?: string;
+    status?: TaskRun["status"];
+    executorId?: string;
+    limit?: number;
+  }): Promise<TaskRun[]> {
+    let rows = await this.listJsonTable("task_run", TaskRunSchema);
+    rows = rows.filter((taskRun) => {
+      if (args?.taskId && taskRun.taskId !== args.taskId) {
+        return false;
+      }
+      if (args?.status && taskRun.status !== args.status) {
+        return false;
+      }
+      if (args?.executorId && taskRun.executorId !== args.executorId) {
+        return false;
+      }
+      return true;
+    });
+    rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async getTaskRun(id: string): Promise<TaskRun | null> {
+    const rows = await this.listTaskRuns();
+    return rows.find((taskRun) => taskRun.id === id) ?? null;
+  }
+
+  public async saveTaskRun(taskRun: TaskRun): Promise<void> {
+    await this.saveJsonRow("task_run", {
+      id: taskRun.id,
+      data: TaskRunSchema.parse(taskRun),
+    });
+  }
+
+  public async listTriggers(args?: {
+    taskId?: string;
+    kind?: Trigger["kind"];
+    enabled?: boolean;
+  }): Promise<Trigger[]> {
+    let rows = await this.listJsonTable("task_trigger", TriggerSchema);
+    rows = rows.filter((trigger) => {
+      if (args?.taskId && trigger.taskId !== args.taskId) {
+        return false;
+      }
+      if (args?.kind && trigger.kind !== args.kind) {
+        return false;
+      }
+      if (typeof args?.enabled === "boolean" && trigger.enabled !== args.enabled) {
+        return false;
+      }
+      return true;
+    });
+    rows.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return rows;
+  }
+
+  public async getTrigger(id: string): Promise<Trigger | null> {
+    const rows = await this.listTriggers();
+    return rows.find((trigger) => trigger.id === id) ?? null;
+  }
+
+  public async saveTrigger(trigger: Trigger): Promise<void> {
+    await this.saveJsonRow("task_trigger", {
+      id: trigger.id,
+      data: TriggerSchema.parse(trigger),
+    });
+  }
+
+  public async listApprovalRequests(args?: {
+    taskRunId?: string;
+    status?: ApprovalRequest["status"];
+    limit?: number;
+  }): Promise<ApprovalRequest[]> {
+    let rows = await this.listJsonTable("approval_request", ApprovalRequestSchema);
+    rows = rows.filter((approval) => {
+      if (args?.taskRunId && approval.taskRunId !== args.taskRunId) {
+        return false;
+      }
+      if (args?.status && approval.status !== args.status) {
+        return false;
+      }
+      return true;
+    });
+    rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async getApprovalRequest(id: string): Promise<ApprovalRequest | null> {
+    const rows = await this.listApprovalRequests();
+    return rows.find((approval) => approval.id === id) ?? null;
+  }
+
+  public async saveApprovalRequest(approval: ApprovalRequest): Promise<void> {
+    await this.saveJsonRow("approval_request", {
+      id: approval.id,
+      data: ApprovalRequestSchema.parse(approval),
+    });
+  }
+
+  public async listExecutorNodes(): Promise<ExecutorNode[]> {
+    return this.listJsonTable("executor_node", ExecutorNodeSchema);
+  }
+
+  public async getExecutorNode(id: string): Promise<ExecutorNode | null> {
+    const rows = await this.listExecutorNodes();
+    return rows.find((executor) => executor.id === id) ?? null;
+  }
+
+  public async saveExecutorNode(executor: ExecutorNode): Promise<void> {
+    await this.saveJsonRow("executor_node", {
+      id: executor.id,
+      data: ExecutorNodeSchema.parse(executor),
     });
   }
 
@@ -1567,6 +1764,11 @@ export class InMemoryAppRepository implements AppRepository {
   private agentProfiles = new Map<string, AgentProfile>();
   private installs = new Map<string, InstallRecord>();
   private searchSettings: SearchSettings | null = null;
+  private tasks = new Map<string, Task>();
+  private taskRuns = new Map<string, TaskRun>();
+  private triggers = new Map<string, Trigger>();
+  private approvalRequests = new Map<string, ApprovalRequest>();
+  private executorNodes = new Map<string, ExecutorNode>();
   private mcpProviders = new Map<string, McpProviderConfig>();
   private mcpServers = new Map<string, McpServerConfig>();
   private secrets = new Map<string, SecretEnvelope>();
@@ -1748,6 +1950,121 @@ export class InMemoryAppRepository implements AppRepository {
     this.searchSettings = SearchSettingsSchema.parse(settings);
   }
 
+  public async listTasks(): Promise<Task[]> {
+    return [...this.tasks.values()];
+  }
+
+  public async getTask(id: string): Promise<Task | null> {
+    return this.tasks.get(id) ?? null;
+  }
+
+  public async saveTask(task: Task): Promise<void> {
+    const parsed = TaskSchema.parse(task);
+    this.tasks.set(parsed.id, parsed);
+  }
+
+  public async listTaskRuns(args?: {
+    taskId?: string;
+    status?: TaskRun["status"];
+    executorId?: string;
+    limit?: number;
+  }): Promise<TaskRun[]> {
+    let rows = [...this.taskRuns.values()].filter((taskRun) => {
+      if (args?.taskId && taskRun.taskId !== args.taskId) {
+        return false;
+      }
+      if (args?.status && taskRun.status !== args.status) {
+        return false;
+      }
+      if (args?.executorId && taskRun.executorId !== args.executorId) {
+        return false;
+      }
+      return true;
+    });
+    rows = rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async getTaskRun(id: string): Promise<TaskRun | null> {
+    return this.taskRuns.get(id) ?? null;
+  }
+
+  public async saveTaskRun(taskRun: TaskRun): Promise<void> {
+    const parsed = TaskRunSchema.parse(taskRun);
+    this.taskRuns.set(parsed.id, parsed);
+  }
+
+  public async listTriggers(args?: {
+    taskId?: string;
+    kind?: Trigger["kind"];
+    enabled?: boolean;
+  }): Promise<Trigger[]> {
+    return [...this.triggers.values()]
+      .filter((trigger) => {
+        if (args?.taskId && trigger.taskId !== args.taskId) {
+          return false;
+        }
+        if (args?.kind && trigger.kind !== args.kind) {
+          return false;
+        }
+        if (typeof args?.enabled === "boolean" && trigger.enabled !== args.enabled) {
+          return false;
+        }
+        return true;
+      })
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  public async getTrigger(id: string): Promise<Trigger | null> {
+    return this.triggers.get(id) ?? null;
+  }
+
+  public async saveTrigger(trigger: Trigger): Promise<void> {
+    const parsed = TriggerSchema.parse(trigger);
+    this.triggers.set(parsed.id, parsed);
+  }
+
+  public async listApprovalRequests(args?: {
+    taskRunId?: string;
+    status?: ApprovalRequest["status"];
+    limit?: number;
+  }): Promise<ApprovalRequest[]> {
+    let rows = [...this.approvalRequests.values()].filter((approval) => {
+      if (args?.taskRunId && approval.taskRunId !== args.taskRunId) {
+        return false;
+      }
+      if (args?.status && approval.status !== args.status) {
+        return false;
+      }
+      return true;
+    });
+    rows = rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async getApprovalRequest(id: string): Promise<ApprovalRequest | null> {
+    return this.approvalRequests.get(id) ?? null;
+  }
+
+  public async saveApprovalRequest(approval: ApprovalRequest): Promise<void> {
+    const parsed = ApprovalRequestSchema.parse(approval);
+    this.approvalRequests.set(parsed.id, parsed);
+  }
+
+  public async listExecutorNodes(): Promise<ExecutorNode[]> {
+    return [...this.executorNodes.values()]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  public async getExecutorNode(id: string): Promise<ExecutorNode | null> {
+    return this.executorNodes.get(id) ?? null;
+  }
+
+  public async saveExecutorNode(executor: ExecutorNode): Promise<void> {
+    const parsed = ExecutorNodeSchema.parse(executor);
+    this.executorNodes.set(parsed.id, parsed);
+  }
+
   public async listMcpServers(): Promise<McpServerConfig[]> {
     return [...this.mcpServers.values()];
   }
@@ -1808,6 +2125,11 @@ export class InMemoryAppRepository implements AppRepository {
     this.agentProfiles.clear();
     this.installs.clear();
     this.searchSettings = null;
+    this.tasks.clear();
+    this.taskRuns.clear();
+    this.triggers.clear();
+    this.approvalRequests.clear();
+    this.executorNodes.clear();
     this.mcpProviders.clear();
     this.mcpServers.clear();
     this.secrets.clear();

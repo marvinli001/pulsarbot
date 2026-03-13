@@ -25,10 +25,12 @@
 - [仓库结构与架构](project-structure.md)
 - [开发、测试与运维](development-and-ops.md)
 - [API 总览](api-overview.md)
+- [自动化控制面设计](automation-control-plane.md)
 
 ### 我是日常运营者
 
 - [管理台使用说明](miniapp-guide.md)
+- [自动化控制面设计](automation-control-plane.md)
 - [开发、测试与运维](development-and-ops.md)
 - [常见问题与排障](help-and-faq.md)
 
@@ -42,6 +44,8 @@
   - monorepo 布局、运行时数据流、存储边界和代码落点。
 - [miniapp-guide.md](miniapp-guide.md)
   - Telegram Mini App 管理台的使用顺序、面板职责和典型操作。
+- [automation-control-plane.md](automation-control-plane.md)
+  - Tasks、Task Runs、Triggers、Approvals、Executors、workflow templates 和 companion 的设计说明。
 - [development-and-ops.md](development-and-ops.md)
   - 开发命令、测试建议、运维入口、数据目录和发布前检查。
 - [api-overview.md](api-overview.md)

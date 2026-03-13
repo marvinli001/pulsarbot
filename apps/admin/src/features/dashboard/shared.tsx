@@ -8,10 +8,13 @@ import {
 import {
   Bot,
   BrainCircuit,
+  Cable,
+  Clock3,
   Database,
   FileJson,
   HeartPulse,
   LayoutDashboard,
+  ListTodo,
   MemoryStick,
   PackageSearch,
   PlugZap,
@@ -104,6 +107,10 @@ export const navigation = [
   { id: "mcp-market", label: "MCP Market", icon: PackageSearch },
   { id: "mcp-servers", label: "MCP Servers", icon: Wrench },
   { id: "search", label: "Search", icon: Search },
+  { id: "tasks", label: "Tasks", icon: ListTodo },
+  { id: "automations", label: "Automations", icon: Clock3 },
+  { id: "sessions", label: "Sessions", icon: Database },
+  { id: "executors", label: "Executors", icon: Cable },
   { id: "memory", label: "Memory", icon: MemoryStick },
   { id: "documents", label: "Documents", icon: ScrollText },
   { id: "import-export", label: "Import/Export", icon: FileJson },
@@ -197,6 +204,59 @@ export const searchProviderOptions = [
 export const fallbackStrategyOptions = [
   { value: "exa_then_browse", label: "Exa then Browse" },
   { value: "browse_only", label: "Browse Only" },
+] as const;
+
+export const workflowTemplateOptions = [
+  {
+    value: "web_watch_report",
+    label: "网页监控并汇报",
+    caption: "定时抓取网页并生成汇报摘要。",
+  },
+  {
+    value: "browser_workflow",
+    label: "打开网页完成浏览器流程",
+    caption: "通过 companion browser capability 执行网页流程。",
+  },
+  {
+    value: "document_digest_memory",
+    label: "读 PDF/DOCX 并生成摘要+记忆",
+    caption: "围绕文档输入生成摘要，并写回 task context。",
+  },
+  {
+    value: "telegram_followup",
+    label: "从 Telegram 消息生成待办并定时跟进",
+    caption: "将 Telegram 对话转成后续跟进自动化。",
+  },
+  {
+    value: "webhook_fetch_analyze_push",
+    label: "收到 webhook 后抓取、分析并回推 TG",
+    caption: "Webhook 触发后抓取外部内容并推送结果。",
+  },
+] as const;
+
+export const approvalPolicyOptions = [
+  { value: "auto_approve_safe", label: "Auto approve safe" },
+  { value: "approval_required", label: "Always require approval" },
+  { value: "approval_for_write", label: "Approval for write actions" },
+] as const;
+
+export const memoryPolicyOptions = [
+  { value: "chat_only", label: "Chat only" },
+  { value: "task_context", label: "Task context" },
+  { value: "task_context_writeback", label: "Task context + writeback" },
+] as const;
+
+export const triggerKindOptions = [
+  { value: "schedule", label: "Schedule" },
+  { value: "webhook", label: "Webhook" },
+  { value: "telegram_shortcut", label: "Telegram Shortcut" },
+] as const;
+
+export const executorCapabilityOptions = [
+  { value: "browser", label: "Browser" },
+  { value: "http", label: "HTTP" },
+  { value: "fs", label: "Filesystem" },
+  { value: "shell", label: "Shell" },
 ] as const;
 
 export const providerKindTemplates: Record<
@@ -378,6 +438,51 @@ export function useProfiles() {
   return useQuery({
     queryKey: ["profiles"],
     queryFn: () => apiFetch<Array<JsonRecord>>("/api/agent-profiles"),
+  });
+}
+
+export function useTasks() {
+  return useQuery({
+    queryKey: ["tasks"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/tasks"),
+  });
+}
+
+export function useTaskRuns() {
+  return useQuery({
+    queryKey: ["task-runs"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/task-runs"),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useWorkflowTemplates() {
+  return useQuery({
+    queryKey: ["workflow-templates"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/workflow/templates"),
+  });
+}
+
+export function useTriggers() {
+  return useQuery({
+    queryKey: ["triggers"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/triggers"),
+  });
+}
+
+export function useApprovals() {
+  return useQuery({
+    queryKey: ["approvals"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/approvals"),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useExecutors() {
+  return useQuery({
+    queryKey: ["executors"],
+    queryFn: () => apiFetch<Array<JsonRecord>>("/api/executors"),
+    refetchInterval: 10_000,
   });
 }
 

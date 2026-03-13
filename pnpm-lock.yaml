@@ -88,6 +88,18 @@ importers:
         specifier: ^19.0.4
         version: 19.2.3(@types/react@19.2.14)
 
+  apps/companion:
+    dependencies:
+      '@playwright/test':
+        specifier: ^1.52.0
+        version: 1.58.2
+      '@pulsarbot/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@pulsarbot/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
+
   apps/server:
     dependencies:
       '@fastify/cookie':

@@ -14,13 +14,15 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
-import { AgentRuntime, runGraph } from "@pulsarbot/agent";
+import { AgentRuntime, TaskRuntime, runGraph } from "@pulsarbot/agent";
 import { CloudflareApiClient } from "@pulsarbot/cloudflare";
 import {
   AppError,
   createId,
   createLogger,
   deriveHkdfKeyMaterial,
+  formatInternalLogsAsText,
+  getInternalLogSnapshot,
   loadEnv,
   nowIso,
   sha256,
@@ -43,8 +45,12 @@ import {
 } from "@pulsarbot/providers";
 import {
   AgentProfileSchema,
+  ApprovalPolicySchema,
+  ApprovalRequestSchema,
   type AgentGraphState,
   CloudflareCredentialsSchema,
+  ExecutorNodeSchema,
+  MemoryPolicySchema,
   McpServerConfigSchema,
   McpProviderConfigSchema,
   McpProviderCatalogServerSchema,
@@ -52,32 +58,46 @@ import {
   ProviderProfileSchema,
   ResolvedRuntimeSnapshotSchema,
   SearchSettingsSchema,
+  TaskRunSchema,
+  TaskSchema,
+  TaskTriggerKindSchema,
   TurnEventTypeSchema,
   TurnStateSchema,
+  TriggerSchema,
+  WorkflowBudgetSchema,
   WorkspaceExportBundleSchema,
   WorkspaceSchema,
+  type ApprovalRequest,
+  type ApprovalPolicy,
   type AgentProfile,
   type AuthSession,
   type CloudflareCredentials,
   type ConversationTurn,
   type DocumentArtifact,
   type DocumentMetadata,
+  type ExecutorNode,
   type InstallRecord,
   type LooseJsonValue,
   type McpProviderConfig,
   type McpProviderCatalogServer,
   type McpProviderKind,
   type McpServerConfig,
+  type MemoryPolicy,
   type MemoryDocument,
   type ProviderTestCapability,
   type ProviderProfile,
   type ProviderTestRunResult,
   type ResolvedRuntimeSnapshot,
   type SearchSettings,
+  type Task,
+  type TaskRun,
+  type TaskTriggerKind,
   type TelegramInboundContent,
+  type Trigger,
   type TurnEvent,
   type TurnEventType,
   type TurnState,
+  type WorkflowTemplateKind,
   type Workspace,
 } from "@pulsarbot/shared";
 import {
@@ -164,6 +184,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     return null;
   }
   return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function firstStringField(
@@ -270,6 +294,670 @@ function toBooleanLike(value: unknown): boolean | null {
     }
   }
   return null;
+}
+
+interface WorkflowTemplateFieldDefinition {
+  key: string;
+  kind: "text" | "textarea" | "number" | "boolean" | "select" | "json";
+  label: string;
+  description: string;
+  placeholder?: string;
+  options?: Array<{ value: string; label: string }>;
+}
+
+interface WorkflowTemplateDefinition {
+  id: WorkflowTemplateKind;
+  title: string;
+  description: string;
+  requiresExecutor: boolean;
+  executionMode: "executor" | "internal";
+  defaultConfig: Record<string, LooseJsonValue>;
+  fields: WorkflowTemplateFieldDefinition[];
+  defaultApprovalCheckpoints: string[];
+}
+
+const workflowTemplates: WorkflowTemplateDefinition[] = [
+  {
+    id: "web_watch_report",
+    title: "网页监控并汇报",
+    description: "定时抓取目标网页并回推状态摘要。",
+    requiresExecutor: true,
+    executionMode: "executor",
+    defaultConfig: {
+      url: "https://example.com",
+      responseMode: "text",
+      telegramTarget: {},
+    },
+    fields: [
+      {
+        key: "url",
+        kind: "text",
+        label: "Watch URL",
+        description: "The page to fetch on each run.",
+        placeholder: "https://example.com",
+      },
+      {
+        key: "responseMode",
+        kind: "select",
+        label: "Response Mode",
+        description: "How the HTTP result should be packaged.",
+        options: [
+          { value: "text", label: "Text" },
+          { value: "json", label: "JSON" },
+        ],
+      },
+      {
+        key: "telegramTarget.chatId",
+        kind: "text",
+        label: "Telegram Chat ID",
+        description: "Optional override for Telegram push target.",
+        placeholder: "123456789",
+      },
+    ],
+    defaultApprovalCheckpoints: ["before_executor", "before_telegram_push"],
+  },
+  {
+    id: "browser_workflow",
+    title: "打开网页完成浏览器流程",
+    description: "用 companion browser capability 执行结构化浏览器步骤。",
+    requiresExecutor: true,
+    executionMode: "executor",
+    defaultConfig: {
+      startUrl: "https://example.com",
+      steps: [
+        { type: "wait", ms: 500 },
+      ],
+      captureScreenshot: true,
+      telegramTarget: {},
+    },
+    fields: [
+      {
+        key: "startUrl",
+        kind: "text",
+        label: "Start URL",
+        description: "Initial URL for the browser workflow.",
+        placeholder: "https://example.com",
+      },
+      {
+        key: "steps",
+        kind: "json",
+        label: "Browser Steps",
+        description: "Array of browser actions such as goto/click/type/extract_text.",
+      },
+      {
+        key: "captureScreenshot",
+        kind: "boolean",
+        label: "Capture Screenshot",
+        description: "Attach a full-page screenshot on completion.",
+      },
+      {
+        key: "telegramTarget.chatId",
+        kind: "text",
+        label: "Telegram Chat ID",
+        description: "Optional override for Telegram push target.",
+        placeholder: "123456789",
+      },
+    ],
+    defaultApprovalCheckpoints: ["before_executor", "before_telegram_push"],
+  },
+  {
+    id: "document_digest_memory",
+    title: "读 PDF/DOCX 并生成摘要+记忆",
+    description: "从已导入文档生成结构化摘要，并可写回 summary memory。",
+    requiresExecutor: false,
+    executionMode: "internal",
+    defaultConfig: {
+      documentId: "",
+      maxParagraphs: 3,
+      writebackSummary: true,
+      telegramTarget: {},
+    },
+    fields: [
+      {
+        key: "documentId",
+        kind: "text",
+        label: "Document ID",
+        description: "Imported document ID to summarize.",
+        placeholder: "doc_xxx",
+      },
+      {
+        key: "maxParagraphs",
+        kind: "number",
+        label: "Summary Paragraphs",
+        description: "How many paragraphs to keep in the digest.",
+      },
+      {
+        key: "writebackSummary",
+        kind: "boolean",
+        label: "Write Back Summary",
+        description: "Persist the summary into summary memory snapshots.",
+      },
+      {
+        key: "telegramTarget.chatId",
+        kind: "text",
+        label: "Telegram Chat ID",
+        description: "Optional override for Telegram push target.",
+        placeholder: "123456789",
+      },
+    ],
+    defaultApprovalCheckpoints: ["before_memory_writeback", "before_telegram_push"],
+  },
+  {
+    id: "telegram_followup",
+    title: "从 Telegram 消息生成待办并定时跟进",
+    description: "根据 Telegram 消息上下文抓取资源并触发后续跟进。",
+    requiresExecutor: true,
+    executionMode: "executor",
+    defaultConfig: {
+      url: "https://example.com/followup",
+      followupNote: "Follow up on this item",
+      telegramTarget: {},
+    },
+    fields: [
+      {
+        key: "url",
+        kind: "text",
+        label: "Follow-up URL",
+        description: "Resource to fetch during the follow-up run.",
+        placeholder: "https://example.com/followup",
+      },
+      {
+        key: "followupNote",
+        kind: "textarea",
+        label: "Follow-up Note",
+        description: "Instruction bundled into the run.",
+      },
+      {
+        key: "telegramTarget.chatId",
+        kind: "text",
+        label: "Telegram Chat ID",
+        description: "Optional override for Telegram push target.",
+        placeholder: "123456789",
+      },
+    ],
+    defaultApprovalCheckpoints: ["before_executor", "before_telegram_push"],
+  },
+  {
+    id: "webhook_fetch_analyze_push",
+    title: "收到 webhook 后抓取、分析并回推 TG",
+    description: "Webhook 触发后抓取一个 URL，并把结果回推 Telegram。",
+    requiresExecutor: true,
+    executionMode: "executor",
+    defaultConfig: {
+      url: "https://example.com/webhook-source",
+      method: "GET",
+      includeWebhookHeaders: true,
+      telegramTarget: {},
+    },
+    fields: [
+      {
+        key: "url",
+        kind: "text",
+        label: "Fallback URL",
+        description: "Used when the webhook payload does not provide a URL.",
+        placeholder: "https://example.com/webhook-source",
+      },
+      {
+        key: "method",
+        kind: "select",
+        label: "HTTP Method",
+        description: "HTTP method for the fetch action.",
+        options: [
+          { value: "GET", label: "GET" },
+          { value: "POST", label: "POST" },
+        ],
+      },
+      {
+        key: "includeWebhookHeaders",
+        kind: "boolean",
+        label: "Include Webhook Headers",
+        description: "Forward webhook headers into the executor request.",
+      },
+      {
+        key: "telegramTarget.chatId",
+        kind: "text",
+        label: "Telegram Chat ID",
+        description: "Optional override for Telegram push target.",
+        placeholder: "123456789",
+      },
+    ],
+    defaultApprovalCheckpoints: ["before_executor", "before_telegram_push"],
+  },
+];
+
+function workflowTemplateById(id: WorkflowTemplateKind): WorkflowTemplateDefinition {
+  return workflowTemplates.find((item) => item.id === id) ?? workflowTemplates[0]!;
+}
+
+function getNestedValue(record: Record<string, unknown>, pathExpression: string): unknown {
+  return pathExpression.split(".").reduce<unknown>((current, segment) => {
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      return undefined;
+    }
+    return (current as Record<string, unknown>)[segment];
+  }, record);
+}
+
+function setNestedValue(
+  record: Record<string, LooseJsonValue>,
+  pathExpression: string,
+  value: LooseJsonValue,
+): void {
+  const segments = pathExpression.split(".");
+  let cursor = record;
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index]!;
+    const current = cursor[segment];
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      cursor[segment] = {};
+    }
+    cursor = cursor[segment] as Record<string, LooseJsonValue>;
+  }
+  cursor[segments[segments.length - 1]!] = value;
+}
+
+function templateDefaultConfig(
+  templateKind: WorkflowTemplateKind,
+): Record<string, LooseJsonValue> {
+  return asLooseRecordOrEmpty(workflowTemplateById(templateKind).defaultConfig);
+}
+
+function normalizeWorkflowTemplateConfig(args: {
+  templateKind: WorkflowTemplateKind;
+  config: unknown;
+}): Record<string, LooseJsonValue> {
+  const template = workflowTemplateById(args.templateKind);
+  const source = asRecord(args.config) ?? {};
+  const next = templateDefaultConfig(args.templateKind);
+
+  for (const field of template.fields) {
+    const rawValue = getNestedValue(source, field.key);
+    if (typeof rawValue === "undefined" || rawValue === null || rawValue === "") {
+      continue;
+    }
+    if (field.kind === "number") {
+      const numeric = Number(rawValue);
+      if (Number.isFinite(numeric)) {
+        setNestedValue(next, field.key, numeric);
+      }
+      continue;
+    }
+    if (field.kind === "boolean") {
+      const normalized = toBooleanLike(rawValue);
+      if (normalized !== null) {
+        setNestedValue(next, field.key, normalized);
+      }
+      continue;
+    }
+    if (field.kind === "json") {
+      if (typeof rawValue === "object") {
+        setNestedValue(next, field.key, JSON.parse(JSON.stringify(rawValue)) as LooseJsonValue);
+      }
+      continue;
+    }
+    setNestedValue(next, field.key, String(rawValue));
+  }
+
+  const executorAction = asRecord(source.executorAction);
+  if (executorAction) {
+    next.executorAction = asLooseRecordOrEmpty(executorAction);
+  }
+
+  return next;
+}
+
+function defaultApprovalCheckpointsForTemplate(
+  templateKind: WorkflowTemplateKind,
+): string[] {
+  return [...workflowTemplateById(templateKind).defaultApprovalCheckpoints];
+}
+
+function taskHasTelegramPush(task: Task): boolean {
+  const telegramTarget = asRecord(task.config.telegramTarget);
+  return Boolean(telegramTarget && asString(telegramTarget.chatId));
+}
+
+function taskRunSessionId(taskRunId: string): string {
+  return `task-session:${taskRunId}`;
+}
+
+function normalizeWebhookPath(input: string): string {
+  const trimmed = input.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+  return trimmed || `hook-${createId("trigger")}`;
+}
+
+function scheduleIntervalMinutes(config: Record<string, unknown>): number | null {
+  const value = Number(config.intervalMinutes ?? config.everyMinutes ?? config.minutes ?? NaN);
+  if (!Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return Math.max(Math.trunc(value * 100) / 100, 0.01);
+}
+
+function nextScheduledRunAt(config: Record<string, unknown>, baseMs = Date.now()): string | null {
+  const intervalMinutes = scheduleIntervalMinutes(config);
+  if (!intervalMinutes) {
+    return null;
+  }
+  return new Date(baseMs + intervalMinutes * 60_000).toISOString();
+}
+
+function approvalPolicyNeedsReview(policy: string): boolean {
+  return policy === "approval_required" || policy === "approval_for_write";
+}
+
+function normalizeTelegramShortcutCommand(input: unknown): string | null {
+  if (typeof input !== "string") {
+    return "/digest";
+  }
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) {
+    return "/digest";
+  }
+  return normalized === "/digest" ? normalized : null;
+}
+
+function asLooseRecordOrEmpty(value: unknown): Record<string, LooseJsonValue> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return JSON.parse(JSON.stringify(value)) as Record<string, LooseJsonValue>;
+}
+
+function buildTaskExecutionPlan(args: {
+  task: Task;
+  inputSnapshot?: Record<string, unknown> | undefined;
+}): Record<string, LooseJsonValue> {
+  const taskConfig = normalizeWorkflowTemplateConfig({
+    templateKind: args.task.templateKind,
+    config: args.task.config,
+  });
+  const executorAction = asRecord(taskConfig.executorAction);
+  if (executorAction) {
+    return asLooseRecordOrEmpty(executorAction);
+  }
+
+  const webhookBody = asRecord(args.inputSnapshot?.body);
+  switch (args.task.templateKind) {
+    case "web_watch_report":
+      return asLooseRecordOrEmpty({
+        capability: "http",
+        action: "http_fetch",
+        request: {
+          url: firstStringField(taskConfig, ["url", "targetUrl", "watchUrl"]) ?? "",
+          method: "GET",
+        },
+        responseMode: taskConfig.responseMode ?? "text",
+      });
+    case "browser_workflow":
+      return asLooseRecordOrEmpty({
+        capability: "browser",
+        action: "browser_script",
+        startUrl: firstStringField(taskConfig, ["startUrl", "url"]) ?? "",
+        steps: Array.isArray(taskConfig.steps) ? taskConfig.steps : [],
+        captureScreenshot: taskConfig.captureScreenshot ?? true,
+      });
+    case "document_digest_memory":
+      return asLooseRecordOrEmpty({
+        capability: "internal",
+        action: "document_digest_summary",
+        documentId:
+          firstStringField(taskConfig, ["documentId"]) ??
+          args.task.relatedDocumentIds[0] ??
+          "",
+        maxParagraphs: Number(taskConfig.maxParagraphs ?? 3),
+        writebackSummary: Boolean(taskConfig.writebackSummary ?? false),
+      });
+    case "telegram_followup":
+      return asLooseRecordOrEmpty({
+        capability: "http",
+        action: "http_fetch",
+        request: {
+          url: firstStringField(taskConfig, ["url", "targetUrl"]) ?? "",
+          method: "GET",
+        },
+        metadata: {
+          purpose: "telegram_followup",
+        },
+      });
+    case "webhook_fetch_analyze_push":
+      return asLooseRecordOrEmpty({
+        capability: "http",
+        action: "http_fetch",
+        request: {
+          url:
+            firstStringField(webhookBody ?? {}, ["url", "targetUrl"]) ??
+            firstStringField(taskConfig, ["url", "targetUrl"]) ??
+            "",
+          method:
+            firstStringField(webhookBody ?? {}, ["method"]) ??
+            firstStringField(taskConfig, ["method"]) ??
+            "GET",
+          headers: taskConfig.includeWebhookHeaders !== false
+            ? asRecord(webhookBody?.headers) ?? {}
+            : {},
+          body: webhookBody?.body ?? null,
+        },
+        metadata: {
+          source: "webhook_trigger",
+        },
+      });
+    default:
+      return {};
+  }
+}
+
+function summarizeTextLocally(input: string, maxParagraphs = 3): string {
+  const paragraphs = input
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  if (paragraphs.length === 0) {
+    return "";
+  }
+  return paragraphs
+    .slice(0, Math.max(1, maxParagraphs))
+    .map((paragraph, index) => `${index + 1}. ${paragraph.replace(/\s+/g, " ").slice(0, 700)}`)
+    .join("\n\n");
+}
+
+async function loadTaskDocumentText(args: {
+  state: RuntimeState;
+  documentId: string;
+}): Promise<{
+  document: DocumentMetadata;
+  text: string;
+}> {
+  const document = (await args.state.repository.listDocuments()).find((item) => item.id === args.documentId);
+  if (!document) {
+    throw new Error("Task document was not found");
+  }
+
+  const cloudflare = args.state.cloudflare;
+  let text = "";
+  if (cloudflare?.credentials.r2BucketName && document.derivedTextObjectKey) {
+    text = await cloudflare.client.getR2Object({
+      bucketName: cloudflare.credentials.r2BucketName,
+      key: document.derivedTextObjectKey,
+    }) ?? "";
+  }
+  if (!text && cloudflare?.credentials.r2BucketName && document.sourceObjectKey) {
+    const raw = await cloudflare.client.getR2ObjectRaw({
+      bucketName: cloudflare.credentials.r2BucketName,
+      key: document.sourceObjectKey,
+    });
+    if (raw) {
+      text = decodeBestEffortText(raw.body);
+    }
+  }
+  if (!text && document.previewText) {
+    text = document.previewText;
+  }
+  if (!text.trim()) {
+    throw new Error("Task document does not have readable derived text");
+  }
+  return {
+    document,
+    text,
+  };
+}
+
+async function buildWorkflowCapabilityPreview(args: {
+  state: RuntimeState;
+  taskDraft: {
+    id?: string | null;
+    title?: string | null;
+    goal?: string | null;
+    templateKind: WorkflowTemplateKind;
+    config: Record<string, unknown>;
+    defaultExecutorId?: string | null;
+    approvalPolicy?: ApprovalPolicy | null;
+    approvalCheckpoints?: string[] | null;
+    memoryPolicy?: MemoryPolicy | null;
+    relatedDocumentIds?: string[] | null;
+  };
+  inputSnapshot?: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  const template = workflowTemplateById(args.taskDraft.templateKind);
+  const config = normalizeWorkflowTemplateConfig({
+    templateKind: args.taskDraft.templateKind,
+    config: args.taskDraft.config,
+  });
+  const approvalCheckpoints = Array.isArray(args.taskDraft.approvalCheckpoints) &&
+    args.taskDraft.approvalCheckpoints.length > 0
+    ? args.taskDraft.approvalCheckpoints
+    : defaultApprovalCheckpointsForTemplate(args.taskDraft.templateKind);
+  const task = TaskSchema.parse({
+    id: args.taskDraft.id ?? "preview-task",
+    workspaceId: "preview",
+    title: args.taskDraft.title ?? template.title,
+    goal: args.taskDraft.goal ?? template.description,
+    description: "",
+    config,
+    templateKind: args.taskDraft.templateKind,
+    status: "draft",
+    agentProfileId: null,
+    defaultExecutorId: args.taskDraft.defaultExecutorId ?? null,
+    approvalPolicy: args.taskDraft.approvalPolicy ?? "auto_approve_safe",
+    approvalCheckpoints,
+    memoryPolicy: args.taskDraft.memoryPolicy ?? "chat_only",
+    defaultRunBudget: {
+      maxSteps: 8,
+      maxActions: 6,
+      timeoutMs: 60_000,
+    },
+    triggerIds: [],
+    relatedDocumentIds: args.taskDraft.relatedDocumentIds ?? [],
+    relatedThreadIds: [],
+    latestRunId: null,
+    lastRunAt: null,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  });
+  const executionPlan = buildTaskExecutionPlan({
+    task,
+    inputSnapshot: args.inputSnapshot,
+  });
+  const executor = task.defaultExecutorId
+    ? await args.state.repository.getExecutorNode(task.defaultExecutorId)
+    : null;
+  const stagedPreview = await args.state.taskRuntime.stageRun({
+    workspaceId: task.workspaceId,
+    task,
+    triggerType: "manual",
+    executor,
+    inputSnapshot: args.inputSnapshot,
+    executionPlan,
+    runId: "taskrun-preview",
+    sessionId: "task-session:preview",
+    now: nowIso(),
+  });
+  const workspace = await args.state.repository.getWorkspace();
+  const blockers: Array<{ code: string; message: string }> = [];
+
+  if (template.executionMode === "executor") {
+    if (!executor) {
+      blockers.push({
+        code: "executor_missing",
+        message: "This workflow requires a default executor.",
+      });
+    } else {
+      const capability = String(executionPlan.capability ?? "");
+      if (capability && !executor.capabilities.includes(capability as never)) {
+        blockers.push({
+          code: "executor_capability_missing",
+          message: `Executor ${executor.label} is missing capability ${capability}.`,
+        });
+      }
+      if (executor.status !== "online") {
+        blockers.push({
+          code: "executor_offline",
+          message: `Executor ${executor.label} is not online.`,
+        });
+      }
+    }
+  }
+
+  if (task.templateKind === "document_digest_memory") {
+    const documentId =
+      firstStringField(config, ["documentId"]) ??
+      task.relatedDocumentIds[0] ??
+      null;
+    if (!documentId) {
+      blockers.push({
+        code: "document_missing",
+        message: "This workflow requires a documentId or related document.",
+      });
+    } else {
+      const document = (await args.state.repository.listDocuments()).find((item) => item.id === documentId);
+      if (!document) {
+        blockers.push({
+          code: "document_not_found",
+          message: `Document ${documentId} was not found.`,
+        });
+      }
+    }
+  }
+
+  if (
+    taskHasTelegramPush(task) &&
+    !asString(getNestedValue(config, "telegramTarget.chatId")) &&
+    !workspace?.ownerTelegramUserId
+  ) {
+    blockers.push({
+      code: "telegram_target_missing",
+      message: "Telegram push checkpoint is enabled but telegramTarget.chatId is missing.",
+    });
+  }
+
+  return {
+    template: {
+      id: template.id,
+      title: template.title,
+      description: template.description,
+      executionMode: template.executionMode,
+      requiresExecutor: template.requiresExecutor,
+    },
+    config,
+    executionPlan,
+    approvalPolicy: task.approvalPolicy,
+    approvalCheckpoints,
+    defaultApprovalCheckpoints: template.defaultApprovalCheckpoints,
+    taskRunStatus: stagedPreview.taskRun.status,
+    approvalRequired: Boolean(stagedPreview.approval),
+    approvalReason: stagedPreview.approval?.reason ?? null,
+    requestedCapabilities: stagedPreview.approval?.requestedCapabilities ?? [],
+    executor: executor
+      ? {
+          id: executor.id,
+          label: executor.label,
+          status: executor.status,
+          capabilities: executor.capabilities,
+        }
+      : null,
+    blockers,
+    ready: blockers.length === 0,
+  };
 }
 
 function collectBailianMcpRecords(
@@ -514,6 +1202,10 @@ function isIsoInFuture(value: string | null | undefined): boolean {
   return Boolean(value && Date.parse(value) > Date.now());
 }
 
+function isIsoExpired(value: string | null | undefined): boolean {
+  return Boolean(value && Date.parse(value) <= Date.now());
+}
+
 function isMissingSecretError(error: unknown): boolean {
   if (error instanceof AppError) {
     return error.code === "SECRET_NOT_FOUND";
@@ -530,6 +1222,8 @@ const TURN_EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TELEGRAM_INIT_DATA_MAX_AGE_SECONDS = 10 * 60;
 const TELEGRAM_INIT_DATA_REPLAY_WINDOW_MS = 15 * 60 * 1000;
 const TELEGRAM_INIT_DATA_CLOCK_SKEW_SECONDS = 60;
+const EXECUTOR_PAIRING_CODE_MAX_AGE_MS = 10 * 60 * 1000;
+const APPROVAL_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 const TURN_GRAPH_RECOVERABLE_NODES_V1 = new Set([
   "persist_assistant_message",
   "persist_tool_runs",
@@ -938,6 +1632,7 @@ class RuntimeState {
     mcpProviders: [],
   };
   public readonly agent: AgentRuntime;
+  public readonly taskRuntime: TaskRuntime;
 
   private pendingCloudflare: CloudflareCredentials | null = null;
   private bailianMcpSyncPromise: Promise<void> | null = null;
@@ -987,6 +1682,7 @@ class RuntimeState {
       },
       this.dataDir,
     );
+    this.taskRuntime = new TaskRuntime();
   }
 
   public async initialize(): Promise<void> {
@@ -1007,6 +1703,105 @@ class RuntimeState {
       ? new InMemoryAppRepository()
       : new D1AppRepository(client, bootstrap.cloudflareCredentials.d1DatabaseId);
     await this.releaseExpiredConversationLocks();
+    const workspace = await this.repository.getWorkspace();
+    if (workspace) {
+      await this.migrateLegacyTriggerWebhookSecrets(workspace.id);
+    }
+  }
+
+  private triggerWebhookSecretScope(triggerId: string): string {
+    return `trigger:${triggerId}:webhook-secret`;
+  }
+
+  public async saveTriggerWebhookSecret(args: {
+    workspaceId: string;
+    triggerId: string;
+    secret: string;
+  }): Promise<string> {
+    const scope = this.triggerWebhookSecretScope(args.triggerId);
+    const existingSecret = await this.repository.getSecretByScope(args.workspaceId, scope);
+    await this.repository.saveSecret(
+      encryptSecret({
+        accessToken: this.env.PULSARBOT_ACCESS_TOKEN,
+        workspaceId: args.workspaceId,
+        scope,
+        plainText: args.secret,
+        ...(existingSecret ? { existingId: existingSecret.id } : {}),
+      }),
+    );
+    return scope;
+  }
+
+  public async resolveTriggerWebhookSecret(args: {
+    workspaceId: string;
+    trigger: Trigger;
+  }): Promise<string | null> {
+    if (args.trigger.webhookSecretRef) {
+      const envelope = await this.repository.getSecretByScope(
+        args.workspaceId,
+        args.trigger.webhookSecretRef,
+      );
+      if (envelope) {
+        return decryptSecret({
+          accessToken: this.env.PULSARBOT_ACCESS_TOKEN,
+          workspaceId: args.workspaceId,
+          envelope,
+        });
+      }
+    }
+    return args.trigger.webhookSecret ?? null;
+  }
+
+  private async normalizeImportedTrigger(args: {
+    workspaceId: string;
+    trigger: Trigger;
+  }): Promise<Trigger> {
+    if (args.trigger.kind !== "webhook") {
+      return TriggerSchema.parse({
+        ...args.trigger,
+        webhookSecret: null,
+        webhookSecretRef: null,
+      });
+    }
+
+    const secret = args.trigger.webhookSecret;
+    const webhookSecretRef =
+      args.trigger.webhookSecretRef ??
+      (secret ? this.triggerWebhookSecretScope(args.trigger.id) : null);
+
+    if (secret && webhookSecretRef) {
+      await this.saveTriggerWebhookSecret({
+        workspaceId: args.workspaceId,
+        triggerId: args.trigger.id,
+        secret,
+      });
+    }
+
+    return TriggerSchema.parse({
+      ...args.trigger,
+      webhookSecret: null,
+      webhookSecretRef,
+    });
+  }
+
+  private async migrateLegacyTriggerWebhookSecrets(workspaceId: string): Promise<void> {
+    const triggers = await this.repository.listTriggers();
+    for (const trigger of triggers) {
+      if (trigger.kind !== "webhook" || !trigger.webhookSecret || trigger.webhookSecretRef) {
+        continue;
+      }
+      const webhookSecretRef = await this.saveTriggerWebhookSecret({
+        workspaceId,
+        triggerId: trigger.id,
+        secret: trigger.webhookSecret,
+      });
+      await this.repository.saveTrigger({
+        ...trigger,
+        webhookSecret: null,
+        webhookSecretRef,
+        updatedAt: nowIso(),
+      });
+    }
   }
 
   public async resolveProviderProfile(profileId: string): Promise<ProviderProfile> {
@@ -1877,6 +2672,7 @@ class RuntimeState {
   public async exportBundle(exportPassphrase: string) {
     const workspace = await this.repository.getWorkspace();
     requireWorkspace(workspace);
+    await this.migrateLegacyTriggerWebhookSecrets(workspace.id);
     const memories = await this.readMemoryDocumentsForExport(workspace.id);
     const installs = await this.repository.listInstallRecords();
     const documents = await this.repository.listDocuments();
@@ -1890,6 +2686,16 @@ class RuntimeState {
       mcpProviders: await this.repository.listMcpProviders(),
       mcpServers: await this.repository.listMcpServers(),
       searchSettings: await this.repository.getSearchSettings(),
+      tasks: await this.repository.listTasks(),
+      taskRuns: await this.repository.listTaskRuns(),
+      triggers: (await this.repository.listTriggers()).map((trigger) =>
+        TriggerSchema.parse({
+          ...trigger,
+          webhookSecret: null,
+        })
+      ),
+      approvals: await this.repository.listApprovalRequests(),
+      executors: await this.repository.listExecutorNodes(),
       documents,
       documentArtifacts: await this.readDocumentArtifactsForExport(workspace.id, documents),
       memories,
@@ -1950,6 +2756,24 @@ class RuntimeState {
     }
     for (const server of parsed.mcpServers) {
       await this.repository.saveMcpServer(server);
+    }
+    for (const executor of parsed.executors) {
+      await this.repository.saveExecutorNode(executor);
+    }
+    for (const task of parsed.tasks) {
+      await this.repository.saveTask(task);
+    }
+    for (const trigger of parsed.triggers) {
+      await this.repository.saveTrigger(await this.normalizeImportedTrigger({
+        workspaceId: parsed.workspace.id,
+        trigger,
+      }));
+    }
+    for (const taskRun of parsed.taskRuns) {
+      await this.repository.saveTaskRun(taskRun);
+    }
+    for (const approval of parsed.approvals) {
+      await this.repository.saveApprovalRequest(approval);
     }
     for (const document of parsed.documents) {
       await this.repository.saveDocument(document);
@@ -3292,10 +4116,409 @@ export async function createApp(
     });
   };
 
+  const appendSessionEvent = async (args: {
+    sessionId: string;
+    eventType: TurnEventType;
+    nodeId?: string;
+    payload?: Record<string, unknown>;
+  }) => {
+    const existing = await state.repository.listTurnEvents(args.sessionId, { limit: 500 });
+    const nextSeq = (existing[existing.length - 1]?.seq ?? 0) + 1;
+    await state.repository.appendTurnEvent({
+      id: createId("tevt"),
+      turnId: args.sessionId,
+      seq: nextSeq,
+      nodeId: args.nodeId ?? "task_runtime",
+      eventType: args.eventType,
+      attempt: 1,
+      payload: toLooseJsonRecord(args.payload ?? {}),
+      occurredAt: nowIso(),
+    });
+  };
+
+  const logInternalEvent = (
+    event: string,
+    detail: Record<string, unknown> = {},
+    level: "debug" | "info" | "warn" | "error" = "info",
+  ) => {
+    logger[level](
+      {
+        category: "internal_runtime",
+        event,
+        ...detail,
+      },
+      event,
+    );
+  };
+
+  type NormalizedCompanionLogEntry = {
+    taskRunId: string | null;
+    scope: string;
+    level: "debug" | "info" | "warn" | "error";
+    event: string;
+    message: string;
+    detail: Record<string, unknown>;
+    occurredAt: string;
+  };
+
+  const normalizeCompanionLogEntries = (value: unknown): NormalizedCompanionLogEntry[] => {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value
+      .map((item) => asRecord(item))
+      .filter((item): item is Record<string, unknown> => Boolean(item))
+      .map((item) => {
+        const level: NormalizedCompanionLogEntry["level"] =
+          item.level === "debug" || item.level === "info" || item.level === "warn" || item.level === "error"
+            ? item.level
+            : "info";
+        return {
+          taskRunId: typeof item.taskRunId === "string" && item.taskRunId.trim() ? item.taskRunId : null,
+          scope: typeof item.scope === "string" && item.scope.trim() ? item.scope : "assignment",
+          level,
+          event: typeof item.event === "string" && item.event.trim() ? item.event : "companion_log",
+          message: typeof item.message === "string" && item.message.trim() ? item.message : "Companion log entry",
+          detail: asRecord(item.detail) ?? {},
+          occurredAt: typeof item.occurredAt === "string" && item.occurredAt.trim() ? item.occurredAt : nowIso(),
+        };
+      });
+  };
+
+  const ingestCompanionLogs = async (args: {
+    executorId: string;
+    logs: NormalizedCompanionLogEntry[];
+  }) => {
+    for (const entry of args.logs) {
+      const taskRun = entry.taskRunId ? await state.repository.getTaskRun(entry.taskRunId) : null;
+      const sessionId = taskRun?.sessionId ?? `executor:${args.executorId}`;
+      await appendSessionEvent({
+        sessionId,
+        eventType: "executor_log",
+        nodeId: "companion_runtime",
+        payload: {
+          executorId: args.executorId,
+          taskRunId: entry.taskRunId,
+          scope: entry.scope,
+          level: entry.level,
+          event: entry.event,
+          message: entry.message,
+          detail: entry.detail,
+          sourceOccurredAt: entry.occurredAt,
+        },
+      });
+      logger[entry.level](
+        {
+          category: "companion_runtime",
+          executorId: args.executorId,
+          taskRunId: entry.taskRunId,
+          scope: entry.scope,
+          companionEvent: entry.event,
+          detail: entry.detail,
+          sourceOccurredAt: entry.occurredAt,
+        },
+        entry.message,
+      );
+    }
+  };
+
+  const isTerminalTaskRunStatus = (status: TaskRun["status"]) =>
+    status === "completed" || status === "failed" || status === "aborted";
+
+  const resolveTaskExecutor = async (task: Task, overrideExecutorId?: string | null) => {
+    const executorId = overrideExecutorId ?? task.defaultExecutorId;
+    if (!executorId) {
+      return null;
+    }
+    return state.repository.getExecutorNode(executorId);
+  };
+
+  const touchTaskAfterRun = async (task: Task, taskRun: TaskRun) => {
+    await state.repository.saveTask({
+      ...task,
+      latestRunId: taskRun.id,
+      lastRunAt: taskRun.createdAt,
+      updatedAt: nowIso(),
+    });
+  };
+
+  let sendTaskRunStatusUpdate: (args: {
+    task: Task | null;
+    taskRun: TaskRun;
+    status:
+      | "started"
+      | "waiting_approval"
+      | "waiting_retry"
+      | "running"
+      | "completed"
+      | "failed";
+    approval?: ApprovalRequest | null;
+  }) => Promise<void> = async () => {};
+
+  const createTaskRun = async (args: {
+    task: Task;
+    triggerType: TaskTriggerKind;
+    triggerId?: string | null;
+    inputSnapshot?: Record<string, unknown>;
+    sourceTurnId?: string | null;
+    overrideExecutorId?: string | null;
+  }) => {
+    const executor = await resolveTaskExecutor(args.task, args.overrideExecutorId);
+    const taskRunId = createId("taskrun");
+    const executionPlan = buildTaskExecutionPlan({
+      task: args.task,
+      inputSnapshot: args.inputSnapshot,
+    });
+    const planned = await state.taskRuntime.stageRun({
+      workspaceId: args.task.workspaceId,
+      task: args.task,
+      triggerType: args.triggerType,
+      triggerId: args.triggerId ?? null,
+      executor,
+      inputSnapshot: args.inputSnapshot,
+      executionPlan,
+      sourceTurnId: args.sourceTurnId ?? null,
+      runId: taskRunId,
+      sessionId: taskRunSessionId(taskRunId),
+      approvalExpiresAt: isoAfter(APPROVAL_REQUEST_TTL_MS),
+    });
+
+    const taskRun = {
+      ...planned.taskRun,
+      executorId: args.overrideExecutorId ?? planned.taskRun.executorId,
+    };
+    await state.repository.saveTaskRun(taskRun);
+    if (planned.approval) {
+      await state.repository.saveApprovalRequest(planned.approval);
+    }
+    await touchTaskAfterRun(args.task, taskRun);
+    await appendSessionEvent({
+      sessionId: taskRun.sessionId,
+      eventType: "trigger_fired",
+      payload: {
+        taskId: args.task.id,
+        triggerType: args.triggerType,
+        triggerId: args.triggerId ?? null,
+      },
+    });
+    await appendSessionEvent({
+      sessionId: taskRun.sessionId,
+      eventType: taskRun.status === "waiting_approval"
+        ? "task_run_waiting_approval"
+        : taskRun.status === "waiting_retry"
+          ? "task_run_waiting_retry"
+          : "task_run_queued",
+      payload: {
+        taskId: args.task.id,
+        taskRunId: taskRun.id,
+        triggerType: taskRun.triggerType,
+        triggerId: taskRun.triggerId,
+        executorId: taskRun.executorId,
+        approvalId: planned.approval?.id ?? null,
+      },
+    });
+    if (planned.approval) {
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: "approval_requested",
+        payload: {
+          taskRunId: taskRun.id,
+          approvalId: planned.approval.id,
+          executorId: planned.approval.executorId,
+          requestedCapabilities: planned.approval.requestedCapabilities,
+        },
+      });
+    }
+    await sendTaskRunStatusUpdate({
+      task: args.task,
+      taskRun,
+      status: taskRun.status === "waiting_approval"
+        ? "waiting_approval"
+        : taskRun.status === "waiting_retry"
+          ? "waiting_retry"
+          : "started",
+      approval: planned.approval,
+    });
+    logInternalEvent("task_run_staged", {
+      taskId: args.task.id,
+      taskRunId: taskRun.id,
+      templateKind: taskRun.templateKind,
+      triggerType: taskRun.triggerType,
+      triggerId: taskRun.triggerId,
+      status: taskRun.status,
+      executorId: taskRun.executorId,
+      approvalId: planned.approval?.id ?? null,
+    });
+    return {
+      taskRun,
+      approval: planned.approval,
+    };
+  };
+
+  const resolveApprovalDecision = async (args: {
+    approvalId: string;
+    decision: "approved" | "rejected" | "cancelled";
+    note?: string | null;
+  }) => {
+    const approval = await state.repository.getApprovalRequest(args.approvalId);
+    if (!approval) {
+      throw new Error("Approval request not found");
+    }
+    if (approval.status !== "pending") {
+      throw new Error("Approval request is no longer pending");
+    }
+    if (isIsoExpired(approval.expiresAt)) {
+      await expireApprovalRequest(approval);
+      throw new Error("Approval request has expired");
+    }
+    const updatedApproval = ApprovalRequestSchema.parse({
+      ...approval,
+      status: args.decision,
+      decisionNote: args.note ?? approval.decisionNote,
+      decidedAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    await state.repository.saveApprovalRequest(updatedApproval);
+    const taskRun = await state.repository.getTaskRun(approval.taskRunId);
+    let updatedRun: TaskRun | null = null;
+    if (taskRun) {
+      updatedRun = TaskRunSchema.parse({
+        ...taskRun,
+        status: args.decision === "approved" ? "queued" : "aborted",
+        error: args.decision === "approved" ? null : `Approval ${args.decision}`,
+        updatedAt: nowIso(),
+        finishedAt: args.decision === "approved" ? taskRun.finishedAt : nowIso(),
+      });
+      await state.repository.saveTaskRun(updatedRun);
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: "approval_resolved",
+        payload: {
+          approvalId: updatedApproval.id,
+          taskRunId: taskRun.id,
+          decision: args.decision,
+        },
+      });
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: args.decision === "approved" ? "task_run_queued" : "task_run_failed",
+        payload: {
+          taskRunId: taskRun.id,
+          decision: args.decision,
+          error: updatedRun.error,
+        },
+      });
+      await sendTaskRunStatusUpdate({
+        task: taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null,
+        taskRun: updatedRun,
+        status: args.decision === "approved" ? "started" : "failed",
+        approval: updatedApproval,
+      });
+      logInternalEvent("approval_resolved", {
+        approvalId: updatedApproval.id,
+        taskRunId: taskRun.id,
+        taskId: taskRun.taskId,
+        decision: args.decision,
+        resultingStatus: updatedRun.status,
+      });
+    }
+    return {
+      approval: updatedApproval,
+      taskRun: updatedRun,
+    };
+  };
+
+  const expireApprovalRequest = async (approval: ApprovalRequest) => {
+    if (approval.status !== "pending") {
+      return {
+        approval,
+        taskRun: approval.taskRunId
+          ? await state.repository.getTaskRun(approval.taskRunId)
+          : null,
+      };
+    }
+
+    const timestamp = nowIso();
+    const updatedApproval = ApprovalRequestSchema.parse({
+      ...approval,
+      status: "expired",
+      decisionNote: approval.decisionNote ?? "Approval request expired",
+      decidedAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveApprovalRequest(updatedApproval);
+
+    const taskRun = await state.repository.getTaskRun(approval.taskRunId);
+    let updatedRun: TaskRun | null = null;
+    if (taskRun && taskRun.status === "waiting_approval") {
+      updatedRun = TaskRunSchema.parse({
+        ...taskRun,
+        status: "aborted",
+        error: "Approval expired",
+        updatedAt: timestamp,
+        finishedAt: timestamp,
+      });
+      await state.repository.saveTaskRun(updatedRun);
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: "approval_resolved",
+        payload: {
+          approvalId: updatedApproval.id,
+          taskRunId: taskRun.id,
+          decision: "expired",
+        },
+      });
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: "task_run_failed",
+        payload: {
+          taskRunId: taskRun.id,
+          decision: "expired",
+          error: updatedRun.error,
+        },
+      });
+      await sendTaskRunStatusUpdate({
+        task: taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null,
+        taskRun: updatedRun,
+        status: "failed",
+        approval: updatedApproval,
+      });
+    }
+
+    logInternalEvent("approval_expired", {
+      approvalId: updatedApproval.id,
+      taskRunId: approval.taskRunId,
+      taskId: taskRun?.taskId ?? null,
+    }, "warn");
+
+    return {
+      approval: updatedApproval,
+      taskRun: updatedRun,
+    };
+  };
+
+  const pauseTask = async (taskId: string) => {
+    const task = await state.repository.getTask(taskId);
+    if (!task) {
+      throw new Error("Task not found");
+    }
+    const next = TaskSchema.parse({
+      ...task,
+      status: "paused",
+      updatedAt: nowIso(),
+    });
+    await state.repository.saveTask(next);
+    return next;
+  };
+
   const buildRuntimePreview = async (profile: AgentProfile) => {
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
     const runtime = await state.resolveRuntime(profile);
+    const executors = await state.repository.listExecutorNodes();
+    const defaultExecutor = profile.defaultExecutorId
+      ? executors.find((executor) => executor.id === profile.defaultExecutorId) ?? null
+      : null;
     const providerIds = new Set(
       (await state.repository.listProviderProfiles()).map((provider) => provider.id),
     );
@@ -3323,6 +4546,13 @@ export async function createApp(
         id: entry.id,
         reason: `Provider reference is missing for ${entry.label}`,
       }));
+    const executorBlocked = profile.defaultExecutorId && !defaultExecutor
+      ? [{
+          scope: "profile" as const,
+          id: profile.defaultExecutorId,
+          reason: "Default executor reference is missing for workflow defaults",
+        }]
+      : [];
     const tools = await state.agent.previewTools({
       profile,
       context: {
@@ -3337,8 +4567,32 @@ export async function createApp(
     });
     return {
       ...runtime,
-      blocked: [...runtime.blocked, ...providerBlocked],
+      blocked: [...runtime.blocked, ...providerBlocked, ...executorBlocked],
       tools,
+      workflowSupport: workflowTemplates.map((template) => ({
+        id: template.id,
+        title: template.title,
+        executionMode: template.executionMode,
+        requiresExecutor: template.requiresExecutor,
+        ready: template.requiresExecutor
+          ? Boolean(defaultExecutor && defaultExecutor.status === "online")
+          : true,
+        blockers: template.requiresExecutor
+          ? defaultExecutor
+            ? defaultExecutor.status === "online"
+              ? []
+              : ["Default executor is offline"]
+            : ["Default executor is missing"]
+          : [],
+      })),
+      workflowDefaults: {
+        defaultExecutorId: profile.defaultExecutorId,
+        approvalPolicy: profile.approvalPolicy,
+        defaultMemoryPolicy: profile.defaultMemoryPolicy,
+        defaultWorkflowBudget: profile.defaultWorkflowBudget,
+        defaultExecutor,
+      },
+      workflowTemplates,
       generatedAt: nowIso(),
     };
   };
@@ -3453,6 +4707,10 @@ export async function createApp(
         lastEventSeq: 0,
         currentNode: args.currentNode ?? "acquire_turn_lock",
         resumeEligible: args.resumeEligible ?? true,
+        taskRunId: null,
+        triggerType: null,
+        executorId: null,
+        approvalState: "none",
         startedAt: timestamp,
         finishedAt: null,
         lockExpiresAt,
@@ -4290,6 +5548,303 @@ export async function createApp(
     return 600_000;
   };
 
+  const expirePendingApprovals = async (limit = 20) => {
+    const pendingApprovals = await state.repository.listApprovalRequests({
+      status: "pending",
+      limit: 200,
+    });
+    const expiredApprovals = pendingApprovals
+      .filter((approval) => isIsoExpired(approval.expiresAt))
+      .slice(0, limit);
+
+    for (const approval of expiredApprovals) {
+      await expireApprovalRequest(approval);
+    }
+
+    return expiredApprovals.length;
+  };
+
+  const processScheduledTriggers = async (limit = 10) => {
+    const workspace = await state.repository.getWorkspace();
+    if (!workspace) {
+      return 0;
+    }
+    const dueTriggers = (await state.repository.listTriggers({
+      kind: "schedule",
+      enabled: true,
+    }))
+      .filter((trigger) =>
+        trigger.workspaceId === workspace.id &&
+        trigger.taskId &&
+        trigger.nextRunAt &&
+        Date.parse(trigger.nextRunAt) <= Date.now()
+      )
+      .slice(0, limit);
+
+    for (const trigger of dueTriggers) {
+      const task = await state.repository.getTask(trigger.taskId!);
+      if (!task || task.status !== "active") {
+        logInternalEvent("schedule_trigger_skipped", {
+          triggerId: trigger.id,
+          taskId: trigger.taskId,
+          reason: !task ? "task_missing" : "task_inactive",
+          taskStatus: task?.status ?? null,
+        }, "warn");
+        await state.repository.saveTrigger({
+          ...trigger,
+          nextRunAt: nextScheduledRunAt(trigger.config, Date.now()),
+          updatedAt: nowIso(),
+        });
+        continue;
+      }
+      const created = await createTaskRun({
+        task,
+        triggerType: "schedule",
+        triggerId: trigger.id,
+        inputSnapshot: {
+          schedule: trigger.config,
+          firedAt: nowIso(),
+        },
+      });
+      await state.repository.saveTrigger({
+        ...trigger,
+        lastTriggeredAt: nowIso(),
+        lastRunId: created.taskRun.id,
+        nextRunAt: nextScheduledRunAt(trigger.config, Date.now()),
+        updatedAt: nowIso(),
+      });
+      logInternalEvent("schedule_trigger_fired", {
+        triggerId: trigger.id,
+        taskId: task.id,
+        taskRunId: created.taskRun.id,
+      });
+    }
+
+    return dueTriggers.length;
+  };
+
+  const runInternalTaskExecution = async (args: {
+    task: Task;
+    taskRun: TaskRun;
+  }): Promise<{
+    outputSummary: string;
+    artifacts: Array<Record<string, unknown>>;
+    relatedMemoryDocumentIds: string[];
+  }> => {
+    const action = String(args.taskRun.executionPlan.action ?? "");
+    if (action !== "document_digest_summary") {
+      throw new Error(`Unsupported internal workflow action: ${action}`);
+    }
+
+    const documentId = String(args.taskRun.executionPlan.documentId ?? "");
+    if (!documentId) {
+      throw new Error("Internal document workflow is missing documentId");
+    }
+
+    const { document, text } = await loadTaskDocumentText({
+      state,
+      documentId,
+    });
+    logInternalEvent("internal_document_workflow_started", {
+      taskId: args.task.id,
+      taskRunId: args.taskRun.id,
+      documentId: document.id,
+      extractionMethod: document.extractionMethod,
+    });
+    const summary = summarizeTextLocally(
+      text,
+      Number(args.taskRun.executionPlan.maxParagraphs ?? 3),
+    );
+    if (!summary.trim()) {
+      throw new Error("Internal document workflow generated an empty summary");
+    }
+
+    const relatedMemoryDocumentIds: string[] = [];
+    if (
+      args.task.memoryPolicy === "task_context_writeback" &&
+      Boolean(args.taskRun.executionPlan.writebackSummary)
+    ) {
+      try {
+        const memory = await state.createMemoryStore(args.task.workspaceId);
+        const relativePath = await memory.writeSummarySnapshot(
+          `task:${args.task.id}`,
+          `# ${args.task.title}\n\n${summary}`,
+        );
+        const memoryDocument = (await state.repository.listMemoryDocuments()).find((item) =>
+          item.workspaceId === args.task.workspaceId && item.path === relativePath
+        );
+        if (memoryDocument) {
+          relatedMemoryDocumentIds.push(memoryDocument.id);
+        }
+      } catch (error) {
+        logger.warn(
+          { error, taskId: args.task.id },
+          "Failed to write internal task summary back to memory",
+        );
+      }
+    }
+
+    return {
+      outputSummary: summary.slice(0, 800),
+      relatedMemoryDocumentIds,
+      artifacts: [
+        {
+          id: `${args.taskRun.id}:document:summary`,
+          label: "Document Summary",
+          kind: "text",
+          content: summary,
+        },
+        {
+          id: `${args.taskRun.id}:document:source`,
+          label: "Source Document",
+          kind: "json",
+          content: {
+            documentId: document.id,
+            title: document.title,
+            extractionMethod: document.extractionMethod,
+          },
+        },
+      ],
+    };
+  };
+
+  const processInternalTaskRuns = async (limit = 5) => {
+    const queuedRuns = (await state.repository.listTaskRuns({ status: "queued", limit: 100 }))
+      .filter((taskRun) => String(taskRun.executionPlan.capability ?? "") === "internal")
+      .slice(0, limit);
+
+    for (const taskRun of queuedRuns) {
+      const task = taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null;
+      if (!task) {
+        await state.repository.saveTaskRun({
+          ...taskRun,
+          status: "failed",
+          error: "Task for internal workflow run was not found",
+          finishedAt: nowIso(),
+          updatedAt: nowIso(),
+        });
+        continue;
+      }
+
+      const startedRun = TaskRunSchema.parse({
+        ...taskRun,
+        status: "running",
+        startedAt: taskRun.startedAt ?? nowIso(),
+        updatedAt: nowIso(),
+      });
+      await state.repository.saveTaskRun(startedRun);
+      await appendSessionEvent({
+        sessionId: startedRun.sessionId,
+        eventType: "task_run_started",
+        payload: {
+          taskRunId: startedRun.id,
+          mode: "internal",
+        },
+      });
+      await sendTaskRunStatusUpdate({
+        task,
+        taskRun: startedRun,
+        status: "running",
+      });
+      logInternalEvent("internal_task_run_started", {
+        taskId: task.id,
+        taskRunId: startedRun.id,
+        templateKind: startedRun.templateKind,
+      });
+
+      try {
+        const result = await runInternalTaskExecution({
+          task,
+          taskRun: startedRun,
+        });
+        const completedRun = TaskRunSchema.parse({
+          ...startedRun,
+          status: "completed",
+          outputSummary: result.outputSummary,
+          artifacts: result.artifacts.map((artifact) => ({
+            id: String(artifact.id),
+            label: String(artifact.label),
+            kind: artifact.kind as "text" | "json" | "url" | "screenshot" | "file",
+            content: artifact.content ?? null,
+            createdAt: nowIso(),
+          })),
+          relatedMemoryDocumentIds: result.relatedMemoryDocumentIds,
+          finishedAt: nowIso(),
+          updatedAt: nowIso(),
+        });
+        await state.repository.saveTaskRun(completedRun);
+        await appendSessionEvent({
+          sessionId: completedRun.sessionId,
+          eventType: "task_run_completed",
+          payload: {
+            taskRunId: completedRun.id,
+            mode: "internal",
+            relatedMemoryDocumentIds: result.relatedMemoryDocumentIds,
+          },
+        });
+        await sendTaskRunStatusUpdate({
+          task,
+          taskRun: completedRun,
+          status: "completed",
+        });
+        await audit(
+          "server:internal-runner",
+          "complete_internal_task_run",
+          "task_run",
+          completedRun.id,
+          {
+            taskId: task.id,
+          },
+        );
+        logInternalEvent("internal_task_run_completed", {
+          taskId: task.id,
+          taskRunId: completedRun.id,
+          relatedMemoryDocumentIds: result.relatedMemoryDocumentIds,
+        });
+      } catch (error) {
+        const failedRun = TaskRunSchema.parse({
+          ...startedRun,
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+          finishedAt: nowIso(),
+          updatedAt: nowIso(),
+        });
+        await state.repository.saveTaskRun(failedRun);
+        await appendSessionEvent({
+          sessionId: failedRun.sessionId,
+          eventType: "task_run_failed",
+          payload: {
+            taskRunId: failedRun.id,
+            mode: "internal",
+            error: failedRun.error,
+          },
+        });
+        await sendTaskRunStatusUpdate({
+          task,
+          taskRun: failedRun,
+          status: "failed",
+        });
+        await audit(
+          "server:internal-runner",
+          "fail_internal_task_run",
+          "task_run",
+          failedRun.id,
+          {
+            taskId: task.id,
+            error: failedRun.error,
+          },
+        );
+        logInternalEvent("internal_task_run_failed", {
+          taskId: task.id,
+          taskRunId: failedRun.id,
+          error: failedRun.error,
+        }, "error");
+      }
+    }
+
+    return queuedRuns.length;
+  };
+
   const processBackgroundJobs = async (limit = 10) => {
     const workspace = await state.repository.getWorkspace();
     if (!workspace) {
@@ -4445,6 +6000,43 @@ export async function createApp(
     });
   };
 
+  const assertOwnerCommandAccess = async (userId: number) => {
+    const workspace = await state.repository.getWorkspace();
+    requireWorkspace(workspace);
+    if (
+      workspace.ownerTelegramUserId &&
+      workspace.ownerTelegramUserId !== String(userId)
+    ) {
+      throw new Error("This command is only available to the owner.");
+    }
+    return workspace;
+  };
+
+  const resolveTelegramShortcutTarget = async (command: string) => {
+    const triggers = await state.repository.listTriggers({
+      kind: "telegram_shortcut",
+      enabled: true,
+    });
+    const matched = triggers
+      .slice()
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .find((trigger) => {
+        const config = asRecord(trigger.config) ?? {};
+        return normalizeTelegramShortcutCommand(config.command) === command;
+      });
+    if (!matched?.taskId) {
+      return null;
+    }
+    const task = await state.repository.getTask(matched.taskId);
+    if (!task || task.status !== "active") {
+      return null;
+    }
+    return {
+      trigger: matched,
+      task,
+    };
+  };
+
   const telegram = (options.telegramFactory ?? createTelegramBot)({
     token: state.env.TELEGRAM_BOT_TOKEN,
     resolveForumTopicName: async ({ chatId, threadId, requestText, replyText }) =>
@@ -4456,6 +6048,117 @@ export async function createApp(
             requestText,
             replyText,
           }),
+    commandHandlers: {
+      onTasks: async (context) => {
+        await assertOwnerCommandAccess(context.userId);
+        const tasks = (await state.repository.listTasks())
+          .filter((task) => task.status === "active" || task.status === "paused")
+          .slice(0, 5);
+        if (tasks.length === 0) {
+          return "No active tasks yet. Create one from the Mini App Tasks panel.";
+        }
+        return [
+          "Tasks:",
+          ...tasks.map((task) =>
+            `- ${task.title} (${task.status}) · ${task.templateKind}${task.latestRunId ? ` · last run ${task.latestRunId}` : ""}`
+          ),
+        ].join("\n");
+      },
+      onApprove: async (context) => {
+        await assertOwnerCommandAccess(context.userId);
+        const approvalId = context.args[0];
+        if (!approvalId) {
+          return "Usage: /approve <approvalId>";
+        }
+        const result = await resolveApprovalDecision({
+          approvalId,
+          decision: "approved",
+        });
+        await audit(String(context.userId), "telegram_approve", "approval", approvalId);
+        return `Approved ${approvalId}. Task run ${result.taskRun?.id ?? result.approval.taskRunId} is queued.`;
+      },
+      onPause: async (context) => {
+        await assertOwnerCommandAccess(context.userId);
+        const taskId = context.args[0];
+        if (!taskId) {
+          return "Usage: /pause <taskId>";
+        }
+        const task = await pauseTask(taskId);
+        await audit(String(context.userId), "telegram_pause_task", "task", task.id);
+        return `Paused task ${task.title} (${task.id}).`;
+      },
+      onDigest: async (context) => {
+        await assertOwnerCommandAccess(context.userId);
+        const shortcut = await resolveTelegramShortcutTarget("/digest");
+        const tasks = shortcut ? [] : await state.repository.listTasks();
+        const target = shortcut?.task ?? tasks.find((task) =>
+          task.status === "active" && task.templateKind === "web_watch_report"
+        ) ?? tasks.find((task) => task.status === "active");
+        if (!target) {
+          return "No active task is ready for /digest. Create and activate a task first.";
+        }
+        const created = await createTaskRun({
+          task: target,
+          triggerType: "telegram_shortcut",
+          triggerId: shortcut?.trigger.id ?? null,
+          inputSnapshot: {
+            command: "/digest",
+            chatId: context.chatId,
+            threadId: context.threadId,
+          },
+        });
+        await audit(String(context.userId), "telegram_digest", "task_run", created.taskRun.id, {
+          taskId: target.id,
+        });
+        logInternalEvent("telegram_digest_invoked", {
+          taskId: target.id,
+          taskRunId: created.taskRun.id,
+          triggerId: shortcut?.trigger.id ?? null,
+          chatId: context.chatId,
+          threadId: context.threadId,
+        });
+        return `Started ${target.title}. Run ${created.taskRun.id} is ${created.taskRun.status}.`;
+      },
+    },
+    onCallbackQuery: async (context) => {
+      await assertOwnerCommandAccess(context.userId);
+      if (context.data.startsWith("taskapprove:")) {
+        const approvalId = context.data.slice("taskapprove:".length);
+        const result = await resolveApprovalDecision({
+          approvalId,
+          decision: "approved",
+        });
+        await audit(String(context.userId), "telegram_callback_approve", "approval", approvalId);
+        return {
+          answerText: "Approved",
+          replyText:
+            `Approved ${approvalId}. Task run ${result.taskRun?.id ?? result.approval.taskRunId} is queued.`,
+        };
+      }
+      if (context.data.startsWith("taskreject:")) {
+        const approvalId = context.data.slice("taskreject:".length);
+        const result = await resolveApprovalDecision({
+          approvalId,
+          decision: "rejected",
+        });
+        await audit(String(context.userId), "telegram_callback_reject", "approval", approvalId);
+        return {
+          answerText: "Rejected",
+          replyText:
+            `Rejected ${approvalId}. Task run ${result.taskRun?.id ?? result.approval.taskRunId} was aborted.`,
+        };
+      }
+      if (context.data.startsWith("taskpause:")) {
+        const taskId = context.data.slice("taskpause:".length);
+        const task = await pauseTask(taskId);
+        await audit(String(context.userId), "telegram_callback_pause", "task", taskId);
+        return {
+          answerText: "Paused",
+          replyText: `Paused task ${task.title} (${task.id}).`,
+        };
+      }
+      return null;
+    },
     onMessage: async (rawPayload, stream) => {
       const streamController = stream ?? {
         enabled: false,
@@ -5698,6 +7401,104 @@ export async function createApp(
     }
   };
 
+  const resolveTaskRunTelegramTarget = async (args: {
+    task: Task | null;
+    taskRun: TaskRun;
+  }): Promise<{ chatId: number; threadId: number | null } | null> => {
+    const input = asRecord(args.taskRun.inputSnapshot) ?? {};
+    const taskConfig = asRecord(args.task?.config) ?? {};
+    const targetRecord = asRecord(taskConfig.telegramTarget) ?? {};
+    const workspace = await state.repository.getWorkspace();
+    const rawChatId =
+      input.chatId ??
+      targetRecord.chatId ??
+      workspace?.ownerTelegramUserId ??
+      null;
+    const rawThreadId =
+      input.threadId ??
+      targetRecord.threadId ??
+      args.task?.relatedThreadIds[0] ??
+      null;
+    const chatId = typeof rawChatId === "number"
+      ? rawChatId
+      : typeof rawChatId === "string" && rawChatId.trim()
+        ? Number(rawChatId)
+        : null;
+    const threadId = typeof rawThreadId === "number"
+      ? rawThreadId
+      : typeof rawThreadId === "string" && rawThreadId.trim()
+        ? Number(rawThreadId)
+        : null;
+    if (!Number.isFinite(chatId)) {
+      return null;
+    }
+    return {
+      chatId: Number(chatId),
+      threadId: Number.isFinite(threadId) ? Number(threadId) : null,
+    };
+  };
+
+  sendTaskRunStatusUpdate = async (args) => {
+    const target = await resolveTaskRunTelegramTarget(args);
+    const api = (telegram as { bot?: { api?: { sendMessage?: (...params: any[]) => Promise<unknown> } } }).bot?.api;
+    if (!target || !api?.sendMessage) {
+      return;
+    }
+    const statusLabel = {
+      started: "Started",
+      waiting_approval: "Waiting Approval",
+      waiting_retry: "Waiting Retry",
+      running: "Running",
+      completed: "Completed",
+      failed: "Failed",
+    }[args.status];
+    const lines = [
+      `Task: ${args.task?.title ?? args.taskRun.taskId ?? args.taskRun.id}`,
+      `Status: ${statusLabel}`,
+      `Run: ${args.taskRun.id}`,
+      `Trigger: ${args.taskRun.triggerType}`,
+    ];
+    if (args.status === "waiting_approval" && args.approval) {
+      lines.push(`Approval: ${args.approval.id}`);
+    }
+    if (args.status === "waiting_retry" && args.taskRun.error) {
+      lines.push(`Error: ${args.taskRun.error}`);
+    }
+    if (args.status === "completed" && args.taskRun.outputSummary) {
+      lines.push(`Summary: ${args.taskRun.outputSummary}`);
+    }
+    if (args.status === "failed" && args.taskRun.error) {
+      lines.push(`Error: ${args.taskRun.error}`);
+    }
+
+    const replyMarkup = args.status === "waiting_approval" && args.approval
+      ? {
+          inline_keyboard: [[
+            { text: "Approve", callback_data: `taskapprove:${args.approval.id}` },
+            { text: "Reject", callback_data: `taskreject:${args.approval.id}` },
+          ]],
+        }
+      : args.task
+        ? {
+            inline_keyboard: [[
+              { text: "Pause Task", callback_data: `taskpause:${args.task.id}` },
+            ]],
+          }
+        : undefined;
+
+    try {
+      await api.sendMessage(target.chatId, lines.join("\n"), {
+        ...(target.threadId !== null ? { message_thread_id: target.threadId } : {}),
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
+    } catch (error) {
+      logger.warn(
+        { error, taskRunId: args.taskRun.id, chatId: target.chatId },
+        "Failed to send task run Telegram status update",
+      );
+    }
+  };
+
   app.decorate("__pulsarbot", {
     state,
     telegram,
@@ -5774,6 +7575,15 @@ export async function createApp(
   const backgroundWorker = setInterval(() => {
     void processBackgroundJobs(10).catch((error) => {
       logger.error({ error }, "Background job tick failed");
+    });
+    void expirePendingApprovals(20).catch((error) => {
+      logger.error({ error }, "Approval expiration tick failed");
+    });
+    void processInternalTaskRuns(5).catch((error) => {
+      logger.error({ error }, "Internal task runner tick failed");
+    });
+    void processScheduledTriggers(10).catch((error) => {
+      logger.error({ error }, "Scheduled trigger tick failed");
     });
   }, options.backgroundPollMs ?? 5_000);
   const turnEventPruner = setInterval(() => {
@@ -6504,6 +8314,15 @@ export async function createApp(
         body.allowNetworkTools ?? existing?.allowNetworkTools ?? true,
       allowWriteTools: body.allowWriteTools ?? existing?.allowWriteTools ?? true,
       allowMcpTools: body.allowMcpTools ?? existing?.allowMcpTools ?? true,
+      defaultExecutorId:
+        body.defaultExecutorId ?? existing?.defaultExecutorId ?? null,
+      approvalPolicy:
+        body.approvalPolicy ?? existing?.approvalPolicy ?? "auto_approve_safe",
+      defaultMemoryPolicy:
+        body.defaultMemoryPolicy ?? existing?.defaultMemoryPolicy ?? "chat_only",
+      defaultWorkflowBudget: WorkflowBudgetSchema.parse(
+        body.defaultWorkflowBudget ?? existing?.defaultWorkflowBudget ?? {},
+      ),
       createdAt: existing?.createdAt ?? timestamp,
       updatedAt: timestamp,
     });
@@ -6584,6 +8403,840 @@ export async function createApp(
       return buildRuntimePreview(profile);
     },
   );
+
+  app.get("/api/workflow/templates", { preHandler: requireOwner }, async () =>
+    workflowTemplates.map((template) => ({
+      id: template.id,
+      title: template.title,
+      description: template.description,
+      requiresExecutor: template.requiresExecutor,
+      executionMode: template.executionMode,
+      defaultConfig: template.defaultConfig,
+      fields: template.fields,
+      defaultApprovalCheckpoints: template.defaultApprovalCheckpoints,
+    })),
+  );
+
+  app.post("/api/workflow/preview", { preHandler: requireOwner }, async (request) => {
+    const body = (request.body ?? {}) as {
+      taskId?: string;
+      templateKind?: WorkflowTemplateKind;
+      title?: string;
+      goal?: string;
+      config?: Record<string, unknown>;
+      defaultExecutorId?: string;
+      approvalPolicy?: ApprovalPolicy;
+      approvalCheckpoints?: string[];
+      memoryPolicy?: MemoryPolicy;
+      relatedDocumentIds?: string[];
+      inputSnapshot?: Record<string, unknown>;
+    };
+    if (body.taskId) {
+      const task = await state.repository.getTask(body.taskId);
+      if (!task) {
+        throw app.httpErrors.notFound("Task not found");
+      }
+      return buildWorkflowCapabilityPreview({
+        state,
+        taskDraft: {
+          id: task.id,
+          title: task.title,
+          goal: task.goal,
+          templateKind: task.templateKind,
+          config: asRecord(task.config) ?? {},
+          defaultExecutorId: task.defaultExecutorId,
+          approvalPolicy: task.approvalPolicy,
+          approvalCheckpoints: task.approvalCheckpoints,
+          memoryPolicy: task.memoryPolicy,
+          relatedDocumentIds: task.relatedDocumentIds,
+        },
+      });
+    }
+    if (!body.templateKind) {
+      throw app.httpErrors.badRequest("taskId or templateKind is required");
+    }
+    return buildWorkflowCapabilityPreview({
+      state,
+      taskDraft: {
+        title: body.title ?? null,
+        goal: body.goal ?? null,
+        templateKind: body.templateKind,
+        config: asRecord(body.config) ?? {},
+        defaultExecutorId: body.defaultExecutorId ?? null,
+        approvalPolicy: body.approvalPolicy ?? null,
+        approvalCheckpoints: body.approvalCheckpoints ?? null,
+        memoryPolicy: body.memoryPolicy ?? null,
+        relatedDocumentIds: body.relatedDocumentIds ?? null,
+      },
+      ...(asRecord(body.inputSnapshot)
+        ? {
+            inputSnapshot: asRecord(body.inputSnapshot) ?? {},
+          }
+        : {}),
+    });
+  });
+
+  app.get("/api/tasks", { preHandler: requireOwner }, async () => {
+    const tasks = await state.repository.listTasks();
+    return tasks.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  });
+
+  app.post("/api/tasks", { preHandler: requireOwner }, async (request) => {
+    const workspace = await state.repository.getWorkspace();
+    requireWorkspace(workspace);
+    const body = (request.body ?? {}) as Partial<Task>;
+    const existing = body.id ? await state.repository.getTask(body.id) : null;
+    if (body.agentProfileId) {
+      const profiles = await state.repository.listAgentProfiles();
+      if (!profiles.some((profile) => profile.id === body.agentProfileId)) {
+        throw app.httpErrors.badRequest("Agent profile not found for task");
+      }
+    }
+    if (body.defaultExecutorId) {
+      const executor = await state.repository.getExecutorNode(body.defaultExecutorId);
+      if (!executor) {
+        throw app.httpErrors.badRequest("Default executor not found for task");
+      }
+    }
+    const timestamp = nowIso();
+    const templateKind = body.templateKind ?? existing?.templateKind ?? "web_watch_report";
+    const next = TaskSchema.parse({
+      id: body.id ?? existing?.id ?? createId("task"),
+      workspaceId: workspace.id,
+      title: body.title ?? existing?.title ?? "Untitled Task",
+      goal: body.goal ?? existing?.goal ?? "",
+      description: body.description ?? existing?.description ?? "",
+      config: normalizeWorkflowTemplateConfig({
+        templateKind,
+        config: body.config ?? existing?.config ?? {},
+      }),
+      templateKind,
+      status: body.status ?? existing?.status ?? "draft",
+      agentProfileId: body.agentProfileId ?? existing?.agentProfileId ?? null,
+      defaultExecutorId: body.defaultExecutorId ?? existing?.defaultExecutorId ?? null,
+      approvalPolicy: body.approvalPolicy ?? existing?.approvalPolicy ?? "auto_approve_safe",
+      approvalCheckpoints:
+        Array.isArray((body as { approvalCheckpoints?: unknown[] }).approvalCheckpoints)
+          ? (body as { approvalCheckpoints: unknown[] }).approvalCheckpoints.map((item) => String(item))
+          : existing?.approvalCheckpoints ?? defaultApprovalCheckpointsForTemplate(templateKind),
+      memoryPolicy: body.memoryPolicy ?? existing?.memoryPolicy ?? "chat_only",
+      defaultRunBudget: WorkflowBudgetSchema.parse(
+        body.defaultRunBudget ?? existing?.defaultRunBudget ?? {},
+      ),
+      triggerIds: body.triggerIds ?? existing?.triggerIds ?? [],
+      relatedDocumentIds: body.relatedDocumentIds ?? existing?.relatedDocumentIds ?? [],
+      relatedThreadIds: body.relatedThreadIds ?? existing?.relatedThreadIds ?? [],
+      latestRunId: existing?.latestRunId ?? null,
+      lastRunAt: existing?.lastRunAt ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveTask(next);
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      existing ? "update_task" : "create_task",
+      "task",
+      next.id,
+      {
+        templateKind: next.templateKind,
+        status: next.status,
+      },
+    );
+    return next;
+  });
+
+  app.get(
+    "/api/task-runs",
+    { preHandler: requireOwner },
+    async (request) => {
+      const query = request.query as {
+        taskId?: string;
+        status?: TaskRun["status"];
+        executorId?: string;
+        limit?: string | number;
+      };
+      const limit = query.limit === undefined ? undefined : Number(query.limit);
+      return state.repository.listTaskRuns({
+        ...(query.taskId ? { taskId: query.taskId } : {}),
+        ...(query.status ? { status: query.status } : {}),
+        ...(query.executorId ? { executorId: query.executorId } : {}),
+        ...(Number.isFinite(limit) ? { limit: Number(limit) } : {}),
+      });
+    },
+  );
+
+  app.post("/api/task-runs", { preHandler: requireOwner }, async (request) => {
+    const body = (request.body ?? {}) as {
+      taskId?: string;
+      triggerType?: TaskTriggerKind;
+      triggerId?: string;
+      inputSnapshot?: Record<string, unknown>;
+      sourceTurnId?: string;
+      executorId?: string;
+    };
+    const overrideExecutorId =
+      typeof body.executorId === "string" && body.executorId.trim()
+        ? body.executorId
+        : null;
+    if (!body.taskId) {
+      throw app.httpErrors.badRequest("taskId is required");
+    }
+    const task = await state.repository.getTask(body.taskId);
+    if (!task) {
+      throw app.httpErrors.notFound("Task not found");
+    }
+    if (overrideExecutorId) {
+      const executor = await state.repository.getExecutorNode(overrideExecutorId);
+      if (!executor) {
+        throw app.httpErrors.badRequest("Executor not found");
+      }
+    }
+    if (task.status === "archived" || task.status === "paused") {
+      throw app.httpErrors.conflict("Task is not active");
+    }
+    const { taskRun, approval } = await createTaskRun({
+      task,
+      triggerType: TaskTriggerKindSchema.parse(body.triggerType ?? "manual"),
+      triggerId: body.triggerId ?? null,
+      inputSnapshot: asRecord(body.inputSnapshot ?? {}) ?? {},
+      sourceTurnId: typeof body.sourceTurnId === "string" ? body.sourceTurnId : null,
+      overrideExecutorId,
+    });
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      "create_task_run",
+      "task_run",
+      taskRun.id,
+      {
+        taskId: task.id,
+        status: taskRun.status,
+        executorId: taskRun.executorId,
+      },
+    );
+    return {
+      taskRun,
+      approval,
+    };
+  });
+
+  app.get("/api/triggers", { preHandler: requireOwner }, async (request) => {
+    const query = request.query as {
+      taskId?: string;
+      kind?: Trigger["kind"];
+      enabled?: string;
+    };
+    return state.repository.listTriggers({
+      ...(query.taskId ? { taskId: query.taskId } : {}),
+      ...(query.kind ? { kind: query.kind } : {}),
+      ...(query.enabled === undefined
+        ? {}
+        : { enabled: query.enabled === "true" || query.enabled === "1" }),
+    });
+  });
+
+  app.post("/api/triggers", { preHandler: requireOwner }, async (request) => {
+    const workspace = await state.repository.getWorkspace();
+    requireWorkspace(workspace);
+    const body = (request.body ?? {}) as Partial<Trigger>;
+    const existing = body.id ? await state.repository.getTrigger(body.id) : null;
+    const triggerId = body.id ?? existing?.id ?? createId("trigger");
+    if (body.taskId) {
+      const task = await state.repository.getTask(body.taskId);
+      if (!task) {
+        throw app.httpErrors.badRequest("Task not found for trigger");
+      }
+    }
+    const kind = TaskTriggerKindSchema.parse(body.kind ?? existing?.kind ?? "manual");
+    const taskId = body.taskId ?? existing?.taskId ?? null;
+    if (kind !== "manual" && !taskId) {
+      throw app.httpErrors.badRequest("taskId is required for non-manual triggers");
+    }
+    const config = asRecord(body.config ?? existing?.config ?? {}) ?? {};
+    if (kind === "schedule" && !scheduleIntervalMinutes(config)) {
+      throw app.httpErrors.badRequest("Schedule triggers require a positive intervalMinutes value");
+    }
+    if (kind === "telegram_shortcut") {
+      const command = normalizeTelegramShortcutCommand(config.command);
+      if (!command) {
+        throw app.httpErrors.badRequest("Only /digest is currently supported for telegram shortcut triggers");
+      }
+      config.command = command;
+    }
+    const rawWebhookSecret = typeof body.webhookSecret === "string"
+      ? body.webhookSecret.trim()
+      : "";
+    const persistedWebhookSecret = kind === "webhook"
+      ? rawWebhookSecret ||
+        await state.resolveTriggerWebhookSecret({
+          workspaceId: workspace.id,
+          trigger: existing ?? TriggerSchema.parse({
+            id: triggerId,
+            workspaceId: workspace.id,
+            label: body.label ?? "Trigger",
+            kind,
+          }),
+        }) ||
+        createId("hooksecret")
+      : null;
+    const webhookSecretRef = kind === "webhook" && persistedWebhookSecret
+      ? await state.saveTriggerWebhookSecret({
+          workspaceId: workspace.id,
+          triggerId,
+          secret: persistedWebhookSecret,
+        })
+      : null;
+    const normalizedWebhookPath = kind === "webhook"
+      ? normalizeWebhookPath(
+            String(body.webhookPath ?? existing?.webhookPath ?? body.label ?? "trigger"),
+        )
+      : null;
+    const nextEnabled = body.enabled ?? existing?.enabled ?? true;
+    if (kind === "webhook" && normalizedWebhookPath && nextEnabled) {
+      const conflictingTrigger = (await state.repository.listTriggers({
+        kind: "webhook",
+        enabled: true,
+      })).find((trigger) =>
+        trigger.id !== existing?.id && trigger.webhookPath === normalizedWebhookPath
+      );
+      if (conflictingTrigger) {
+        throw app.httpErrors.conflict("Webhook path is already used by another enabled trigger");
+      }
+    }
+    const timestamp = nowIso();
+    const next = TriggerSchema.parse({
+      id: triggerId,
+      workspaceId: workspace.id,
+      taskId,
+      label: body.label ?? existing?.label ?? "Trigger",
+      kind,
+      enabled: body.enabled ?? existing?.enabled ?? true,
+      config,
+      webhookPath: normalizedWebhookPath,
+      webhookSecret: null,
+      webhookSecretRef,
+      nextRunAt: kind === "schedule"
+        ? String(body.nextRunAt ?? existing?.nextRunAt ?? nextScheduledRunAt(config) ?? nowIso())
+        : null,
+      lastTriggeredAt: existing?.lastTriggeredAt ?? null,
+      lastRunId: existing?.lastRunId ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveTrigger(next);
+    if (next.taskId) {
+      const task = await state.repository.getTask(next.taskId);
+      if (task) {
+        await state.repository.saveTask({
+          ...task,
+          triggerIds: [...new Set([...task.triggerIds, next.id])],
+          updatedAt: nowIso(),
+        });
+      }
+    }
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      existing ? "update_trigger" : "create_trigger",
+      "trigger",
+      next.id,
+      {
+        taskId: next.taskId,
+        kind: next.kind,
+        enabled: next.enabled,
+      },
+    );
+    return next;
+  });
+
+  app.post("/api/triggers/webhook/:path", async (request, reply) => {
+    const normalizedPath = normalizeWebhookPath((request.params as { path: string }).path);
+    const trigger = (await state.repository.listTriggers({
+      kind: "webhook",
+      enabled: true,
+    })).find((item) => item.webhookPath === normalizedPath);
+    if (!trigger || !trigger.taskId) {
+      return reply.code(404).send({ error: "Webhook trigger not found" });
+    }
+    const webhookSecret = await state.resolveTriggerWebhookSecret({
+      workspaceId: trigger.workspaceId,
+      trigger,
+    });
+    if (
+      webhookSecret &&
+      request.headers["x-pulsarbot-webhook-secret"] !== webhookSecret
+    ) {
+      return reply.code(401).send({ error: "Webhook secret is invalid" });
+    }
+    const task = await state.repository.getTask(trigger.taskId);
+    if (!task || task.status !== "active") {
+      return reply.code(409).send({ error: "Trigger task is unavailable" });
+    }
+    const created = await createTaskRun({
+      task,
+      triggerType: "webhook",
+      triggerId: trigger.id,
+      inputSnapshot: {
+        headers: request.headers,
+        body: request.body ?? null,
+      },
+    });
+    await state.repository.saveTrigger({
+      ...trigger,
+      lastTriggeredAt: nowIso(),
+      lastRunId: created.taskRun.id,
+      updatedAt: nowIso(),
+    });
+    logInternalEvent("webhook_trigger_fired", {
+      triggerId: trigger.id,
+      taskId: task.id,
+      taskRunId: created.taskRun.id,
+      webhookPath: trigger.webhookPath,
+    });
+    return {
+      ok: true,
+      taskRun: created.taskRun,
+      approval: created.approval,
+    };
+  });
+
+  app.get("/api/approvals", { preHandler: requireOwner }, async (request) => {
+    const query = request.query as {
+      taskRunId?: string;
+      status?: ApprovalRequest["status"];
+      limit?: string | number;
+    };
+    const limit = query.limit === undefined ? undefined : Number(query.limit);
+    return state.repository.listApprovalRequests({
+      ...(query.taskRunId ? { taskRunId: query.taskRunId } : {}),
+      ...(query.status ? { status: query.status } : {}),
+      ...(Number.isFinite(limit) ? { limit: Number(limit) } : {}),
+    });
+  });
+
+  app.post("/api/approvals", { preHandler: requireOwner }, async (request) => {
+    const workspace = await state.repository.getWorkspace();
+    requireWorkspace(workspace);
+    const body = (request.body ?? {}) as {
+      approvalId?: string;
+      decision?: "approved" | "rejected" | "cancelled";
+      note?: string;
+      taskRunId?: string;
+      reason?: string;
+      requestedCapabilities?: string[];
+      requestedScopes?: Record<string, unknown>;
+      executorId?: string;
+    };
+    if (body.approvalId) {
+      const decision = body.decision;
+      if (decision !== "approved" && decision !== "rejected" && decision !== "cancelled") {
+        throw app.httpErrors.badRequest("decision must be approved, rejected, or cancelled");
+      }
+      let result;
+      try {
+        result = await resolveApprovalDecision({
+          approvalId: body.approvalId,
+          decision,
+          note: body.note ?? null,
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message === "Approval request not found") {
+          throw app.httpErrors.notFound(error.message);
+        }
+        if (
+          error instanceof Error &&
+          (error.message.includes("no longer pending") || error.message.includes("has expired"))
+        ) {
+          throw app.httpErrors.conflict(error.message);
+        }
+        throw error;
+      }
+      await audit(
+        (request.user as { sub?: string }).sub ?? "unknown",
+        "resolve_approval",
+        "approval",
+        result.approval.id,
+        {
+          decision,
+          taskRunId: result.approval.taskRunId,
+        },
+      );
+      return result;
+    }
+
+    if (!body.taskRunId || !body.reason) {
+      throw app.httpErrors.badRequest("taskRunId and reason are required");
+    }
+    const taskRun = await state.repository.getTaskRun(body.taskRunId);
+    if (!taskRun) {
+      throw app.httpErrors.notFound("Task run not found");
+    }
+    const timestamp = nowIso();
+    const approval = ApprovalRequestSchema.parse({
+      id: createId("approval"),
+      workspaceId: workspace.id,
+      taskId: taskRun.taskId,
+      taskRunId: taskRun.id,
+      executorId: body.executorId ?? taskRun.executorId ?? null,
+      status: "pending",
+      reason: body.reason,
+      requestedCapabilities: Array.isArray(body.requestedCapabilities)
+        ? body.requestedCapabilities
+        : [],
+      requestedScopes: asRecord(body.requestedScopes ?? {}),
+      decisionNote: null,
+      requestedAt: timestamp,
+      decidedAt: null,
+      expiresAt: isoAfter(APPROVAL_REQUEST_TTL_MS),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveApprovalRequest(approval);
+    await state.repository.saveTaskRun({
+      ...taskRun,
+      approvalId: approval.id,
+      status: "waiting_approval",
+      updatedAt: timestamp,
+    });
+    await appendSessionEvent({
+      sessionId: taskRun.sessionId,
+      eventType: "approval_requested",
+      payload: {
+        approvalId: approval.id,
+        taskRunId: taskRun.id,
+      },
+    });
+    return {
+      approval,
+    };
+  });
+
+  app.get("/api/executors", { preHandler: requireOwner }, async () =>
+    state.repository.listExecutorNodes(),
+  );
+
+  app.post("/api/executors", { preHandler: requireOwner }, async (request) => {
+    const workspace = await state.repository.getWorkspace();
+    requireWorkspace(workspace);
+    const body = (request.body ?? {}) as Partial<ExecutorNode>;
+    const existing = body.id ? await state.repository.getExecutorNode(body.id) : null;
+    const timestamp = nowIso();
+    const next = ExecutorNodeSchema.parse({
+      id: body.id ?? existing?.id ?? createId("executor"),
+      workspaceId: workspace.id,
+      label: body.label ?? existing?.label ?? "Companion Executor",
+      kind: body.kind ?? existing?.kind ?? "companion",
+      status: existing?.status ?? "offline",
+      version: body.version ?? existing?.version ?? null,
+      platform: body.platform ?? existing?.platform ?? null,
+      capabilities: body.capabilities ?? existing?.capabilities ?? [],
+      scopes: body.scopes ?? existing?.scopes ?? {},
+      metadata: body.metadata ?? existing?.metadata ?? {},
+      pairingCodeHash: existing?.pairingCodeHash ?? null,
+      executorTokenHash: existing?.executorTokenHash ?? null,
+      pairingIssuedAt: existing?.pairingIssuedAt ?? null,
+      pairedAt: existing?.pairedAt ?? null,
+      lastHeartbeatAt: existing?.lastHeartbeatAt ?? null,
+      lastSeenAt: existing?.lastSeenAt ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveExecutorNode(next);
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      existing ? "update_executor" : "create_executor",
+      "executor",
+      next.id,
+      {
+        status: next.status,
+        capabilities: next.capabilities,
+      },
+    );
+    return next;
+  });
+
+  app.post("/api/executors/:id/pair", { preHandler: requireOwner }, async (request) => {
+    const executor = await state.repository.getExecutorNode(
+      (request.params as { id: string }).id,
+    );
+    if (!executor) {
+      throw app.httpErrors.notFound("Executor not found");
+    }
+    const pairingCode = `pair.${executor.id}.${createId("pair")}`;
+    const next = ExecutorNodeSchema.parse({
+      ...executor,
+      status: "pending_pairing",
+      pairingCodeHash: sha256(pairingCode),
+      executorTokenHash: null,
+      pairingIssuedAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    await state.repository.saveExecutorNode(next);
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      "pair_executor",
+      "executor",
+      executor.id,
+    );
+    return {
+      executor: next,
+      pairingCode,
+    };
+  });
+
+  app.post("/api/executors/:id/heartbeat", async (request, reply) => {
+    const executor = await state.repository.getExecutorNode(
+      (request.params as { id: string }).id,
+    );
+    if (!executor) {
+      return reply.code(404).send({ error: "Executor not found" });
+    }
+    const body = (request.body ?? {}) as {
+      pairingCode?: string;
+      executorToken?: string;
+      version?: string;
+      platform?: string;
+      capabilities?: string[];
+      metadata?: Record<string, unknown>;
+      completedRuns?: Array<{
+        taskRunId?: string;
+        status?: "completed" | "failed" | "aborted";
+        outputSummary?: string;
+        error?: string;
+        logs?: unknown[];
+        artifacts?: Array<{
+          id?: string;
+          label?: string;
+          kind?: "text" | "json" | "url" | "screenshot" | "file";
+          content?: unknown;
+        }>;
+      }>;
+      companionLogs?: unknown[];
+    };
+    const timestamp = nowIso();
+    let next = executor;
+    let paired = false;
+    let executorToken: string | null = null;
+
+    if (typeof body.pairingCode === "string" && body.pairingCode.trim()) {
+      if (!executor.pairingCodeHash || sha256(body.pairingCode) !== executor.pairingCodeHash) {
+        return reply.code(401).send({ error: "Pairing code is invalid" });
+      }
+      if (
+        !executor.pairingIssuedAt ||
+        Date.parse(executor.pairingIssuedAt) + EXECUTOR_PAIRING_CODE_MAX_AGE_MS <= Date.now()
+      ) {
+        const expiredExecutor = ExecutorNodeSchema.parse({
+          ...executor,
+          status: "offline",
+          pairingCodeHash: null,
+          pairingIssuedAt: null,
+          updatedAt: timestamp,
+        });
+        await state.repository.saveExecutorNode(expiredExecutor);
+        return reply.code(401).send({ error: "Pairing code has expired" });
+      }
+      paired = true;
+      executorToken = `exec.${executor.id}.${createId("token")}`;
+      next = ExecutorNodeSchema.parse({
+        ...executor,
+        status: "online",
+        version: body.version ?? executor.version,
+        platform: body.platform ?? executor.platform,
+        capabilities: Array.isArray(body.capabilities)
+          ? body.capabilities
+          : executor.capabilities,
+        metadata: asRecord(body.metadata ?? executor.metadata),
+        pairingCodeHash: null,
+        executorTokenHash: sha256(executorToken),
+        pairedAt: executor.pairedAt ?? timestamp,
+        lastHeartbeatAt: timestamp,
+        lastSeenAt: timestamp,
+        updatedAt: timestamp,
+      });
+      await appendSessionEvent({
+        sessionId: `executor:${executor.id}`,
+        eventType: "executor_paired",
+        payload: {
+          executorId: executor.id,
+        },
+      });
+      logInternalEvent("executor_paired", {
+        executorId: executor.id,
+        capabilities: next.capabilities,
+        platform: next.platform,
+        version: next.version,
+      });
+    } else if (
+      typeof body.executorToken === "string" &&
+      body.executorToken.trim() &&
+      executor.executorTokenHash &&
+      sha256(body.executorToken) === executor.executorTokenHash
+    ) {
+      next = ExecutorNodeSchema.parse({
+        ...executor,
+        status: "online",
+        version: body.version ?? executor.version,
+        platform: body.platform ?? executor.platform,
+        capabilities: Array.isArray(body.capabilities)
+          ? body.capabilities
+          : executor.capabilities,
+        metadata: asRecord(body.metadata ?? executor.metadata),
+        lastHeartbeatAt: timestamp,
+        lastSeenAt: timestamp,
+        updatedAt: timestamp,
+      });
+    } else {
+      return reply.code(401).send({ error: "Executor token is invalid" });
+    }
+
+    await state.repository.saveExecutorNode(next);
+    await ingestCompanionLogs({
+      executorId: executor.id,
+      logs: normalizeCompanionLogEntries(body.companionLogs),
+    });
+
+    for (const runUpdate of body.completedRuns ?? []) {
+      if (!runUpdate.taskRunId) {
+        continue;
+      }
+      const taskRun = await state.repository.getTaskRun(runUpdate.taskRunId);
+      if (!taskRun || taskRun.executorId !== executor.id) {
+        continue;
+      }
+      const nextStatus = runUpdate.status ?? "completed";
+      if (isTerminalTaskRunStatus(taskRun.status) && taskRun.finishedAt) {
+        continue;
+      }
+      const updatedRun = TaskRunSchema.parse({
+        ...taskRun,
+        status: nextStatus,
+        outputSummary: runUpdate.outputSummary ?? taskRun.outputSummary,
+        error: runUpdate.error ?? (nextStatus === "completed" ? null : taskRun.error),
+        artifacts: Array.isArray(runUpdate.artifacts)
+          ? runUpdate.artifacts.map((artifact, index) => ({
+              id: String(artifact.id ?? `artifact:${taskRun.id}:${index}`),
+              label: String(artifact.label ?? artifact.kind ?? "Artifact"),
+              kind: artifact.kind ?? "json",
+              content: artifact.content ?? null,
+              createdAt: timestamp,
+            }))
+          : taskRun.artifacts,
+        updatedAt: timestamp,
+        finishedAt: timestamp,
+      });
+      await state.repository.saveTaskRun(updatedRun);
+      await ingestCompanionLogs({
+        executorId: executor.id,
+        logs: normalizeCompanionLogEntries(runUpdate.logs).map((entry) => ({
+          ...entry,
+          taskRunId: entry.taskRunId ?? taskRun.id,
+        })),
+      });
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: nextStatus === "completed"
+          ? "task_run_completed"
+          : nextStatus === "failed"
+            ? "task_run_failed"
+            : "task_run_failed",
+        payload: {
+          taskRunId: taskRun.id,
+          executorId: executor.id,
+          status: nextStatus,
+          error: updatedRun.error,
+        },
+      });
+      await audit(
+        `executor:${executor.id}`,
+        nextStatus === "completed" ? "executor_complete_task_run" : "executor_fail_task_run",
+        "task_run",
+        updatedRun.id,
+        {
+          executorId: executor.id,
+          status: nextStatus,
+          taskId: updatedRun.taskId,
+        },
+      );
+      await sendTaskRunStatusUpdate({
+        task: updatedRun.taskId ? await state.repository.getTask(updatedRun.taskId) : null,
+        taskRun: updatedRun,
+        status: nextStatus === "completed" ? "completed" : "failed",
+      });
+      logInternalEvent("executor_run_updated", {
+        executorId: executor.id,
+        taskRunId: updatedRun.id,
+        taskId: updatedRun.taskId,
+        status: nextStatus,
+        error: updatedRun.error,
+      }, nextStatus === "completed" ? "info" : "warn");
+    }
+
+    const queuedRuns = await state.repository.listTaskRuns({
+      executorId: executor.id,
+      limit: 5,
+    });
+    const assignments: Array<Record<string, unknown>> = [];
+    for (const taskRun of queuedRuns) {
+      if (taskRun.status !== "queued") {
+        continue;
+      }
+      const task = taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null;
+      const startedRun = TaskRunSchema.parse({
+        ...taskRun,
+        status: "running",
+        startedAt: taskRun.startedAt ?? timestamp,
+        updatedAt: timestamp,
+      });
+      await state.repository.saveTaskRun(startedRun);
+      await appendSessionEvent({
+        sessionId: taskRun.sessionId,
+        eventType: "task_run_started",
+        payload: {
+          taskRunId: taskRun.id,
+          executorId: executor.id,
+        },
+      });
+      await sendTaskRunStatusUpdate({
+        task,
+        taskRun: startedRun,
+        status: "running",
+      });
+      assignments.push({
+        id: startedRun.id,
+        sessionId: startedRun.sessionId,
+        taskId: startedRun.taskId,
+        taskTitle: task?.title ?? null,
+        templateKind: startedRun.templateKind,
+        triggerType: startedRun.triggerType,
+        inputSnapshot: startedRun.inputSnapshot,
+        executionPlan: startedRun.executionPlan,
+        status: startedRun.status,
+      });
+    }
+
+    await appendSessionEvent({
+      sessionId: `executor:${executor.id}`,
+      eventType: "executor_heartbeat",
+      payload: {
+        executorId: executor.id,
+        assignmentCount: assignments.length,
+      },
+    });
+    logInternalEvent("executor_heartbeat", {
+      executorId: executor.id,
+      paired,
+      assignmentCount: assignments.length,
+      completedRunCount: Array.isArray(body.completedRuns) ? body.completedRuns.length : 0,
+      onlineStatus: next.status,
+    });
+
+    return {
+      ok: true,
+      paired,
+      executorToken,
+      executor: next,
+      assignments,
+    };
+  });
 
   app.get("/api/market/:kind", { preHandler: requireOwner }, async (request) => {
     const kind = (request.params as { kind: string }).kind;
@@ -7363,6 +10016,9 @@ export async function createApp(
   app.get("/api/system/logs", { preHandler: requireOwner }, async () => {
     const servers = await state.repository.listMcpServers();
     const documents = await state.repository.listDocuments();
+    const taskRuns = await state.repository.listTaskRuns({ limit: 30 });
+    const approvals = await state.repository.listApprovalRequests({ limit: 20 });
+    const executors = await state.repository.listExecutorNodes();
     return {
       note: "Structured logs stream to stdout. Runtime job, import/export, provider test, and MCP summaries are returned here for diagnostics.",
       importExportRuns: await state.repository.listImportExportRuns(20),
@@ -7384,6 +10040,28 @@ export async function createApp(
         .filter((document) => document.extractionStatus === "failed" || document.lastExtractionError)
         .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
         .slice(0, 20),
+      recentTaskRuns: taskRuns,
+      pendingApprovals: approvals.filter((approval) => approval.status === "pending"),
+      executors,
+      internalLogSummary: getInternalLogSnapshot(200),
+    };
+  });
+
+  app.get("/api/system/internal-logs", { preHandler: requireOwner }, async (request, reply) => {
+    const query = request.query as {
+      format?: string;
+      limit?: string | number;
+    };
+    const limit = query.limit === undefined ? undefined : Number(query.limit);
+    const format = query.format === "text" ? "text" : "json";
+    if (format === "text") {
+      return reply
+        .type("text/plain; charset=utf-8")
+        .send(formatInternalLogsAsText(Number.isFinite(limit) ? Number(limit) : undefined));
+    }
+    return {
+      generatedAt: nowIso(),
+      ...getInternalLogSnapshot(Number.isFinite(limit) ? Number(limit) : undefined),
     };
   });
 
@@ -7398,7 +10076,16 @@ export async function createApp(
       const { turnId } = request.params as { turnId: string };
       const snapshot = await state.repository.getLatestTurnState(turnId);
       if (!snapshot) {
-        return reply.code(404).send({ error: "Turn state not found" });
+        const taskRun = (await state.repository.listTaskRuns({ limit: 200 }))
+          .find((run) => run.sessionId === turnId);
+        if (!taskRun) {
+          return reply.code(404).send({ error: "Turn state not found" });
+        }
+        return {
+          kind: "task_run_session",
+          sessionId: turnId,
+          taskRun,
+        };
       }
       return snapshot;
     },
@@ -7430,6 +10117,10 @@ export async function createApp(
     const mcpProviders = await state.repository.listMcpProviders();
     const mcpServers = await state.repository.listMcpServers();
     const documents = await state.repository.listDocuments();
+    const tasks = await state.repository.listTasks();
+    const taskRuns = await state.repository.listTaskRuns({ limit: 200 });
+    const approvals = await state.repository.listApprovalRequests({ limit: 200 });
+    const executors = await state.repository.listExecutorNodes();
     const workspace = await state.repository.getWorkspace();
     const providerProfiles = await state.repository.listProviderProfiles();
     const agentProfiles = await state.repository.listAgentProfiles();
@@ -7442,6 +10133,7 @@ export async function createApp(
     const expectedWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env, request);
     const webhookInfo = await readTelegramWebhookInfo();
     let runtimeDiagnostics: Record<string, unknown> | null = null;
+    const internalLogSnapshot = getInternalLogSnapshot(200);
 
     if (workspace?.activeAgentProfileId) {
       const activeProfile = agentProfiles.find((profile) =>
@@ -7522,6 +10214,15 @@ export async function createApp(
       },
       bootstrapState: await state.repository.getBootstrapState(),
       hasWorkspace: Boolean(workspace),
+      internalLogs: {
+        totalEntries: internalLogSnapshot.totalEntries,
+        retainedEntries: internalLogSnapshot.retainedEntries,
+        droppedEntries: internalLogSnapshot.droppedEntries,
+        firstSeq: internalLogSnapshot.firstSeq,
+        lastSeq: internalLogSnapshot.lastSeq,
+        latestAt: internalLogSnapshot.entries[internalLogSnapshot.entries.length - 1]?.receivedAt ?? null,
+        latestLevel: internalLogSnapshot.entries[internalLogSnapshot.entries.length - 1]?.level ?? null,
+      },
       providerProfiles: providerProfiles.length,
       mcpProviders: mcpProviders.length,
       mcpServers: mcpServers.length,
@@ -7565,6 +10266,34 @@ export async function createApp(
             updatedAt: document.updatedAt,
           })),
       },
+      tasks: {
+        total: tasks.length,
+        draft: tasks.filter((task) => task.status === "draft").length,
+        active: tasks.filter((task) => task.status === "active").length,
+        paused: tasks.filter((task) => task.status === "paused").length,
+        archived: tasks.filter((task) => task.status === "archived").length,
+      },
+      taskRuns: {
+        queued: taskRuns.filter((taskRun) => taskRun.status === "queued").length,
+        running: taskRuns.filter((taskRun) => taskRun.status === "running").length,
+        waitingApproval: taskRuns.filter((taskRun) => taskRun.status === "waiting_approval").length,
+        waitingRetry: taskRuns.filter((taskRun) => taskRun.status === "waiting_retry").length,
+        completed: taskRuns.filter((taskRun) => taskRun.status === "completed").length,
+        failed: taskRuns.filter((taskRun) => taskRun.status === "failed").length,
+      },
+      approvals: {
+        pending: approvals.filter((approval) => approval.status === "pending").length,
+        approved: approvals.filter((approval) => approval.status === "approved").length,
+        rejected: approvals.filter((approval) => approval.status === "rejected").length,
+        cancelled: approvals.filter((approval) => approval.status === "cancelled").length,
+      },
+      executors: executors.map((executor) => ({
+        id: executor.id,
+        label: executor.label,
+        status: executor.status,
+        capabilities: executor.capabilities,
+        lastHeartbeatAt: executor.lastHeartbeatAt,
+      })),
       recentProviderTests: providerTests.slice(0, 5),
       recentMcpHealth: mcpServers
         .filter((server) => server.lastHealthCheckedAt)

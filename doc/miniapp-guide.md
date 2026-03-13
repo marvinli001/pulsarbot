@@ -8,14 +8,18 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 2. `Workspace`
 3. `Providers`
 4. `Profiles`
-5. `Skills / Plugins / MCP Market`
-6. `MCP Servers`
-7. `Search`
-8. `Memory`
-9. `Documents`
-10. `Import/Export`
-11. `Logs`
-12. `Health`
+5. `Tasks`
+6. `Automations`
+7. `Sessions`
+8. `Executors`
+9. `Skills / Plugins / MCP Market`
+10. `MCP Servers`
+11. `Search`
+12. `Memory`
+13. `Documents`
+14. `Import/Export`
+15. `Logs`
+16. `Health`
 
 ## 1. Overview
 
@@ -79,7 +83,102 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 如果 profile 引用了未安装、未启用或不存在的对象，服务端会拒绝保存。
 
-## 5. Skills / Plugins / MCP Market
+## 5. Tasks
+
+这里是自动化控制面的主入口。当前面板已经不是 generic JSON 配置页，而是 workflow template 驱动的任务编辑器。
+
+你可以在这里完成：
+
+- 选择 workflow template
+- 填写模板字段
+- 选择默认 executor
+- 设置 approval policy 和 approval checkpoints
+- 设置 memory policy 与 workflow budget
+- 查看 capability preview
+- 手动触发一次 task run
+
+当前模板固定为：
+
+- `网页监控并汇报`
+- `打开网页完成浏览器流程`
+- `读 PDF/DOCX 并生成摘要+记忆`
+- `从 Telegram 消息生成待办并定时跟进`
+- `收到 webhook 后抓取、分析并回推 TG`
+
+推荐操作：
+
+1. 先选模板，再补字段
+2. 看 `Workflow Capability Preview` 是否 ready
+3. 再把 task 切到 `active`
+4. 用 `Run` 先做一次手动闭环
+
+## 6. Automations
+
+这里管理 trigger，而不是 task 本体。
+
+当前支持：
+
+- `schedule`
+- `webhook`
+- `telegram_shortcut`
+
+说明：
+
+- `telegram_shortcut` 当前只支持 `/digest`
+- 非手动 trigger 必须绑定一个 task
+- schedule trigger 需要有效的 `intervalMinutes`
+
+推荐做法：
+
+1. 先把 task 配好并成功手动运行一次
+2. 再给它挂上 schedule 或 webhook
+3. webhook 创建后，把路径和 secret 保存到你自己的外部系统里
+
+## 7. Sessions
+
+这里用于看 task run 的运行历史与审批状态。
+
+面板会直接读取：
+
+- task run 基本信息
+- 关联 approval
+- `session state`
+- `session events`
+
+这个面板不是另一套独立日志，而是复用现有 turn timeline。
+
+适合排查：
+
+- 为什么 run 卡在 `waiting_approval`
+- executor 有没有真正把 run 拉走
+- internal document workflow 为什么失败
+
+## 8. Executors
+
+这里管理 owner 自己的 companion executor。
+
+你可以在这里完成：
+
+- 创建 executor
+- 设置 capability
+- 设置 `allowedHosts / allowedPaths / allowedCommands`
+- 生成 pairing code
+- 查看在线状态、最近心跳、最近任务
+
+推荐做法：
+
+1. 先按最小权限创建 scope
+2. 配对 companion
+3. 回到 `Tasks` 选择默认 executor
+4. 用一个最小的 `web_watch_report` 或 `browser_workflow` 做验证
+
+排障说明：
+
+- 如果 task run 看起来“卡住”，先到 `System Health` 导出 internal logs。
+- Health 页里的 `Download logs as...` 和 `Copy logs as...` 会包含 server internal logs，也包含 companion 通过 heartbeat 回传并被 server 摄取的执行日志。
+- 如果要看某个 task run 的细节，再去 `Sessions` 面板查看对应的 `executor_log` 事件流。
+
+## 9. Skills / Plugins / MCP Market
 
 这几组面板用于查看官方 market manifests，并完成：
 
@@ -94,7 +193,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 2. 修改后立刻到 `Profiles` 或 `Runtime Preview` 核对是否进入最终运行时
 3. 对于官方 MCP 条目，启用后再检查对应 server 是否已附着到 active profile
 
-## 6. MCP Market 与 MCP Servers
+## 10. MCP Market 与 MCP Servers
 
 `MCP Market` 面板本身除了官方 marketplace 条目外，也承载了 “MCP provider” 这条链路。目前代码已经支持：
 
@@ -115,7 +214,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 - 列出远端 tools
 - 查看 MCP 运行日志
 
-## 7. Search
+## 11. Search
 
 用于配置搜索优先级与回退顺序。当前管理台支持的来源包括：
 
@@ -126,7 +225,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 这里的设置会进入运行时装配结果，而不只是 UI 偏好项。
 
-## 8. Memory
+## 12. Memory
 
 用于查看：
 
@@ -139,7 +238,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 同时支持手动触发 `memory reindex`。
 
-## 9. Documents
+## 13. Documents
 
 用于查看已入库文档与抽取状态，并支持：
 
@@ -149,7 +248,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 如果语音、图片、PDF 或其他文档处理失败，优先来这里确认状态。
 
-## 10. Import/Export
+## 14. Import/Export
 
 用于工作区备份与恢复，包括：
 
@@ -159,7 +258,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 高敏操作会要求再次输入 `PULSARBOT_ACCESS_TOKEN`。
 
-## 11. Logs
+## 15. Logs
 
 用于查看结构化运行摘要，包括：
 
@@ -171,7 +270,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 如果你在排查“为什么刚才那次操作失败”，这个面板通常比直接翻控制台更快。
 
-## 12. Health
+## 16. Health
 
 用于总览系统健康状态，重点包括：
 
@@ -184,6 +283,11 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 - 最近 MCP health
 - 当前 active profile 的 runtime 诊断
 - Telegram webhook 的预期地址和实际状态
+- `System Health (Raw JSON)` 面板支持：
+  - `Download logs as...`
+  - `Copy logs as...`
+
+这里导出的不是单纯的 health JSON，而是服务端最近保留的 internal log buffer，适合在排障时直接发给维护者。
 
 ## 推荐的首次上线流程
 
@@ -194,9 +298,11 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 5. 初始化或接管资源
 6. 配置 Provider API Key 并执行 provider test
 7. 调整 `Workspace` 和 `Profiles`
-8. 在 `Skills / Plugins / MCP Market` 中安装并启用需要的能力
-9. 在 `Health` 和 `Logs` 面板确认系统状态
-10. 回到 Telegram 私聊 Bot 发起真实对话
+8. 在 `Executors` 里创建并配对 companion
+9. 在 `Tasks` 里创建一个模板化 task，并先手动运行一次
+10. 在 `Automations` 里挂 schedule 或 webhook
+11. 在 `Health`、`Logs` 和 `Sessions` 面板确认系统状态
+12. 回到 Telegram 私聊 Bot 发起真实对话
 
 ## 两个典型排查动作
 
@@ -217,3 +323,12 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 2. `Logs` 面板中的最近 turn / job / provider test 信息
 3. Provider 是否通过测试
 4. 当前 active profile 是否有效
+
+### 为什么自动化任务一直不开始
+
+优先检查：
+
+1. `Tasks` 面板里的 capability preview 是否 ready
+2. `Sessions` 面板里 run 当前是 `queued`、`waiting_approval` 还是 `waiting_retry`
+3. `Approvals` 或 Telegram 卡片里是否还没审批
+4. `Executors` 面板里的 companion 是否在线、capability 是否匹配

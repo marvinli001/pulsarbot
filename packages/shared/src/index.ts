@@ -36,6 +36,71 @@ export const ProviderTestCapabilitySchema = z.enum([
   "audio",
   "document",
 ]);
+export const WorkflowTemplateKindSchema = z.enum([
+  "web_watch_report",
+  "browser_workflow",
+  "document_digest_memory",
+  "telegram_followup",
+  "webhook_fetch_analyze_push",
+]);
+export const TaskStatusSchema = z.enum(["draft", "active", "paused", "archived"]);
+export const TaskTriggerKindSchema = z.enum([
+  "manual",
+  "schedule",
+  "webhook",
+  "telegram_shortcut",
+]);
+export const TaskRunStatusSchema = z.enum([
+  "queued",
+  "running",
+  "waiting_approval",
+  "waiting_retry",
+  "completed",
+  "failed",
+  "aborted",
+]);
+export const ApprovalPolicySchema = z.enum([
+  "auto_approve_safe",
+  "approval_required",
+  "approval_for_write",
+]);
+export const WorkflowApprovalCheckpointSchema = z.enum([
+  "before_executor",
+  "before_memory_writeback",
+  "before_telegram_push",
+  "before_fs_write",
+  "before_shell",
+]);
+export const MemoryPolicySchema = z.enum([
+  "chat_only",
+  "task_context",
+  "task_context_writeback",
+]);
+export const ApprovalRequestStatusSchema = z.enum([
+  "pending",
+  "approved",
+  "rejected",
+  "expired",
+  "cancelled",
+]);
+export const ExecutorKindSchema = z.enum(["companion"]);
+export const ExecutorStatusSchema = z.enum([
+  "offline",
+  "pending_pairing",
+  "online",
+]);
+export const ExecutorCapabilitySchema = z.enum([
+  "browser",
+  "http",
+  "fs",
+  "shell",
+]);
+export const TurnApprovalStateSchema = z.enum([
+  "none",
+  "pending",
+  "approved",
+  "rejected",
+]);
 export const MessageSourceTypeSchema = z.enum([
   "text",
   "voice",
@@ -182,6 +247,12 @@ export const ProviderProfileSchema = z.object({
   updatedAt: z.string().min(1),
 });
 
+export const WorkflowBudgetSchema = z.object({
+  maxSteps: z.number().int().positive().default(8),
+  maxActions: z.number().int().positive().default(6),
+  timeoutMs: z.number().int().positive().default(60_000),
+});
+
 export const AgentProfileSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
@@ -202,6 +273,14 @@ export const AgentProfileSchema = z.object({
   allowNetworkTools: z.boolean().default(true),
   allowWriteTools: z.boolean().default(true),
   allowMcpTools: z.boolean().default(true),
+  defaultExecutorId: z.string().nullable().default(null),
+  approvalPolicy: ApprovalPolicySchema.default("auto_approve_safe"),
+  defaultMemoryPolicy: MemoryPolicySchema.default("chat_only"),
+  defaultWorkflowBudget: WorkflowBudgetSchema.default({
+    maxSteps: 8,
+    maxActions: 6,
+    timeoutMs: 60_000,
+  }),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
 });
@@ -258,6 +337,89 @@ export const SearchSettingsSchema = z.object({
     "exa_then_browse",
   ),
   maxResults: z.number().int().positive().default(5),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
+export const ExecutorScopeSchema = z.object({
+  allowedHosts: z.array(z.string()).default([]),
+  allowedPaths: z.array(z.string()).default([]),
+  allowedCommands: z.array(z.string()).default([]),
+  fsRequiresApproval: z.boolean().default(true),
+  shellRequiresApproval: z.boolean().default(true),
+});
+
+export const ExecutorNodeSchema = z.object({
+  id: z.string().min(1),
+  workspaceId: z.string().min(1),
+  label: z.string().min(1),
+  kind: ExecutorKindSchema.default("companion"),
+  status: ExecutorStatusSchema.default("offline"),
+  version: z.string().nullable().default(null),
+  platform: z.string().nullable().default(null),
+  capabilities: z.array(ExecutorCapabilitySchema).default([]),
+  scopes: ExecutorScopeSchema.default({
+    allowedHosts: [],
+    allowedPaths: [],
+    allowedCommands: [],
+    fsRequiresApproval: true,
+    shellRequiresApproval: true,
+  }),
+  metadata: LooseRecordSchema.default({}),
+  pairingCodeHash: z.string().nullable().default(null),
+  executorTokenHash: z.string().nullable().default(null),
+  pairingIssuedAt: z.string().nullable().default(null),
+  pairedAt: z.string().nullable().default(null),
+  lastHeartbeatAt: z.string().nullable().default(null),
+  lastSeenAt: z.string().nullable().default(null),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
+export const TaskSchema = z.object({
+  id: z.string().min(1),
+  workspaceId: z.string().min(1),
+  title: z.string().min(1),
+  goal: z.string().min(1),
+  description: z.string().default(""),
+  config: LooseRecordSchema.default({}),
+  templateKind: WorkflowTemplateKindSchema,
+  status: TaskStatusSchema.default("draft"),
+  agentProfileId: z.string().nullable().default(null),
+  defaultExecutorId: z.string().nullable().default(null),
+  approvalPolicy: ApprovalPolicySchema.default("auto_approve_safe"),
+  approvalCheckpoints: z.array(WorkflowApprovalCheckpointSchema).default([
+    "before_executor",
+  ]),
+  memoryPolicy: MemoryPolicySchema.default("chat_only"),
+  defaultRunBudget: WorkflowBudgetSchema.default({
+    maxSteps: 8,
+    maxActions: 6,
+    timeoutMs: 60_000,
+  }),
+  triggerIds: z.array(z.string()).default([]),
+  relatedDocumentIds: z.array(z.string()).default([]),
+  relatedThreadIds: z.array(z.number().int()).default([]),
+  latestRunId: z.string().nullable().default(null),
+  lastRunAt: z.string().nullable().default(null),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+
+export const TriggerSchema = z.object({
+  id: z.string().min(1),
+  workspaceId: z.string().min(1),
+  taskId: z.string().nullable().default(null),
+  label: z.string().min(1),
+  kind: TaskTriggerKindSchema,
+  enabled: z.boolean().default(true),
+  config: LooseRecordSchema.default({}),
+  webhookPath: z.string().nullable().default(null),
+  webhookSecret: z.string().nullable().default(null),
+  webhookSecretRef: z.string().nullable().default(null),
+  nextRunAt: z.string().nullable().default(null),
+  lastTriggeredAt: z.string().nullable().default(null),
+  lastRunId: z.string().nullable().default(null),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
 });
@@ -538,6 +700,10 @@ export const ConversationTurnSchema = z.object({
   lastEventSeq: z.number().int().nonnegative().default(0),
   currentNode: z.string().nullable().default(null),
   resumeEligible: z.boolean().default(false),
+  taskRunId: z.string().nullable().default(null),
+  triggerType: TaskTriggerKindSchema.nullable().default(null),
+  executorId: z.string().nullable().default(null),
+  approvalState: TurnApprovalStateSchema.default("none"),
   startedAt: z.string().min(1),
   finishedAt: z.string().nullable().default(null),
   lockExpiresAt: z.string().nullable().default(null),
@@ -573,6 +739,10 @@ export const TurnStateSchema = z.object({
   graphVersion: z.enum(["v1", "v2"]).default("v2"),
   status: z.enum(["running", "waiting_retry", "succeeded", "failed", "aborted"]),
   currentNode: z.string().min(1),
+  taskRunId: z.string().nullable().default(null),
+  triggerType: TaskTriggerKindSchema.nullable().default(null),
+  executorId: z.string().nullable().default(null),
+  approvalState: TurnApprovalStateSchema.default("none"),
   version: z.number().int().nonnegative().default(0),
   input: z.object({
     updateId: z.number().int().nullable().default(null),
@@ -676,6 +846,18 @@ export const TurnEventTypeSchema = z.enum([
   "turn_succeeded",
   "turn_failed",
   "turn_recovered",
+  "task_run_queued",
+  "task_run_started",
+  "task_run_waiting_approval",
+  "task_run_waiting_retry",
+  "task_run_completed",
+  "task_run_failed",
+  "trigger_fired",
+  "approval_requested",
+  "approval_resolved",
+  "executor_paired",
+  "executor_heartbeat",
+  "executor_log",
 ]);
 
 export const TurnEventSchema = z.object({
@@ -687,6 +869,57 @@ export const TurnEventSchema = z.object({
   attempt: z.number().int().positive().default(1),
   payload: LooseRecordSchema.default({}),
   occurredAt: z.string().min(1),
+});
+
+export const TaskRunArtifactSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  kind: z.enum(["text", "json", "url", "screenshot", "file"]),
+  content: JsonValueSchema.nullable().default(null),
+  createdAt: z.string().min(1),
+});
+
+export const TaskRunSchema = z.object({
+  id: z.string().min(1),
+  workspaceId: z.string().min(1),
+  taskId: z.string().nullable().default(null),
+  templateKind: WorkflowTemplateKindSchema,
+  status: TaskRunStatusSchema,
+  triggerType: TaskTriggerKindSchema,
+  triggerId: z.string().nullable().default(null),
+  executorId: z.string().nullable().default(null),
+  approvalId: z.string().nullable().default(null),
+  sourceTurnId: z.string().nullable().default(null),
+  sessionId: z.string().min(1),
+  inputSnapshot: LooseRecordSchema.default({}),
+  executionPlan: LooseRecordSchema.default({}),
+  outputSummary: z.string().nullable().default(null),
+  artifacts: z.array(TaskRunArtifactSchema).default([]),
+  relatedDocumentIds: z.array(z.string()).default([]),
+  relatedMemoryDocumentIds: z.array(z.string()).default([]),
+  error: z.string().nullable().default(null),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+  startedAt: z.string().nullable().default(null),
+  finishedAt: z.string().nullable().default(null),
+});
+
+export const ApprovalRequestSchema = z.object({
+  id: z.string().min(1),
+  workspaceId: z.string().min(1),
+  taskId: z.string().nullable().default(null),
+  taskRunId: z.string().min(1),
+  executorId: z.string().nullable().default(null),
+  status: ApprovalRequestStatusSchema.default("pending"),
+  reason: z.string().min(1),
+  requestedCapabilities: z.array(ExecutorCapabilitySchema).default([]),
+  requestedScopes: LooseRecordSchema.default({}),
+  decisionNote: z.string().nullable().default(null),
+  requestedAt: z.string().min(1),
+  decidedAt: z.string().nullable().default(null),
+  expiresAt: z.string().nullable().default(null),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
 });
 
 export const DocumentMetadataSchema = z.object({
@@ -847,6 +1080,11 @@ export const WorkspaceExportBundleSchema = z.object({
   mcpProviders: z.array(McpProviderConfigSchema).default([]),
   mcpServers: z.array(McpServerConfigSchema),
   searchSettings: SearchSettingsSchema.optional(),
+  tasks: z.array(TaskSchema).default([]),
+  taskRuns: z.array(TaskRunSchema).default([]),
+  triggers: z.array(TriggerSchema).default([]),
+  approvals: z.array(ApprovalRequestSchema).default([]),
+  executors: z.array(ExecutorNodeSchema).default([]),
   documents: z.array(DocumentMetadataSchema).default([]),
   documentArtifacts: z.array(DocumentArtifactSchema).default([]),
   memories: z.array(MemoryDocumentSchema),
@@ -893,6 +1131,18 @@ export const ResolvedRuntimeSnapshotSchema = z.object({
 export type ProviderKind = z.infer<typeof ProviderKindSchema>;
 export type ReasoningLevel = z.infer<typeof ReasoningLevelSchema>;
 export type ProviderTestCapability = z.infer<typeof ProviderTestCapabilitySchema>;
+export type WorkflowTemplateKind = z.infer<typeof WorkflowTemplateKindSchema>;
+export type TaskStatus = z.infer<typeof TaskStatusSchema>;
+export type TaskTriggerKind = z.infer<typeof TaskTriggerKindSchema>;
+export type TaskRunStatus = z.infer<typeof TaskRunStatusSchema>;
+export type ApprovalPolicy = z.infer<typeof ApprovalPolicySchema>;
+export type WorkflowApprovalCheckpoint = z.infer<typeof WorkflowApprovalCheckpointSchema>;
+export type MemoryPolicy = z.infer<typeof MemoryPolicySchema>;
+export type ApprovalRequestStatus = z.infer<typeof ApprovalRequestStatusSchema>;
+export type ExecutorKind = z.infer<typeof ExecutorKindSchema>;
+export type ExecutorStatus = z.infer<typeof ExecutorStatusSchema>;
+export type ExecutorCapability = z.infer<typeof ExecutorCapabilitySchema>;
+export type TurnApprovalState = z.infer<typeof TurnApprovalStateSchema>;
 export type Workspace = z.infer<typeof WorkspaceSchema>;
 export type BootstrapState = z.infer<typeof BootstrapStateSchema>;
 export type AdminIdentity = z.infer<typeof AdminIdentitySchema>;
@@ -906,6 +1156,11 @@ export type McpProviderKind = z.infer<typeof McpProviderKindSchema>;
 export type McpProviderCatalogServer = z.infer<typeof McpProviderCatalogServerSchema>;
 export type McpProviderConfig = z.infer<typeof McpProviderConfigSchema>;
 export type SearchSettings = z.infer<typeof SearchSettingsSchema>;
+export type WorkflowBudget = z.infer<typeof WorkflowBudgetSchema>;
+export type ExecutorScope = z.infer<typeof ExecutorScopeSchema>;
+export type ExecutorNode = z.infer<typeof ExecutorNodeSchema>;
+export type Task = z.infer<typeof TaskSchema>;
+export type Trigger = z.infer<typeof TriggerSchema>;
 export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
 export type SkillManifest = z.infer<typeof SkillManifestSchema>;
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;
@@ -930,6 +1185,9 @@ export type ConversationTurn = z.infer<typeof ConversationTurnSchema>;
 export type TurnState = z.infer<typeof TurnStateSchema>;
 export type TurnEventType = z.infer<typeof TurnEventTypeSchema>;
 export type TurnEvent = z.infer<typeof TurnEventSchema>;
+export type TaskRunArtifact = z.infer<typeof TaskRunArtifactSchema>;
+export type TaskRun = z.infer<typeof TaskRunSchema>;
+export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
 export type DocumentMetadata = z.infer<typeof DocumentMetadataSchema>;
 export type DocumentArtifact = z.infer<typeof DocumentArtifactSchema>;
 export type MemoryDocument = z.infer<typeof MemoryDocumentSchema>;

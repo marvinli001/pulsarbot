@@ -1,4 +1,6 @@
+export { AutomationsPanel } from "./automations-panel.js";
 export { DocumentsPanel } from "./documents-panel.js";
+export { ExecutorsPanel } from "./executors-panel.js";
 export { HealthPanel } from "./health-panel.js";
 export { ImportExportPanel } from "./import-export-panel.js";
 export { LogsPanel } from "./logs-panel.js";
@@ -10,4 +12,6 @@ export { OverviewPanel } from "./overview-panel.js";
 export { ProfilesPanel } from "./profiles-panel.js";
 export { ProvidersPanel } from "./providers-panel.js";
 export { SearchPanel } from "./search-panel.js";
+export { SessionsPanel } from "./sessions-panel.js";
+export { TasksPanel } from "./tasks-panel.js";
 export { WorkspacePanel } from "./workspace-panel.js";

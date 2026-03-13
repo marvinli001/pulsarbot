@@ -14,7 +14,9 @@ import {
   useSessionBootstrap,
 } from "./shared.js";
 import {
+  AutomationsPanel,
   DocumentsPanel,
+  ExecutorsPanel,
   HealthPanel,
   ImportExportPanel,
   LogsPanel,
@@ -26,6 +28,8 @@ import {
   ProfilesPanel,
   ProvidersPanel,
   SearchPanel,
+  SessionsPanel,
+  TasksPanel,
   WorkspacePanel,
 } from "./panels/index.js";
 
@@ -136,6 +140,10 @@ function Page() {
       {activeSection === "mcp-market" ? <McpMarketPanel /> : null}
       {activeSection === "mcp-servers" ? <McpServersPanel /> : null}
       {activeSection === "search" ? <SearchPanel /> : null}
+      {activeSection === "tasks" ? <TasksPanel /> : null}
+      {activeSection === "automations" ? <AutomationsPanel /> : null}
+      {activeSection === "sessions" ? <SessionsPanel /> : null}
+      {activeSection === "executors" ? <ExecutorsPanel /> : null}
       {activeSection === "memory" ? <MemoryPanel /> : null}
       {activeSection === "documents" ? <DocumentsPanel /> : null}
       {activeSection === "import-export" ? <ImportExportPanel /> : null}

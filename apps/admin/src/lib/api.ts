@@ -29,10 +29,10 @@ async function refreshTelegramSession(): Promise<void> {
   }
 }
 
-export async function apiFetch<T>(
+async function apiRequest(
   input: string,
   init?: RequestInit,
-): Promise<T> {
+): Promise<Response> {
   const headers = new Headers(init?.headers ?? {});
   if (init?.body !== undefined && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
@@ -54,7 +54,23 @@ export async function apiFetch<T>(
     throw new Error(await response.text());
   }
 
+  return response;
+}
+
+export async function apiFetch<T>(
+  input: string,
+  init?: RequestInit,
+): Promise<T> {
+  const response = await apiRequest(input, init);
   return response.json() as Promise<T>;
+}
+
+export async function apiFetchText(
+  input: string,
+  init?: RequestInit,
+): Promise<string> {
+  const response = await apiRequest(input, init);
+  return response.text();
 }
 
 export function devTelegramSessionPayload() {

@@ -13,6 +13,26 @@ async function readBootstrapState(page: Page) {
   });
 }
 
+async function waitForTaskRunStatus(page: Page, taskTitle: string, status: string) {
+  return expect
+    .poll(async () => page.evaluate(async ({ title }) => {
+      const [tasksResponse, runsResponse] = await Promise.all([
+        fetch("/api/tasks", { credentials: "include" }),
+        fetch("/api/task-runs", { credentials: "include" }),
+      ]);
+      const tasks = await tasksResponse.json() as Array<Record<string, unknown>>;
+      const runs = await runsResponse.json() as Array<Record<string, unknown>>;
+      const taskId = tasks.find((task) => String(task.title ?? "") === title)?.id;
+      if (!taskId) {
+        return null;
+      }
+      return runs.find((run) => String(run.taskId ?? "") === String(taskId))?.status ?? null;
+    }, { title: taskTitle }), {
+      message: `Expected task "${taskTitle}" to reach status "${status}"`,
+    })
+    .toBe(status);
+}
+
 async function openSection(page: Page, section: string, heading: string) {
   await page.getByRole("button", { name: section }).click();
   await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
@@ -259,6 +279,57 @@ test.describe("Mini App", () => {
     await page.getByRole("button", { name: "Save Memory Content" }).click();
     await expect(page.getByText("Saved")).toBeVisible();
 
+    const executorLabel = "Playwright Executor";
+    await openSection(page, "Executors", "Executors");
+    await page.getByPlaceholder("Executor label").fill(executorLabel);
+    await page.getByRole("button", { name: "Create Executor" }).click();
+    await expect(page.getByText("Executor Saved")).toBeVisible();
+    const executorCard = await cardByTitle(page, executorLabel);
+    await executorCard.getByRole("button", { name: "Pair" }).click();
+    await expect(page.locator("textarea").first()).toHaveValue(/pair\./);
+
+    const taskTitle = "Playwright Digest Task";
+    await openSection(page, "Tasks", "Tasks");
+    await page.getByPlaceholder("Task title").fill(taskTitle);
+    await page
+      .getByPlaceholder("What should this task accomplish?")
+      .fill("Summarize the imported E2E document and surface it in Sessions.");
+    const taskEditor = page.locator("section").filter({
+      has: page.getByRole("heading", { name: "Create Task" }),
+    }).first();
+    await taskEditor.locator("select").nth(0).selectOption("document_digest_memory");
+    await expect(page.getByPlaceholder("doc_xxx")).toBeVisible();
+    await page.getByPlaceholder("doc_xxx").fill(documentId);
+    await taskEditor.locator("select").nth(3).selectOption("active");
+    await page.getByRole("button", { name: "Create Task" }).click();
+    await expect(page.getByText("Task Saved")).toBeVisible();
+    const taskCard = await cardByTitle(page, taskTitle);
+    await taskCard.getByRole("button", { name: "Run" }).click();
+    await expect(page.getByRole("heading", { name: "Last Manual Run" })).toBeVisible();
+    await waitForTaskRunStatus(page, taskTitle, "completed");
+
+    const triggerLabel = "Playwright Schedule";
+    await openSection(page, "Automations", "Automations");
+    const triggerEditor = page.locator("section").filter({
+      has: page.getByRole("heading", { name: "Create Trigger" }),
+    }).first();
+    await triggerEditor.locator("select").nth(0).selectOption(`${taskTitle} · active`);
+    await page.getByPlaceholder("Trigger label").fill(triggerLabel);
+    await page.getByRole("button", { name: "Create Trigger" }).click();
+    await expect(page.getByText("Trigger Saved")).toBeVisible();
+    await expect(page.getByText(triggerLabel)).toBeVisible();
+
+    await openSection(page, "Sessions", "Sessions");
+    const taskId = await page.evaluate(async (title) => {
+      const response = await fetch("/api/tasks", { credentials: "include" });
+      const tasks = await response.json() as Array<Record<string, unknown>>;
+      return tasks.find((task) => String(task.title ?? "") === title)?.id ?? null;
+    }, taskTitle);
+    await expect(taskId).toBeTruthy();
+    await page.getByRole("button", { name: new RegExp(`${String(taskId)}.*completed`) }).click();
+    await expect(page.getByRole("heading", { name: "Selected Session" })).toBeVisible();
+    await expect(page.getByText("task_run_completed")).toBeVisible();
+
     await openSection(page, "Logs", "Logs Overview");
     await expect(page.getByRole("heading", { name: "Recent Jobs" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Recent Provider Tests" })).toBeVisible();
@@ -269,6 +340,9 @@ test.describe("Mini App", () => {
     await expect(page.getByRole("heading", { name: "Recent MCP Health" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Cloudflare Dependencies" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Telegram Webhook" })).toBeVisible();
-    await expect(page.locator("pre").last()).toContainText("\"providerProfiles\": 1");
+    const healthJson = page.locator("section").filter({
+      has: page.getByRole("heading", { name: "System Health (Raw JSON)" }),
+    }).locator("pre");
+    await expect(healthJson).toContainText("\"providerProfiles\": 1");
   });
 });

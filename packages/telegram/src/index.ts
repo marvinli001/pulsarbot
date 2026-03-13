@@ -25,12 +25,56 @@ export interface TelegramUpdateHandler {
   ): Promise<string>;
 }
 
+export interface TelegramCommandContext {
+  chatId: number;
+  threadId: number | null;
+  userId: number;
+  username?: string | undefined;
+  rawText: string;
+  args: string[];
+  messageId: number | null;
+}
+
+export interface TelegramCommandHandlers {
+  onTasks?(context: TelegramCommandContext): Promise<string | null> | string | null;
+  onApprove?(context: TelegramCommandContext): Promise<string | null> | string | null;
+  onPause?(context: TelegramCommandContext): Promise<string | null> | string | null;
+  onDigest?(context: TelegramCommandContext): Promise<string | null> | string | null;
+}
+
+export interface TelegramCallbackQueryContext {
+  chatId: number;
+  threadId: number | null;
+  userId: number;
+  username?: string | undefined;
+  data: string;
+  messageId: number | null;
+}
+
+export interface TelegramCallbackQueryResult {
+  replyText?: string | null;
+  answerText?: string | null;
+  showAlert?: boolean;
+}
+
+export type TelegramCallbackQueryHandler = (
+  context: TelegramCallbackQueryContext,
+) => Promise<TelegramCallbackQueryResult | null> | TelegramCallbackQueryResult | null;
+
 function createDisabledTelegramStreamController(): TelegramResponseStreamController {
   return {
     enabled: false,
     async emit() {},
     async finalize() {},
   };
+}
+
+function parseCommandArgs(text: string): string[] {
+  return text
+    .trim()
+    .split(/\s+/)
+    .slice(1)
+    .filter(Boolean);
 }
 
 async function resolveFileMetadata(
@@ -517,6 +561,8 @@ export function createTelegramBot(args: {
   token: string;
   onMessage: TelegramUpdateHandler;
   resolveForumTopicName?: ForumTopicNameResolver;
+  commandHandlers?: TelegramCommandHandlers;
+  onCallbackQuery?: TelegramCallbackQueryHandler;
 }) {
   const bot = new Bot(args.token);
   const implicitTopicNames = new Map<string, { effectiveMessageCount: number }>();
@@ -555,6 +601,51 @@ export function createTelegramBot(args: {
     await ctx.reply(
       "Pulsarbot is online. Open the Telegram Mini App to configure providers, skills, and MCP servers.",
     );
+  });
+
+  const dispatchCommand = async (
+    ctx: Context,
+    handler: ((context: TelegramCommandContext) => Promise<string | null> | string | null) | undefined,
+  ) => {
+    if (!handler || !ensurePrivate(ctx)) {
+      return;
+    }
+    const message = "message" in ctx && ctx.message && "text" in ctx.message
+      ? ctx.message.text
+      : "";
+    const { threadId, replyOptions } = readThreadContext(ctx.message);
+    try {
+      const response = await handler({
+        chatId: ctx.chat!.id,
+        threadId,
+        userId: ctx.from!.id,
+        username: ctx.from?.username ?? undefined,
+        rawText: message,
+        args: parseCommandArgs(message),
+        messageId: ctx.message?.message_id ?? null,
+      });
+      if (response) {
+        await ctx.reply(response, replyOptions);
+      }
+    } catch (error) {
+      await ctx.reply(
+        error instanceof Error ? error.message : "Command failed.",
+        replyOptions,
+      );
+    }
+  };
+
+  bot.command("tasks", async (ctx) => {
+    await dispatchCommand(ctx, args.commandHandlers?.onTasks);
+  });
+  bot.command("approve", async (ctx) => {
+    await dispatchCommand(ctx, args.commandHandlers?.onApprove);
+  });
+  bot.command("pause", async (ctx) => {
+    await dispatchCommand(ctx, args.commandHandlers?.onPause);
+  });
+  bot.command("digest", async (ctx) => {
+    await dispatchCommand(ctx, args.commandHandlers?.onDigest);
   });
 
   bot.on("message", async (ctx, next) => {
@@ -736,6 +827,34 @@ export function createTelegramBot(args: {
         show_alert: true,
       });
       return;
+    }
+    if (args.onCallbackQuery) {
+      try {
+        const handled = await args.onCallbackQuery({
+          chatId: ctx.chat!.id,
+          threadId: threadContext.threadId,
+          userId: ctx.from.id,
+          username: ctx.from.username ?? undefined,
+          data: ctx.callbackQuery.data,
+          messageId: ctx.callbackQuery.message?.message_id ?? null,
+        });
+        if (handled) {
+          await ctx.answerCallbackQuery({
+            show_alert: handled.showAlert ?? false,
+            ...(handled.answerText ? { text: handled.answerText } : {}),
+          });
+          if (handled.replyText) {
+            await ctx.reply(handled.replyText, threadContext.replyOptions);
+          }
+          return;
+        }
+      } catch (error) {
+        await ctx.answerCallbackQuery({
+          text: error instanceof Error ? error.message : "Callback failed",
+          show_alert: true,
+        });
+        return;
+      }
     }
     const reply = await args.onMessage(
       {

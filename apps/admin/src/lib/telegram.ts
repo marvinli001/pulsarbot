@@ -196,6 +196,11 @@ let backButtonHandler: (() => void) | null = null;
 let settingsButtonHandler: (() => void) | null = null;
 let resizeHandlerAttached = false;
 let colorSchemeMediaAttached = false;
+let telegramEventsBound = false;
+let telegramScriptRequested = false;
+
+const TELEGRAM_WEBAPP_SCRIPT_URL = "https://telegram.org/js/telegram-web-app.js";
+const TELEGRAM_WEBAPP_SCRIPT_SELECTOR = 'script[data-pulsarbot-telegram-bridge="1"]';
 
 function getPreferredColorScheme(): TelegramColorScheme {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
@@ -246,6 +251,69 @@ function normalizeInsets(value: TelegramInsets | undefined): Required<TelegramIn
 
 function getWebApp(): TelegramWebApp | null {
   return window.Telegram?.WebApp ?? null;
+}
+
+function bindTelegramWebAppEvents() {
+  const webApp = getWebApp();
+  if (!webApp || telegramEventsBound) {
+    return;
+  }
+  telegramEventsBound = true;
+  const sync = () => updateSnapshot();
+  webApp.onEvent("themeChanged", sync);
+  webApp.onEvent("viewportChanged", sync);
+  webApp.onEvent("safeAreaChanged", sync);
+  webApp.onEvent("contentSafeAreaChanged", sync);
+}
+
+function requestTelegramBridgeScript() {
+  if (
+    telegramScriptRequested ||
+    typeof window === "undefined" ||
+    typeof document === "undefined" ||
+    getWebApp()
+  ) {
+    bindTelegramWebAppEvents();
+    return;
+  }
+
+  telegramScriptRequested = true;
+  window.setTimeout(() => {
+    if (getWebApp()) {
+      bindTelegramWebAppEvents();
+      updateSnapshot();
+      return;
+    }
+
+    const existing = document.querySelector<HTMLScriptElement>(
+      TELEGRAM_WEBAPP_SCRIPT_SELECTOR,
+    );
+    if (existing) {
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = TELEGRAM_WEBAPP_SCRIPT_URL;
+    script.async = true;
+    script.defer = true;
+    script.dataset.pulsarbotTelegramBridge = "1";
+    script.addEventListener(
+      "load",
+      () => {
+        bindTelegramWebAppEvents();
+        updateSnapshot();
+      },
+      { once: true },
+    );
+    script.addEventListener(
+      "error",
+      () => {
+        updateSnapshot();
+      },
+      { once: true },
+    );
+    document.head.appendChild(script);
+  }, 0);
 }
 
 function hasRealTelegramSession(webApp: TelegramWebApp | null): boolean {
@@ -534,14 +602,11 @@ export function initTelegramMiniApp() {
   attachColorSchemeFallback();
 
   if (!webApp) {
+    requestTelegramBridgeScript();
     return;
   }
 
-  const sync = () => updateSnapshot();
-  webApp.onEvent("themeChanged", sync);
-  webApp.onEvent("viewportChanged", sync);
-  webApp.onEvent("safeAreaChanged", sync);
-  webApp.onEvent("contentSafeAreaChanged", sync);
+  bindTelegramWebAppEvents();
   updateSnapshot();
 }
 

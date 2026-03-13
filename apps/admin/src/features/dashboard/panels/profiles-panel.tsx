@@ -20,13 +20,17 @@ import {
   useTelegramMainButton,
 } from "../../../lib/telegram.js";
 import {
+  approvalPolicyOptions,
   type JsonRecord,
   CheckboxField,
   CheckboxListField,
   JsonPanel,
+  memoryPolicyOptions,
   MutationBadge,
   ResourceSelectField,
+  SelectField,
   useMarket,
+  useExecutors,
   useMcpServers,
   useProfiles,
   useProviders,
@@ -67,6 +71,7 @@ function toneForScope(scope: string): "neutral" | "warning" | "danger" {
 export function ProfilesPanel() {
   const profiles = useProfiles();
   const providers = useProviders();
+  const executors = useExecutors();
   const skillsMarket = useMarket("skills");
   const pluginsMarket = useMarket("plugins");
   const mcpServers = useMcpServers();
@@ -98,6 +103,12 @@ export function ProfilesPanel() {
     allowNetworkTools: true,
     allowWriteTools: true,
     allowMcpTools: true,
+    defaultExecutorId: "",
+    approvalPolicy: "auto_approve_safe",
+    defaultMemoryPolicy: "task_context",
+    workflowMaxSteps: "8",
+    workflowMaxActions: "6",
+    workflowTimeoutMs: "60000",
   });
 
   useEffect(() => {
@@ -163,6 +174,13 @@ export function ProfilesPanel() {
       label: `${String(server.label ?? server.id ?? "")} · ${String(server.transport ?? "unknown")}`,
       caption: String(server.description ?? ""),
     }));
+  const executorOptions = [
+    { value: "", label: "No default executor" },
+    ...(executors.data ?? []).map((executor) => ({
+      value: String(executor.id ?? ""),
+      label: `${String(executor.label ?? executor.id ?? "")} · ${String(executor.status ?? "offline")}`,
+    })),
+  ];
 
   const saveMutation = useMutation({
     mutationFn: () =>
@@ -187,6 +205,14 @@ export function ProfilesPanel() {
           allowNetworkTools: form.allowNetworkTools,
           allowWriteTools: form.allowWriteTools,
           allowMcpTools: form.allowMcpTools,
+          defaultExecutorId: form.defaultExecutorId || null,
+          approvalPolicy: form.approvalPolicy,
+          defaultMemoryPolicy: form.defaultMemoryPolicy,
+          defaultWorkflowBudget: {
+            maxSteps: Number(form.workflowMaxSteps || "8"),
+            maxActions: Number(form.workflowMaxActions || "6"),
+            timeoutMs: Number(form.workflowTimeoutMs || "60000"),
+          },
         }),
       }),
     onSuccess: async (data) => {
@@ -216,6 +242,7 @@ export function ProfilesPanel() {
   const loadProfile = (profile: JsonRecord) => {
     selectionChanged();
     setEditingId(String(profile.id ?? ""));
+    const workflowBudget = asRecord(profile.defaultWorkflowBudget);
     setForm({
       label: String(profile.label ?? ""),
       description: String(profile.description ?? ""),
@@ -241,6 +268,12 @@ export function ProfilesPanel() {
       allowNetworkTools: Boolean(profile.allowNetworkTools),
       allowWriteTools: Boolean(profile.allowWriteTools),
       allowMcpTools: Boolean(profile.allowMcpTools),
+      defaultExecutorId: String(profile.defaultExecutorId ?? ""),
+      approvalPolicy: String(profile.approvalPolicy ?? "auto_approve_safe"),
+      defaultMemoryPolicy: String(profile.defaultMemoryPolicy ?? "task_context"),
+      workflowMaxSteps: String(workflowBudget.maxSteps ?? "8"),
+      workflowMaxActions: String(workflowBudget.maxActions ?? "6"),
+      workflowTimeoutMs: String(workflowBudget.timeoutMs ?? "60000"),
     });
   };
 
@@ -318,6 +351,13 @@ export function ProfilesPanel() {
             onChange={(next) => setForm((current) => ({ ...current, embeddingModelProfileId: next }))}
             options={[{ value: "", label: "No embedding provider" }, ...providerOptions.filter((option) => option.value)]}
           />
+          <ResourceSelectField
+            label="Default Executor"
+            hint="工作流默认执行器；不影响普通 Telegram turn。"
+            value={form.defaultExecutorId}
+            onChange={(next) => setForm((current) => ({ ...current, defaultExecutorId: next }))}
+            options={executorOptions}
+          />
           <CheckboxListField
             label="Enabled Skills"
             hint="只显示已安装且已启用的 skills。"
@@ -346,6 +386,29 @@ export function ProfilesPanel() {
             <Input value={form.maxToolDurationMs} onChange={(event) => setForm((current) => ({ ...current, maxToolDurationMs: event.target.value }))} placeholder="max tool duration ms" />
             <Input value={form.compactSoftThreshold} onChange={(event) => setForm((current) => ({ ...current, compactSoftThreshold: event.target.value }))} placeholder="compact soft threshold" />
             <Input value={form.compactHardThreshold} onChange={(event) => setForm((current) => ({ ...current, compactHardThreshold: event.target.value }))} placeholder="compact hard threshold" />
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <p className="mb-2 text-sm font-medium text-slate-900">Workflow Approval Policy</p>
+              <SelectField
+                value={form.approvalPolicy}
+                onChange={(next) => setForm((current) => ({ ...current, approvalPolicy: next }))}
+                options={[...approvalPolicyOptions]}
+              />
+            </div>
+            <div>
+              <p className="mb-2 text-sm font-medium text-slate-900">Workflow Memory Policy</p>
+              <SelectField
+                value={form.defaultMemoryPolicy}
+                onChange={(next) => setForm((current) => ({ ...current, defaultMemoryPolicy: next }))}
+                options={[...memoryPolicyOptions]}
+              />
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-3">
+            <Input value={form.workflowMaxSteps} onChange={(event) => setForm((current) => ({ ...current, workflowMaxSteps: event.target.value }))} placeholder="workflow max steps" />
+            <Input value={form.workflowMaxActions} onChange={(event) => setForm((current) => ({ ...current, workflowMaxActions: event.target.value }))} placeholder="workflow max actions" />
+            <Input value={form.workflowTimeoutMs} onChange={(event) => setForm((current) => ({ ...current, workflowTimeoutMs: event.target.value }))} placeholder="workflow timeout ms" />
           </div>
           <div className="grid gap-3 md:grid-cols-2">
             <CheckboxField label="Allow Network Tools" checked={form.allowNetworkTools} onChange={(next) => setForm((current) => ({ ...current, allowNetworkTools: next }))} />
@@ -387,6 +450,12 @@ export function ProfilesPanel() {
                   allowNetworkTools: true,
                   allowWriteTools: true,
                   allowMcpTools: true,
+                  defaultExecutorId: "",
+                  approvalPolicy: "auto_approve_safe",
+                  defaultMemoryPolicy: "task_context",
+                  workflowMaxSteps: "8",
+                  workflowMaxActions: "6",
+                  workflowTimeoutMs: "60000",
                 });
               }}
             >

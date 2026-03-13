@@ -24,7 +24,7 @@ export default defineConfig({
   webServer: {
     command: `tsx tests/e2e/server.ts`,
     url: `${baseURL}/miniapp/`,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: process.env.PLAYWRIGHT_REUSE_SERVER === "1",
     timeout: 45_000,
     env: {
       PLAYWRIGHT_PORT: String(port),
