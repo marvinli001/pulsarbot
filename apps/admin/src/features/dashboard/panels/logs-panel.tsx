@@ -1,5 +1,8 @@
-import { Badge, Panel } from "@pulsarbot/ui-kit";
+import { Badge, Button, Panel } from "@pulsarbot/ui-kit";
+import { useState } from "react";
+import { notificationOccurred } from "../../../lib/telegram.js";
 import {
+  formatJson,
   JsonPanel,
   KeyValueGrid,
   useSystemAudit,
@@ -38,6 +41,107 @@ function toneForStatus(status: string): "success" | "warning" | "danger" | "neut
     return "warning";
   }
   return "neutral";
+}
+
+function triggerDownload(url: string) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.rel = "noopener";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+async function copyToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "absolute";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+function LogsJsonExportActions(args: {
+  value: unknown;
+  downloadPath: string;
+}) {
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
+
+  const handleDownload = async (format: "text" | "json") => {
+    try {
+      triggerDownload(`${args.downloadPath}?format=${format}`);
+      notificationOccurred("success");
+      setDownloadOpen(false);
+    } catch {
+      notificationOccurred("error");
+    }
+  };
+
+  const handleCopy = async (format: "text" | "json") => {
+    try {
+      const content = format === "text" ? formatJson(args.value) : JSON.stringify(args.value ?? {}, null, 2);
+      await copyToClipboard(content);
+      notificationOccurred("success");
+      setCopyOpen(false);
+    } catch {
+      notificationOccurred("error");
+    }
+  };
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      <div className="relative">
+        <Button type="button" tone="secondary" onClick={() => setDownloadOpen((open) => !open)}>
+          Download JSON as...
+        </Button>
+        {downloadOpen ? (
+          <div
+            className="absolute right-0 z-10 mt-2 grid min-w-52 gap-1 rounded-2xl border p-2 shadow-lg"
+            style={{
+              background: "var(--app-surface)",
+              borderColor: "var(--app-border)",
+            }}
+          >
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleDownload("text")}>
+              Plain text (.txt)
+            </Button>
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleDownload("json")}>
+              JSON (.json)
+            </Button>
+          </div>
+        ) : null}
+      </div>
+      <div className="relative">
+        <Button type="button" tone="ghost" onClick={() => setCopyOpen((open) => !open)}>
+          Copy JSON as...
+        </Button>
+        {copyOpen ? (
+          <div
+            className="absolute right-0 z-10 mt-2 grid min-w-44 gap-1 rounded-2xl border p-2 shadow-lg"
+            style={{
+              background: "var(--app-surface)",
+              borderColor: "var(--app-border)",
+            }}
+          >
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleCopy("text")}>
+              Plain text
+            </Button>
+            <Button type="button" tone="ghost" className="justify-start" onClick={() => void handleCopy("json")}>
+              JSON
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 export function LogsPanel() {
@@ -200,8 +304,18 @@ export function LogsPanel() {
       </Panel>
 
       <div className="grid gap-6 xl:grid-cols-[0.95fr,1.05fr]">
-        <JsonPanel title="System Logs (Raw JSON)" subtitle="保留完整输出用于深度排障。" value={logs.data ?? {}} />
-        <JsonPanel title="Audit Events (Raw JSON)" subtitle="完整审计 JSON。" value={audit.data ?? []} />
+        <JsonPanel
+          title="System Logs (Raw JSON)"
+          subtitle="保留完整输出用于深度排障。"
+          actions={<LogsJsonExportActions value={logs.data ?? {}} downloadPath="/api/system/logs/export" />}
+          value={logs.data ?? {}}
+        />
+        <JsonPanel
+          title="Audit Events (Raw JSON)"
+          subtitle="完整审计 JSON。"
+          actions={<LogsJsonExportActions value={audit.data ?? []} downloadPath="/api/system/audit/export" />}
+          value={audit.data ?? []}
+        />
       </div>
     </div>
   );

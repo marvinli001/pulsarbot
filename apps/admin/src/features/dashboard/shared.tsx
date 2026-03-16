@@ -787,7 +787,7 @@ export function JsonPanel({
   return (
     <Panel title={title} subtitle={subtitle} actions={actions}>
       <pre
-        className="overflow-x-auto rounded-2xl p-4 text-xs"
+        className="max-w-full overflow-auto whitespace-pre-wrap break-words rounded-2xl p-4 text-xs"
         style={{
           background: "var(--app-header-bg)",
           color: "var(--app-header-text)",

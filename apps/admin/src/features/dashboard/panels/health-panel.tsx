@@ -3,9 +3,9 @@ import {
   Button,
   Panel,
 } from "@pulsarbot/ui-kit";
-import { apiFetch, apiFetchText } from "../../../lib/api.js";
 import { notificationOccurred } from "../../../lib/telegram.js";
 import {
+  formatJson,
   JsonPanel,
   KeyValueGrid,
   useSystemHealth,
@@ -54,16 +54,13 @@ function toneForStatus(status: string): "success" | "warning" | "danger" | "neut
   return "neutral";
 }
 
-function downloadTextFile(filename: string, content: string, mimeType: string) {
-  const blob = new Blob([content], { type: mimeType });
-  const objectUrl = URL.createObjectURL(blob);
+function triggerDownload(url: string) {
   const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filename;
+  link.href = url;
+  link.rel = "noopener";
   document.body.append(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(objectUrl);
 }
 
 async function copyToClipboard(text: string) {
@@ -82,26 +79,13 @@ async function copyToClipboard(text: string) {
   textarea.remove();
 }
 
-function InternalLogsActions() {
+function SystemHealthExportActions({ value }: { value: unknown }) {
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [copyOpen, setCopyOpen] = useState(false);
 
-  const fetchLogsPayload = async (format: "text" | "json") => {
-    if (format === "text") {
-      return apiFetchText("/api/system/internal-logs?format=text&limit=5000");
-    }
-    const payload = await apiFetch<Record<string, unknown>>("/api/system/internal-logs?format=json&limit=5000");
-    return JSON.stringify(payload, null, 2);
-  };
-
   const handleDownload = async (format: "text" | "json") => {
     try {
-      const content = await fetchLogsPayload(format);
-      downloadTextFile(
-        `pulsarbot-internal-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.${format === "text" ? "txt" : "json"}`,
-        content,
-        format === "text" ? "text/plain;charset=utf-8" : "application/json;charset=utf-8",
-      );
+      triggerDownload(`/api/system/health/export?format=${format}`);
       notificationOccurred("success");
       setDownloadOpen(false);
     } catch {
@@ -111,7 +95,7 @@ function InternalLogsActions() {
 
   const handleCopy = async (format: "text" | "json") => {
     try {
-      const content = await fetchLogsPayload(format);
+      const content = format === "text" ? formatJson(value) : JSON.stringify(value ?? {}, null, 2);
       await copyToClipboard(content);
       notificationOccurred("success");
       setCopyOpen(false);
@@ -124,7 +108,7 @@ function InternalLogsActions() {
     <div className="flex flex-wrap gap-2">
       <div className="relative">
         <Button type="button" tone="secondary" onClick={() => setDownloadOpen((open) => !open)}>
-          Download logs as...
+          Download JSON as...
         </Button>
         {downloadOpen ? (
           <div
@@ -145,7 +129,7 @@ function InternalLogsActions() {
       </div>
       <div className="relative">
         <Button type="button" tone="ghost" onClick={() => setCopyOpen((open) => !open)}>
-          Copy logs as...
+          Copy JSON as...
         </Button>
         {copyOpen ? (
           <div
@@ -480,7 +464,7 @@ export function HealthPanel() {
       <JsonPanel
         title="System Health (Raw JSON)"
         subtitle="用于排障时查看完整原始响应。"
-        actions={<InternalLogsActions />}
+        actions={<SystemHealthExportActions value={health.data ?? {}} />}
         value={health.data ?? {}}
       />
     </div>

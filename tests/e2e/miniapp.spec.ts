@@ -336,6 +336,31 @@ test.describe("Mini App", () => {
     await expect(page.getByRole("heading", { name: "Recent Jobs" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Recent Provider Tests" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "System Logs (Raw JSON)" })).toBeVisible();
+    const systemLogsJson = page.locator("section").filter({
+      has: page.getByRole("heading", { name: "System Logs (Raw JSON)" }),
+    }).first();
+    await page.evaluate(() => {
+      Object.defineProperty(window.navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: async (text: string) => {
+            (window as Window & { __pulsarbotCopiedText?: string }).__pulsarbotCopiedText = text;
+          },
+        },
+      });
+    });
+    await expect(systemLogsJson.locator("pre")).toContainText("\"recentJobs\":");
+    await systemLogsJson.getByRole("button", { name: "Copy JSON as..." }).click();
+    await systemLogsJson.getByRole("button", { name: "Plain text" }).click();
+    await expect.poll(async () =>
+      page.evaluate(() => (window as Window & { __pulsarbotCopiedText?: string }).__pulsarbotCopiedText ?? null),
+    ).toContain("\"recentJobs\":");
+
+    const systemLogsDownloadPromise = page.waitForEvent("download");
+    await systemLogsJson.getByRole("button", { name: "Download JSON as..." }).click();
+    await systemLogsJson.getByRole("button", { name: "Plain text (.txt)" }).click();
+    const systemLogsDownload = await systemLogsDownloadPromise;
+    expect(systemLogsDownload.suggestedFilename()).toMatch(/^pulsarbot-system-logs-.*\.txt$/);
 
     await openSection(page, "Health", "System Health Overview");
     await expect(page.getByRole("heading", { name: "Document Extraction" })).toBeVisible();
@@ -344,7 +369,19 @@ test.describe("Mini App", () => {
     await expect(page.getByRole("heading", { name: "Telegram Webhook" })).toBeVisible();
     const healthJson = page.locator("section").filter({
       has: page.getByRole("heading", { name: "System Health (Raw JSON)" }),
-    }).locator("pre");
-    await expect(healthJson).toContainText("\"providerProfiles\": 1");
+    }).first();
+    const healthJsonPre = healthJson.locator("pre");
+    await expect(healthJsonPre).toContainText("\"providerProfiles\": 1");
+    await healthJson.getByRole("button", { name: "Copy JSON as..." }).click();
+    await healthJson.getByRole("button", { name: "Plain text" }).click();
+    await expect.poll(async () =>
+      page.evaluate(() => (window as Window & { __pulsarbotCopiedText?: string }).__pulsarbotCopiedText ?? null),
+    ).toContain("\"providerProfiles\": 1");
+
+    const downloadPromise = page.waitForEvent("download");
+    await healthJson.getByRole("button", { name: "Download JSON as..." }).click();
+    await healthJson.getByRole("button", { name: "Plain text (.txt)" }).click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toMatch(/^pulsarbot-system-health-.*\.txt$/);
   });
 });

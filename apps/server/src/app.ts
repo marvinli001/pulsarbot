@@ -115,6 +115,7 @@ import {
 } from "@pulsarbot/storage";
 import {
   createTelegramBot,
+  splitTelegramMessageText,
   type TelegramUpdatePayload,
 } from "@pulsarbot/telegram";
 
@@ -7199,19 +7200,25 @@ export async function createApp(
     const threadId = threadIdFromConversationId(args.conversationId);
     try {
       if (threadId === null) {
-        await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), normalizedReplyText);
+        for (const chunk of splitTelegramMessageText(normalizedReplyText)) {
+          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), chunk);
+        }
         return;
       }
 
       try {
-        await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), normalizedReplyText, {
-          message_thread_id: threadId,
-        });
+        for (const chunk of splitTelegramMessageText(normalizedReplyText)) {
+          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), chunk, {
+            message_thread_id: threadId,
+          });
+        }
         return;
       } catch {
-        await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), normalizedReplyText, {
-          direct_messages_topic_id: threadId,
-        });
+        for (const chunk of splitTelegramMessageText(normalizedReplyText)) {
+          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), chunk, {
+            direct_messages_topic_id: threadId,
+          });
+        }
       }
     } catch (error) {
       logger.warn(
@@ -7643,10 +7650,13 @@ export async function createApp(
         : undefined;
 
     try {
-      await api.sendMessage(target.chatId, lines.join("\n"), {
-        ...(target.threadId !== null ? { message_thread_id: target.threadId } : {}),
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-      });
+      const messageChunks = splitTelegramMessageText(lines.join("\n"));
+      for (const [index, chunk] of messageChunks.entries()) {
+        await api.sendMessage(target.chatId, chunk, {
+          ...(target.threadId !== null ? { message_thread_id: target.threadId } : {}),
+          ...(index === 0 && replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+      }
     } catch (error) {
       logger.warn(
         { error, taskRunId: args.taskRun.id, chatId: target.chatId },
@@ -10376,7 +10386,7 @@ export async function createApp(
     },
   );
 
-  app.get("/api/system/logs", { preHandler: requireOwner }, async () => {
+  const buildSystemLogsSnapshot = async () => {
     const servers = await state.repository.listMcpServers();
     const documents = await state.repository.listDocuments();
     const taskRuns = await state.repository.listTaskRuns({ limit: 30 });
@@ -10408,6 +10418,32 @@ export async function createApp(
       executors,
       internalLogSummary: getInternalLogSnapshot(200),
     };
+  };
+
+  app.get("/api/system/logs", { preHandler: requireOwner }, async () =>
+    buildSystemLogsSnapshot(),
+  );
+
+  app.get("/api/system/logs/export", { preHandler: requireOwner }, async (request, reply) => {
+    const query = request.query as {
+      format?: string;
+    };
+    const format = query.format === "text" ? "text" : "json";
+    const payload = await buildSystemLogsSnapshot();
+    const timestamp = nowIso().replace(/[:.]/g, "-");
+    const fileStem = `pulsarbot-system-logs-${timestamp}`;
+
+    if (format === "text") {
+      return reply
+        .header("content-disposition", `attachment; filename="${fileStem}.txt"`)
+        .type("text/plain; charset=utf-8")
+        .send(JSON.stringify(payload, null, 2));
+    }
+
+    return reply
+      .header("content-disposition", `attachment; filename="${fileStem}.json"`)
+      .type("application/json; charset=utf-8")
+      .send(payload);
   });
 
   app.get("/api/system/internal-logs", { preHandler: requireOwner }, async (request, reply) => {
@@ -10431,6 +10467,28 @@ export async function createApp(
   app.get("/api/system/audit", { preHandler: requireOwner }, async () =>
     state.repository.listAuditEvents(100),
   );
+
+  app.get("/api/system/audit/export", { preHandler: requireOwner }, async (request, reply) => {
+    const query = request.query as {
+      format?: string;
+    };
+    const format = query.format === "text" ? "text" : "json";
+    const payload = await state.repository.listAuditEvents(100);
+    const timestamp = nowIso().replace(/[:.]/g, "-");
+    const fileStem = `pulsarbot-audit-events-${timestamp}`;
+
+    if (format === "text") {
+      return reply
+        .header("content-disposition", `attachment; filename="${fileStem}.txt"`)
+        .type("text/plain; charset=utf-8")
+        .send(JSON.stringify(payload, null, 2));
+    }
+
+    return reply
+      .header("content-disposition", `attachment; filename="${fileStem}.json"`)
+      .type("application/json; charset=utf-8")
+      .send(payload);
+  });
 
   app.get(
     "/api/system/turns/:turnId/state",
@@ -10474,7 +10532,7 @@ export async function createApp(
     },
   );
 
-  app.get("/api/system/health", { preHandler: requireOwner }, async (request) => {
+  const buildSystemHealthSnapshot = async (request: FastifyRequest) => {
     const jobs = await state.repository.listJobs();
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpProviders = await state.repository.listMcpProviders();
@@ -10672,6 +10730,32 @@ export async function createApp(
       },
       cloudflare: await buildCloudflareHealth(state),
     };
+  };
+
+  app.get("/api/system/health", { preHandler: requireOwner }, async (request) =>
+    buildSystemHealthSnapshot(request),
+  );
+
+  app.get("/api/system/health/export", { preHandler: requireOwner }, async (request, reply) => {
+    const query = request.query as {
+      format?: string;
+    };
+    const format = query.format === "text" ? "text" : "json";
+    const payload = await buildSystemHealthSnapshot(request);
+    const timestamp = nowIso().replace(/[:.]/g, "-");
+    const fileStem = `pulsarbot-system-health-${timestamp}`;
+
+    if (format === "text") {
+      return reply
+        .header("content-disposition", `attachment; filename="${fileStem}.txt"`)
+        .type("text/plain; charset=utf-8")
+        .send(JSON.stringify(payload, null, 2));
+    }
+
+    return reply
+      .header("content-disposition", `attachment; filename="${fileStem}.json"`)
+      .type("application/json; charset=utf-8")
+      .send(payload);
   });
 
   app.get("/api/system/telegram-webhook", { preHandler: requireOwner }, async (request) => {

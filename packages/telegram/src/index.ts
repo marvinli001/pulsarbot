@@ -118,6 +118,71 @@ type FinalizedReplyContext = {
   replyText: string;
 };
 
+const TELEGRAM_TEXT_LIMIT = 4096;
+
+function trimLeadingWhitespace(value: string) {
+  return value.replace(/^\s+/u, "");
+}
+
+export function splitTelegramMessageText(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
+  const normalized = text.replace(/\r\n/g, "\n");
+  const characters = Array.from(normalized);
+  if (characters.length <= limit) {
+    return normalized.trim().length > 0 ? [normalized] : [];
+  }
+
+  const chunks: string[] = [];
+  let cursor = 0;
+
+  while (cursor < characters.length) {
+    let end = Math.min(cursor + limit, characters.length);
+    if (end < characters.length) {
+      const candidate = characters.slice(cursor, end).join("");
+      const breakpoints = [
+        candidate.lastIndexOf("\n\n"),
+        candidate.lastIndexOf("\n"),
+        candidate.lastIndexOf(" "),
+      ].filter((index) => index >= Math.floor(limit * 0.6));
+      if (breakpoints.length > 0) {
+        end = cursor + Math.max(...breakpoints) + 1;
+      }
+    }
+
+    const chunk = characters.slice(cursor, end).join("");
+    if (chunk.trim().length > 0) {
+      chunks.push(chunk);
+    }
+    cursor = end;
+  }
+
+  return chunks.length > 0 ? chunks : [normalized];
+}
+
+function previewTelegramStreamText(text: string) {
+  const chunks = splitTelegramMessageText(text);
+  const firstChunk = chunks[0] ?? "";
+  if (chunks.length <= 1) {
+    return firstChunk;
+  }
+  const previewCharacters = Array.from(firstChunk);
+  if (previewCharacters.length >= TELEGRAM_TEXT_LIMIT) {
+    return `${previewCharacters.slice(0, TELEGRAM_TEXT_LIMIT - 1).join("")}…`;
+  }
+  return `${trimLeadingWhitespace(firstChunk)}\n…`;
+}
+
+async function replyWithTelegramText(
+  ctx: Context,
+  text: string,
+  replyOptions?: ThreadReplyOptions,
+) {
+  const messages: Array<{ message_id: number }> = [];
+  for (const chunk of splitTelegramMessageText(text)) {
+    messages.push(await ctx.reply(chunk, replyOptions));
+  }
+  return messages;
+}
+
 type ForumTopicNameResolver = (
   context: FinalizedReplyContext,
 ) => Promise<string | null> | string | null;
@@ -465,15 +530,19 @@ export function createTelegramStreamController(args: {
     if (closed || !latestText) {
       return true;
     }
-    if (streamedMessageId !== null && latestText === lastRenderedText) {
+    const nextRenderedText = previewTelegramStreamText(latestText);
+    if (!nextRenderedText) {
+      return true;
+    }
+    if (streamedMessageId !== null && nextRenderedText === lastRenderedText) {
       return true;
     }
 
     try {
       if (streamedMessageId === null) {
-        const message = await args.ctx.reply(latestText, args.replyOptions);
+        const message = await args.ctx.reply(nextRenderedText, args.replyOptions);
         streamedMessageId = message.message_id;
-        lastRenderedText = latestText;
+        lastRenderedText = nextRenderedText;
         lastFlushAt = Date.now();
         return true;
       }
@@ -483,9 +552,9 @@ export function createTelegramStreamController(args: {
       await args.ctx.api.editMessageText(
         args.ctx.chat!.id,
         streamedMessageId,
-        latestText,
+        nextRenderedText,
       );
-      lastRenderedText = latestText;
+      lastRenderedText = nextRenderedText;
       lastFlushAt = Date.now();
       editCount += 1;
       return true;
@@ -531,6 +600,34 @@ export function createTelegramStreamController(args: {
       }
       latestText = finalText || latestText;
       if (!latestText) {
+        closed = true;
+        return;
+      }
+      const finalChunks = splitTelegramMessageText(latestText);
+      if (finalChunks.length > 1) {
+        const firstChunk = finalChunks[0] ?? "";
+        try {
+          if (streamedMessageId === null) {
+            const message = await args.ctx.reply(firstChunk, args.replyOptions);
+            streamedMessageId = message.message_id;
+          } else {
+            await args.ctx.api.editMessageText(
+              args.ctx.chat!.id,
+              streamedMessageId,
+              firstChunk,
+            );
+          }
+          lastRenderedText = firstChunk;
+          for (const chunk of finalChunks.slice(1)) {
+            await args.ctx.reply(chunk, args.replyOptions);
+          }
+        } catch {
+          try {
+            await replyWithTelegramText(args.ctx, latestText, args.replyOptions);
+          } catch {
+            // Do not throw from finalize if Telegram rejects fallback send.
+          }
+        }
         closed = true;
         return;
       }
@@ -598,7 +695,8 @@ export function createTelegramBot(args: {
   });
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(
+    await replyWithTelegramText(
+      ctx,
       "Pulsarbot is online. Open the Telegram Mini App to configure providers, skills, and MCP servers.",
     );
   });
@@ -625,10 +723,11 @@ export function createTelegramBot(args: {
         messageId: ctx.message?.message_id ?? null,
       });
       if (response) {
-        await ctx.reply(response, replyOptions);
+        await replyWithTelegramText(ctx, response, replyOptions);
       }
     } catch (error) {
-      await ctx.reply(
+      await replyWithTelegramText(
+        ctx,
         error instanceof Error ? error.message : "Command failed.",
         replyOptions,
       );
@@ -844,7 +943,7 @@ export function createTelegramBot(args: {
             ...(handled.answerText ? { text: handled.answerText } : {}),
           });
           if (handled.replyText) {
-            await ctx.reply(handled.replyText, threadContext.replyOptions);
+            await replyWithTelegramText(ctx, handled.replyText, threadContext.replyOptions);
           }
           return;
         }
@@ -875,7 +974,7 @@ export function createTelegramBot(args: {
       createDisabledTelegramStreamController(),
     );
     await ctx.answerCallbackQuery();
-    await ctx.reply(reply, threadContext.replyOptions);
+    await replyWithTelegramText(ctx, reply, threadContext.replyOptions);
   });
 
   bot.on("my_chat_member", async (ctx) => {

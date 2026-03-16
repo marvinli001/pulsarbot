@@ -5,6 +5,7 @@ import {
   createTelegramStreamController,
   getImplicitForumTopicThreadId,
   isForumTopicServiceMessage,
+  splitTelegramMessageText,
 } from "../packages/telegram/src/index.js";
 
 afterEach(() => {
@@ -71,6 +72,36 @@ describe("Telegram streaming controller", () => {
     expect(reply).toHaveBeenCalledTimes(2);
     expect(reply).toHaveBeenLastCalledWith("hello", undefined);
   });
+
+  it("splits oversized final replies into multiple Telegram messages", async () => {
+    vi.useFakeTimers();
+    const reply = vi.fn(async () => ({ message_id: 7 }));
+    const editMessageText = vi.fn(async () => true);
+    const controller = createTelegramStreamController({
+      ctx: {
+        chat: { id: 42 },
+        msg: { message_id: 99 },
+        reply,
+        api: {
+          editMessageText,
+        },
+      } as never,
+    });
+
+    const longReply = Array.from({ length: 120 }, (_, index) => `Line ${index + 1}: ${"x".repeat(48)}`).join("\n");
+
+    await controller.emit("working");
+    await vi.advanceTimersByTimeAsync(800);
+    await controller.finalize(longReply);
+
+    const expectedChunks = splitTelegramMessageText(longReply);
+    expect(expectedChunks.length).toBeGreaterThan(1);
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    expect(editMessageText).toHaveBeenLastCalledWith(42, 7, expectedChunks[0]);
+    expect(reply).toHaveBeenCalledTimes(expectedChunks.length);
+    expect(reply.mock.calls.slice(1).map((call) => call[0])).toEqual(expectedChunks.slice(1));
+    expect(expectedChunks.every((chunk) => Array.from(chunk).length <= 4096)).toBe(true);
+  });
 });
 
 describe("Telegram service message filters", () => {
@@ -118,6 +149,17 @@ describe("Telegram service message filters", () => {
     expect(buildForumTopicNameFromReply("  hello\n\nworld  ")).toBe("helloworld");
     expect(buildForumTopicNameFromReply("   ")).toBeNull();
     expect(buildForumTopicNameFromReply("a".repeat(140))).toHaveLength(10);
+  });
+
+  it("splits long Telegram text on natural boundaries", () => {
+    const chunks = splitTelegramMessageText([
+      "第一段".repeat(400),
+      "Second paragraph ".repeat(200),
+      "tail",
+    ].join("\n\n"));
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => Array.from(chunk).length <= 4096)).toBe(true);
+    expect(chunks.join("\n")).toContain("tail");
   });
 
   it("renames implicit forum topic after enough threaded messages accumulate", async () => {
