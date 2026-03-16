@@ -15,7 +15,7 @@ afterEach(() => {
 describe("Telegram streaming controller", () => {
   it("creates a streamed reply, throttles edits, and finalizes with the last edit", async () => {
     vi.useFakeTimers();
-    const reply = vi.fn(async () => ({ message_id: 7 }));
+    const reply = vi.fn(async (_text: string, _options?: unknown) => ({ message_id: 7 }));
     const editMessageText = vi.fn(async () => true);
     const controller = createTelegramStreamController({
       ctx: {
@@ -49,7 +49,7 @@ describe("Telegram streaming controller", () => {
 
   it("falls back to sending a fresh reply when editMessageText is rejected", async () => {
     vi.useFakeTimers();
-    const reply = vi.fn(async () => ({ message_id: 7 }));
+    const reply = vi.fn(async (_text: string, _options?: unknown) => ({ message_id: 7 }));
     const editMessageText = vi.fn(async () => {
       throw new Error("send failed");
     });
@@ -75,7 +75,7 @@ describe("Telegram streaming controller", () => {
 
   it("splits oversized final replies into multiple Telegram messages", async () => {
     vi.useFakeTimers();
-    const reply = vi.fn(async () => ({ message_id: 7 }));
+    const reply = vi.fn(async (_text: string, _options?: unknown) => ({ message_id: 7 }));
     const editMessageText = vi.fn(async () => true);
     const controller = createTelegramStreamController({
       ctx: {

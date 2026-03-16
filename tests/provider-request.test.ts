@@ -4,6 +4,7 @@ import {
   createProviderRequestPreview,
   getProviderAdapter,
   invokeProvider,
+  invokeProviderStream,
   supportsProviderCapability,
 } from "../packages/providers/src/index.js";
 import type { ProviderProfile } from "../packages/shared/src/index.js";
@@ -169,6 +170,40 @@ describe("provider request preview", () => {
 
     await expectation;
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers missing tail text from streaming snapshot events", async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"output_text":"Hello world"}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const chunks: string[] = [];
+    for await (const chunk of invokeProviderStream({
+      profile: profile("bailian", {
+        stream: true,
+      }),
+      apiKey: "sk-test",
+      input: {
+        messages: [{ role: "user", content: "Hello" }],
+      },
+    })) {
+      chunks.push(chunk.accumulated);
+    }
+
+    expect(chunks).toEqual(["Hello", "Hello world"]);
   });
 
   it("builds an Anthropic payload with thinking enabled", () => {

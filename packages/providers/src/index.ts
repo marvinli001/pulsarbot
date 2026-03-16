@@ -2887,14 +2887,27 @@ export async function* invokeProviderStream(args: {
       continue;
     }
     const delta = streamDeltaForProvider(args.profile.kind, payload);
-    if (!delta) {
+    if (delta) {
+      accumulated += delta;
+      yield {
+        delta,
+        accumulated,
+      };
       continue;
     }
-    accumulated += delta;
-    yield {
-      delta,
-      accumulated,
-    };
+    const snapshotText = parseProviderTextPayload(payload);
+    if (
+      snapshotText &&
+      snapshotText.length > accumulated.length &&
+      snapshotText.startsWith(accumulated)
+    ) {
+      const snapshotDelta = snapshotText.slice(accumulated.length);
+      accumulated = snapshotText;
+      yield {
+        delta: snapshotDelta,
+        accumulated,
+      };
+    }
   }
 }
 
