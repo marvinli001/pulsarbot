@@ -86,51 +86,53 @@ async function ensureMarketItemEnabled(page: Page, title: string) {
 test.describe("Mini App", () => {
   test("bootstraps the workspace and previews the runtime on mobile", async ({ page }) => {
     await page.goto("/miniapp/");
+    const bootstrapHeading = page.getByRole("heading", { name: "Workspace Bootstrap" });
+    if (await bootstrapHeading.isVisible({ timeout: 1_000 }).catch(() => false)) {
+      await page.getByPlaceholder("PULSARBOT_ACCESS_TOKEN").fill("dev-access-token");
+      await page.getByRole("button", { name: "Verify Access Token" }).click();
+      await expect
+        .poll(async () => {
+          const workspace = await readBootstrapState(page);
+          return Boolean(workspace.bootstrapState?.verified);
+        })
+        .toBe(true);
 
-    await expect(
-      page.getByRole("heading", { name: "Workspace Bootstrap" }),
-    ).toBeVisible();
+      await page.getByRole("button", { name: "Bind Current Telegram User as Owner" }).click();
+      await expect
+        .poll(async () => {
+          const workspace = await readBootstrapState(page);
+          return Boolean(workspace.bootstrapState?.ownerBound);
+        })
+        .toBe(true);
 
-    await page.getByPlaceholder("PULSARBOT_ACCESS_TOKEN").fill("dev-access-token");
-    await page.getByRole("button", { name: "Verify Access Token" }).click();
-    await expect
-      .poll(async () => {
-        const workspace = await readBootstrapState(page);
-        return Boolean(workspace.bootstrapState?.verified);
-      })
-      .toBe(true);
+      await page.getByRole("button", { name: "API Token" }).click();
+      await page.getByPlaceholder("Cloudflare Account ID").fill("test-account");
+      await page.getByPlaceholder("Cloudflare API Token").fill("test-token");
+      await page.getByPlaceholder("R2 Access Key ID (recommended)").fill("local-key");
+      await page
+        .getByPlaceholder("R2 Secret Access Key (recommended)")
+        .fill("local-secret");
+      await page.getByRole("button", { name: "Connect Cloudflare" }).click();
+      await expect
+        .poll(async () => {
+          const workspace = await readBootstrapState(page);
+          return Boolean(workspace.bootstrapState?.cloudflareConnected);
+        })
+        .toBe(true);
+      await expect(page.getByText("Resources synced")).toBeVisible();
 
-    await page.getByRole("button", { name: "Bind Current Telegram User as Owner" }).click();
-    await expect
-      .poll(async () => {
-        const workspace = await readBootstrapState(page);
-        return Boolean(workspace.bootstrapState?.ownerBound);
-      })
-      .toBe(true);
-
-    await page.getByRole("button", { name: "API Token" }).click();
-    await page.getByPlaceholder("Cloudflare Account ID").fill("test-account");
-    await page.getByPlaceholder("Cloudflare API Token").fill("test-token");
-    await page.getByPlaceholder("R2 Access Key ID (recommended)").fill("local-key");
-    await page
-      .getByPlaceholder("R2 Secret Access Key (recommended)")
-      .fill("local-secret");
-    await page.getByRole("button", { name: "Connect Cloudflare" }).click();
-    await expect
-      .poll(async () => {
-        const workspace = await readBootstrapState(page);
-        return Boolean(workspace.bootstrapState?.cloudflareConnected);
-      })
-      .toBe(true);
-    await expect(page.getByText("Resources synced")).toBeVisible();
-
-    await page.getByRole("button", { name: "Initialize New Workspace" }).click();
-    await expect
-      .poll(async () => {
-        const workspace = await readBootstrapState(page);
-        return Boolean(workspace.bootstrapState?.resourcesInitialized);
-      })
-      .toBe(true);
+      await page.getByRole("button", { name: "Initialize New Workspace" }).click();
+      await expect
+        .poll(async () => {
+          const workspace = await readBootstrapState(page);
+          return Boolean(workspace.bootstrapState?.resourcesInitialized);
+        })
+        .toBe(true);
+    } else {
+      await expect(
+        page.getByRole("heading", { name: "Pulsarbot Control Center" }),
+      ).toBeVisible();
+    }
 
     await page.getByRole("button", { name: "Providers" }).click();
     await expect(
@@ -297,10 +299,10 @@ test.describe("Mini App", () => {
     const taskEditor = page.locator("section").filter({
       has: page.getByRole("heading", { name: "Create Task" }),
     }).first();
-    await taskEditor.locator("select").nth(0).selectOption("document_digest_memory");
+    await taskEditor.getByLabel("Task template").selectOption("document_digest_memory");
     await expect(page.getByPlaceholder("doc_xxx")).toBeVisible();
     await page.getByPlaceholder("doc_xxx").fill(documentId);
-    await taskEditor.locator("select").nth(3).selectOption("active");
+    await taskEditor.getByLabel("Task status").selectOption("active");
     await page.getByRole("button", { name: "Create Task" }).click();
     await expect(page.getByText("Task Saved")).toBeVisible();
     const taskCard = await cardByTitle(page, taskTitle);

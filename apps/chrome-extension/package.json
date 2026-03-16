@@ -1,0 +1,10 @@
+{
+  "name": "@pulsarbot/chrome-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsup src/service-worker.ts src/popup.ts src/options.ts --format esm --target es2022 --out-dir dist && tsup src/content-script.ts --format iife --target es2022 --out-dir dist --global-name PulsarbotContentScript --no-splitting && node ./scripts/copy-static.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

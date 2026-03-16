@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Pulsarbot Chrome Executor",
+  "version": "0.1.0",
+  "description": "Browser-side executor for Pulsarbot task runs.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Pulsarbot Executor",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

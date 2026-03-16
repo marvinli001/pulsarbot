@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pulsarbot Executor Options</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        background: #f8fafc;
+        color: #0f172a;
+      }
+      main {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 32px 20px 48px;
+        display: grid;
+        gap: 20px;
+      }
+      h1, h2 {
+        margin: 0;
+      }
+      p, li {
+        color: #475569;
+        line-height: 1.6;
+      }
+      section {
+        border-radius: 20px;
+        padding: 20px;
+        background: #fff;
+        border: 1px solid #e2e8f0;
+      }
+      pre {
+        margin: 0;
+        padding: 14px;
+        border-radius: 16px;
+        background: #0f172a;
+        color: #e2e8f0;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>Pulsarbot Chrome Extension Executor</h1>
+        <p>Use a dedicated Chrome profile when possible. Pairing is short-lived, and attach is always explicit.</p>
+      </section>
+      <section>
+        <h2>Recommended Flow</h2>
+        <ol>
+          <li>Build the repo and load this extension unpacked from <code>apps/chrome-extension/dist</code>.</li>
+          <li>Create a <code>Chrome Extension</code> executor in Pulsarbot.</li>
+          <li>Pair in the popup, then click <code>Attach Current Window</code> while the target browser window is focused.</li>
+          <li>Keep that attached window on the site whose login state you want the agent to use.</li>
+        </ol>
+      </section>
+      <section>
+        <h2>Current State</h2>
+        <pre id="stateView">{}</pre>
+      </section>
+    </main>
+    <script type="module" src="./options.js"></script>
+  </body>
+</html>

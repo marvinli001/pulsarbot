@@ -73,6 +73,7 @@ npm exec --yes pnpm@10.6.3 --filter @pulsarbot/admin dev
   - import/export 恢复
 - 端到端测试
   - Playwright Mini App 流程
+  - Chrome extension executor 配对、attach、browser workflow 和 artifact 回传
 
 ## 什么时候跑哪些检查
 
@@ -149,6 +150,12 @@ export DATA_DIR="./data"
 - `GET /api/system/turns/:turnId/state`
 - `GET /api/system/turns/:turnId/events`
 
+如果问题涉及 executor，再额外检查：
+
+- `Executors` 面板里的在线状态
+- Chrome extension 的 `attach state / origin / profile label`
+- `Sessions` 中的 `executor_log`
+
 ## 多模态与后台作业
 
 文档、语音、图片等链路依赖 job 系统。出现抽取失败或状态异常时，建议顺序如下：
@@ -185,3 +192,5 @@ export DATA_DIR="./data"
 - 只启动 `apps/admin` 并不能覆盖完整业务联调。
 - 没有挂载 `/data` 时，运行目录内的数据不具备持久性。
 - 在生产环境只设置域名还不够，Telegram webhook 仍需要确认是否已成功同步。
+- Chrome extension executor 不是云服务，不需要部署到 Railway。
+- `cloud_browser` 当前只是预留 kind，不代表已经有可上线的托管浏览器执行面。

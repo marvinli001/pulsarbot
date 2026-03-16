@@ -8,7 +8,7 @@
 
 - 让 owner 能从 Telegram 或 Mini App 创建和运行任务
 - 用统一的 task runtime 复用现有 turn state / turn event 观测链路
-- 把高权限执行收口到 owner 自控的 `companion` 节点
+- 让云端 control plane 统一调度 owner 自控的浏览器侧和本地侧执行端
 - 在 Telegram-first 产品表达下提供 schedule、webhook、manual 和 `/digest` 快捷入口
 
 当前明确的边界是：
@@ -30,7 +30,7 @@
 - `ApprovalRequest`
   - 描述 owner 审批动作
 - `ExecutorNode`
-  - 描述一个可接任务的 companion 执行器
+  - 描述一个可接任务的执行器节点，当前包括 `chrome_extension` 和 `companion`
 
 这些对象的 schema 位于 `packages/shared/src/index.ts`，持久化实现位于 `packages/storage/src/index.ts`。
 
@@ -133,7 +133,40 @@ Mini App 的 `Tasks` 面板会调用 `/api/workflow/preview`，preview 当前会
 
 这不是纯静态检查，而是一次不落库的 stage-run 预演，因此比单纯展示模板默认值更接近真实行为。
 
-## Companion Executor
+## Executor Kinds
+
+当前 executor kind 分为三类：
+
+- `chrome_extension`
+  - 已实现
+  - browser-only
+  - 通过 explicit `attach / detach` 绑定 owner 当前浏览器窗口
+- `companion`
+  - 已实现
+  - 本地高权限执行器
+- `cloud_browser`
+  - 只存在于统一 schema 和调度模型中
+  - 当前没有可用执行后端
+
+### Chrome Extension Executor
+
+`apps/chrome-extension` 当前支持：
+
+- `browser`
+
+约束与语义：
+
+- 只能执行浏览器步骤
+- 需要显式 pairing
+- 需要显式 `attach / detach`
+- 用 `allowedHosts` 做 host allowlist
+- 每次 assignment 自动产出：
+  - `DOM Snapshot`
+  - `Screenshot`
+  - `Final URL`
+  - 可选 `Extracted Text`
+
+### Native Companion
 
 `apps/companion` 当前支持四类 capability：
 
@@ -151,14 +184,14 @@ Mini App 的 `Tasks` 面板会调用 `/api/workflow/preview`，preview 当前会
 
 日志约定：
 
-- companion 在本地执行 assignment 时会产出细粒度结构化日志
+- executor 在本地执行 assignment 时会产出细粒度结构化日志
 - heartbeat payload 可带两类日志：
-  - `companionLogs`: 进程级和 heartbeat 级日志
+  - `executorLogs`: 进程级和 heartbeat 级日志
   - `completedRuns[].logs`: 单次 assignment 执行日志
 - server 接收后会做两次写入：
   - 追加到对应 task session 的 timeline，事件类型为 `executor_log`
   - 进入 internal log ring buffer，供 Health 页导出 `json` 或 `text`
-- 当前 companion v1 已覆盖：
+- 当前 executor 侧日志已经覆盖：
   - `http_request_started/completed`
   - `browser_session_started`
   - `browser_step_started/completed`
@@ -203,7 +236,7 @@ Mini App 的 `Tasks` 面板会调用 `/api/workflow/preview`，preview 当前会
 - `Sessions`
   - 查看 task run、approval 和 session timeline
 - `Executors`
-  - 管理 companion executor、pairing、scope 和最近运行
+  - 管理 chrome extension / companion executor、pairing、scope、attach state 和最近运行
 
 ## 当前约束与下一步
 

@@ -47,6 +47,25 @@ function requiresExecutor(task: Task): boolean {
   return requiredCapabilitiesForTask(task).length > 0;
 }
 
+function isHostAllowed(rawUrl: string, allowedHosts: string[]): boolean {
+  if (allowedHosts.length === 0) {
+    return false;
+  }
+  const url = new URL(rawUrl);
+  const hostname = url.hostname.toLowerCase();
+  return allowedHosts.some((pattern) => {
+    const normalized = pattern.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+    if (normalized.startsWith("*.")) {
+      const suffix = normalized.slice(1);
+      return hostname.endsWith(suffix);
+    }
+    return hostname === normalized;
+  });
+}
+
 function hasTaskCheckpoint(
   task: Task,
   checkpoint: WorkflowApprovalCheckpoint,
@@ -74,6 +93,48 @@ function taskWillWriteMemory(task: Task): boolean {
     return task.config.writebackSummary !== false;
   }
   return true;
+}
+
+function chromeExtensionReady(executor: ExecutorNode): {
+  ready: boolean;
+  reason: string;
+} {
+  if (executor.kind !== "chrome_extension") {
+    return {
+      ready: true,
+      reason: "",
+    };
+  }
+  if (executor.browserAttachment.state !== "attached") {
+    return {
+      ready: false,
+      reason: "Chrome extension executor is not attached to a browser window",
+    };
+  }
+  const origin = executor.browserAttachment.origin;
+  if (!origin) {
+    return {
+      ready: false,
+      reason: "Chrome extension executor does not have an attached browser origin",
+    };
+  }
+  try {
+    if (!isHostAllowed(origin, executor.scopes.allowedHosts)) {
+      return {
+        ready: false,
+        reason: "Chrome extension executor is attached to a tab outside the allowed hosts",
+      };
+    }
+  } catch {
+    return {
+      ready: false,
+      reason: "Chrome extension executor reported an invalid attached browser origin",
+    };
+  }
+  return {
+    ready: true,
+    reason: "",
+  };
 }
 
 function resolveApprovalRequirement(args: {
@@ -252,6 +313,15 @@ export class TaskRuntime {
                 `Executor is missing required capabilities: ${missingCapabilities.join(", ")}`;
               args.state.taskRun.updatedAt = args.context.now;
               return "finalize";
+            }
+            if (args.state.requiredCapabilities.includes("browser")) {
+              const browserReady = chromeExtensionReady(args.state.executor);
+              if (!browserReady.ready) {
+                args.state.taskRun.status = "waiting_retry";
+                args.state.taskRun.error = browserReady.reason;
+                args.state.taskRun.updatedAt = args.context.now;
+                return "finalize";
+              }
             }
             return "evaluate_approval";
           },

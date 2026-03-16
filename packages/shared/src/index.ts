@@ -83,7 +83,11 @@ export const ApprovalRequestStatusSchema = z.enum([
   "expired",
   "cancelled",
 ]);
-export const ExecutorKindSchema = z.enum(["companion"]);
+export const ExecutorKindSchema = z.enum([
+  "companion",
+  "chrome_extension",
+  "cloud_browser",
+]);
 export const ExecutorStatusSchema = z.enum([
   "offline",
   "pending_pairing",
@@ -349,6 +353,26 @@ export const ExecutorScopeSchema = z.object({
   shellRequiresApproval: z.boolean().default(true),
 });
 
+export const BrowserAttachmentStateSchema = z.enum(["detached", "attached"]);
+export const BrowserAttachmentModeSchema = z.enum(["single_window"]);
+
+export const BrowserAttachmentSchema = z.object({
+  state: BrowserAttachmentStateSchema.default("detached"),
+  mode: BrowserAttachmentModeSchema.default("single_window"),
+  windowId: z.number().int().nullable().default(null),
+  tabId: z.number().int().nullable().default(null),
+  url: z.string().nullable().default(null),
+  origin: z.string().nullable().default(null),
+  title: z.string().nullable().default(null),
+  attachedAt: z.string().nullable().default(null),
+  detachedAt: z.string().nullable().default(null),
+  lastSnapshotAt: z.string().nullable().default(null),
+  extensionInstanceId: z.string().nullable().default(null),
+  browserName: z.string().nullable().default(null),
+  browserVersion: z.string().nullable().default(null),
+  profileLabel: z.string().nullable().default(null),
+});
+
 export const ExecutorNodeSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
@@ -366,6 +390,22 @@ export const ExecutorNodeSchema = z.object({
     shellRequiresApproval: true,
   }),
   metadata: LooseRecordSchema.default({}),
+  browserAttachment: BrowserAttachmentSchema.default({
+    state: "detached",
+    mode: "single_window",
+    windowId: null,
+    tabId: null,
+    url: null,
+    origin: null,
+    title: null,
+    attachedAt: null,
+    detachedAt: null,
+    lastSnapshotAt: null,
+    extensionInstanceId: null,
+    browserName: null,
+    browserVersion: null,
+    profileLabel: null,
+  }),
   pairingCodeHash: z.string().nullable().default(null),
   executorTokenHash: z.string().nullable().default(null),
   pairingIssuedAt: z.string().nullable().default(null),
@@ -1142,6 +1182,8 @@ export type ApprovalRequestStatus = z.infer<typeof ApprovalRequestStatusSchema>;
 export type ExecutorKind = z.infer<typeof ExecutorKindSchema>;
 export type ExecutorStatus = z.infer<typeof ExecutorStatusSchema>;
 export type ExecutorCapability = z.infer<typeof ExecutorCapabilitySchema>;
+export type BrowserAttachmentState = z.infer<typeof BrowserAttachmentStateSchema>;
+export type BrowserAttachmentMode = z.infer<typeof BrowserAttachmentModeSchema>;
 export type TurnApprovalState = z.infer<typeof TurnApprovalStateSchema>;
 export type Workspace = z.infer<typeof WorkspaceSchema>;
 export type BootstrapState = z.infer<typeof BootstrapStateSchema>;
@@ -1158,6 +1200,7 @@ export type McpProviderConfig = z.infer<typeof McpProviderConfigSchema>;
 export type SearchSettings = z.infer<typeof SearchSettingsSchema>;
 export type WorkflowBudget = z.infer<typeof WorkflowBudgetSchema>;
 export type ExecutorScope = z.infer<typeof ExecutorScopeSchema>;
+export type BrowserAttachment = z.infer<typeof BrowserAttachmentSchema>;
 export type ExecutorNode = z.infer<typeof ExecutorNodeSchema>;
 export type Task = z.infer<typeof TaskSchema>;
 export type Trigger = z.infer<typeof TriggerSchema>;

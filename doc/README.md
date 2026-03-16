@@ -45,7 +45,7 @@
 - [miniapp-guide.md](miniapp-guide.md)
   - Telegram Mini App 管理台的使用顺序、面板职责和典型操作。
 - [automation-control-plane.md](automation-control-plane.md)
-  - Tasks、Task Runs、Triggers、Approvals、Executors、workflow templates 和 companion 的设计说明。
+  - Tasks、Task Runs、Triggers、Approvals、Executors、workflow templates，以及 Chrome extension / companion 执行端的设计说明。
 - [development-and-ops.md](development-and-ops.md)
   - 开发命令、测试建议、运维入口、数据目录和发布前检查。
 - [api-overview.md](api-overview.md)

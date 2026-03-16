@@ -178,7 +178,7 @@ export function ProfilesPanel() {
     { value: "", label: "No default executor" },
     ...(executors.data ?? []).map((executor) => ({
       value: String(executor.id ?? ""),
-      label: `${String(executor.label ?? executor.id ?? "")} · ${String(executor.status ?? "offline")}`,
+      label: `${String(executor.label ?? executor.id ?? "")} · ${String(executor.kind ?? "companion")} · ${String(executor.status ?? "offline")}${executor.kind === "chrome_extension" ? ` · ${String((executor.browserAttachment as Record<string, unknown> | undefined)?.state ?? "detached")}` : ""}`,
     })),
   ];
 

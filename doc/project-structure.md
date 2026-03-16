@@ -7,6 +7,8 @@ Pulsarbot 当前是一个 `pnpm workspace + Turbo` monorepo。它的设计目标
 ```text
 apps/
   admin/    React + Vite 的 Telegram Mini App
+  chrome-extension/  MV3 browser-only executor
+  companion/         owner 自控的本地高权限执行器
   server/   Fastify 服务端，负责 API、Webhook、静态资源与后台作业
 
 packages/
@@ -41,12 +43,14 @@ tests/
 
 ## 运行时拓扑
 
-推荐部署时，系统由一个公开服务承载：
+推荐部署时，系统由一个云端中枢和零到两个 owner 本地执行端组成：
 
 1. Telegram 把更新推送到 `POST /telegram/webhook`
-2. `apps/server` 负责会话、权限、运行时装配和消息处理
+2. `apps/server` 负责会话、权限、运行时装配、task runtime 和消息处理
 3. `apps/server` 同时暴露 `/api/*` 管理接口与 `/miniapp/` 静态页面
-4. `apps/admin` 只是前端构建产物来源，不单独对外提供业务 API
+4. `apps/chrome-extension` 可作为浏览器侧 executor 接入同一 control plane
+5. `apps/companion` 可作为本地高权限 executor 接入同一 control plane
+6. `apps/admin` 只是前端构建产物来源，不单独对外提供业务 API
 
 这就是为什么 Railway 场景下推荐只保留 `@pulsarbot/server`。
 

@@ -224,4 +224,109 @@ describe("TaskRuntime", () => {
     expect(result.taskRun.status).toBe("queued");
     expect(result.approval).toBeNull();
   });
+
+  it("moves browser workflows to waiting_retry when a chrome extension executor is detached", async () => {
+    const runtime = new TaskRuntime();
+    const task = TaskSchema.parse({
+      id: "task-browser-detached",
+      workspaceId: "main",
+      title: "Browser Task",
+      goal: "Open a page in a logged-in browser tab.",
+      templateKind: "browser_workflow",
+      status: "active",
+      defaultExecutorId: "executor-browser",
+      approvalPolicy: "auto_approve_safe",
+      approvalCheckpoints: [],
+      memoryPolicy: "chat_only",
+      createdAt: "2026-03-13T00:00:00.000Z",
+      updatedAt: "2026-03-13T00:00:00.000Z",
+    });
+    const executor = ExecutorNodeSchema.parse({
+      id: "executor-browser",
+      workspaceId: "main",
+      label: "Chrome Executor",
+      kind: "chrome_extension",
+      status: "online",
+      capabilities: ["browser"],
+      scopes: {
+        allowedHosts: ["example.com"],
+        allowedPaths: [],
+        allowedCommands: [],
+        fsRequiresApproval: true,
+        shellRequiresApproval: true,
+      },
+      browserAttachment: {
+        state: "detached",
+        mode: "single_window",
+      },
+      createdAt: "2026-03-13T00:00:00.000Z",
+      updatedAt: "2026-03-13T00:00:00.000Z",
+    });
+
+    const result = await runtime.stageRun({
+      workspaceId: "main",
+      task,
+      executor,
+      triggerType: "manual",
+      now: "2026-03-13T00:00:01.000Z",
+    });
+
+    expect(result.taskRun.status).toBe("waiting_retry");
+    expect(result.taskRun.error).toContain("not attached");
+  });
+
+  it("moves browser workflows to waiting_retry when a chrome extension executor is attached outside the allowlist", async () => {
+    const runtime = new TaskRuntime();
+    const task = TaskSchema.parse({
+      id: "task-browser-host",
+      workspaceId: "main",
+      title: "Browser Task",
+      goal: "Open a page in a logged-in browser tab.",
+      templateKind: "browser_workflow",
+      status: "active",
+      defaultExecutorId: "executor-browser",
+      approvalPolicy: "auto_approve_safe",
+      approvalCheckpoints: [],
+      memoryPolicy: "chat_only",
+      createdAt: "2026-03-13T00:00:00.000Z",
+      updatedAt: "2026-03-13T00:00:00.000Z",
+    });
+    const executor = ExecutorNodeSchema.parse({
+      id: "executor-browser",
+      workspaceId: "main",
+      label: "Chrome Executor",
+      kind: "chrome_extension",
+      status: "online",
+      capabilities: ["browser"],
+      scopes: {
+        allowedHosts: ["example.com"],
+        allowedPaths: [],
+        allowedCommands: [],
+        fsRequiresApproval: true,
+        shellRequiresApproval: true,
+      },
+      browserAttachment: {
+        state: "attached",
+        mode: "single_window",
+        windowId: 11,
+        tabId: 22,
+        origin: "https://not-allowed.test",
+        url: "https://not-allowed.test/dashboard",
+        title: "Dashboard",
+      },
+      createdAt: "2026-03-13T00:00:00.000Z",
+      updatedAt: "2026-03-13T00:00:00.000Z",
+    });
+
+    const result = await runtime.stageRun({
+      workspaceId: "main",
+      task,
+      executor,
+      triggerType: "manual",
+      now: "2026-03-13T00:00:01.000Z",
+    });
+
+    expect(result.taskRun.status).toBe("waiting_retry");
+    expect(result.taskRun.error).toContain("allowed hosts");
+  });
 });

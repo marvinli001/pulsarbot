@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pulsarbot Executor</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        width: 360px;
+        background: #f8fafc;
+        color: #0f172a;
+      }
+      main {
+        display: grid;
+        gap: 12px;
+        padding: 16px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 18px;
+      }
+      p {
+        margin: 0;
+        color: #475569;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      label {
+        display: grid;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      input, textarea, button {
+        font: inherit;
+      }
+      input, textarea {
+        width: 100%;
+        border: 1px solid #cbd5e1;
+        border-radius: 12px;
+        padding: 10px 12px;
+        box-sizing: border-box;
+        background: #fff;
+      }
+      textarea {
+        min-height: 72px;
+        resize: vertical;
+      }
+      .actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      button {
+        border: 0;
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: #0f172a;
+        color: #fff;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #e2e8f0;
+        color: #0f172a;
+      }
+      pre {
+        margin: 0;
+        padding: 12px;
+        border-radius: 12px;
+        background: #0f172a;
+        color: #e2e8f0;
+        font-size: 11px;
+        overflow: auto;
+        max-height: 180px;
+      }
+      .status {
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: #e0f2fe;
+        color: #0c4a6e;
+        font-size: 12px;
+      }
+      .status.success {
+        background: #dcfce7;
+        color: #166534;
+      }
+      .status.warning {
+        background: #fef3c7;
+        color: #92400e;
+      }
+      .status.danger {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+      .hint {
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid #cbd5e1;
+        background: #ffffff;
+        color: #334155;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      a {
+        color: #0f172a;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div>
+        <h1>Pulsarbot Executor</h1>
+        <p>Pair first, then attach the last focused browser window that should expose its logged-in tab to Pulsarbot.</p>
+      </div>
+
+      <label>
+        Server URL
+        <input id="serverUrl" placeholder="https://your-server" />
+      </label>
+      <label>
+        Executor ID
+        <input id="executorId" placeholder="executor_xxx" />
+      </label>
+      <label>
+        Pairing Code
+        <textarea id="pairingCode" placeholder="pair.executor_xxx...."></textarea>
+      </label>
+      <label>
+        Profile Label
+        <input id="profileLabel" placeholder="Dedicated Work Profile" />
+      </label>
+
+      <div class="actions">
+        <button id="pairButton">Pair</button>
+        <button id="heartbeatButton" class="secondary">Heartbeat Now</button>
+        <button id="attachButton">Attach Current Window</button>
+        <button id="detachButton" class="secondary">Detach</button>
+      </div>
+
+      <div id="status" class="status">Ready.</div>
+      <div id="stateSummary" class="hint">Paste a pairing code first, then pair and attach a target browser window.</div>
+      <pre id="stateView">{}</pre>
+
+      <div class="footer">
+        <p id="pairState">Unpaired</p>
+        <a href="#" id="openOptions">Open options</a>
+      </div>
+    </main>
+    <script type="module" src="./popup.js"></script>
+  </body>
+</html>

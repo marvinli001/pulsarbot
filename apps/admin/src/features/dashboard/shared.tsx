@@ -215,7 +215,7 @@ export const workflowTemplateOptions = [
   {
     value: "browser_workflow",
     label: "打开网页完成浏览器流程",
-    caption: "通过 companion browser capability 执行网页流程。",
+    caption: "通过 executor browser capability 执行网页登录态流程。",
   },
   {
     value: "document_digest_memory",
@@ -250,6 +250,11 @@ export const triggerKindOptions = [
   { value: "schedule", label: "Schedule" },
   { value: "webhook", label: "Webhook" },
   { value: "telegram_shortcut", label: "Telegram Shortcut" },
+] as const;
+
+export const executorKindOptions = [
+  { value: "companion", label: "Companion" },
+  { value: "chrome_extension", label: "Chrome Extension" },
 ] as const;
 
 export const executorCapabilityOptions = [
@@ -826,15 +831,18 @@ export function SelectField({
   value,
   onChange,
   options,
+  ariaLabel,
 }: {
   value: string;
   onChange: (next: string) => void;
   options: Array<{ value: string; label: string }>;
+  ariaLabel?: string;
 }) {
   return (
     <select
       value={value}
       onChange={(event) => onChange(event.target.value)}
+      aria-label={ariaLabel}
       className="w-full rounded-2xl border px-4 py-3 text-sm outline-none transition"
       style={{
         borderColor: "var(--app-border)",
@@ -1066,12 +1074,14 @@ export function ResourceSelectField({
   value,
   onChange,
   options,
+  selectAriaLabel,
 }: {
   label: string;
   hint: string;
   value: string;
   onChange: (next: string) => void;
   options: Array<{ value: string; label: string }>;
+  selectAriaLabel?: string;
 }) {
   return (
     <div className="grid gap-2">
@@ -1079,7 +1089,12 @@ export function ResourceSelectField({
         <p className="text-sm font-medium text-slate-900">{label}</p>
         <p className="text-xs text-slate-500">{hint}</p>
       </div>
-      <SelectField value={value} onChange={onChange} options={options} />
+      <SelectField
+        value={value}
+        onChange={onChange}
+        options={options}
+        ariaLabel={selectAriaLabel ?? label}
+      />
     </div>
   );
 }

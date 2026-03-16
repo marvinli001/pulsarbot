@@ -155,27 +155,44 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 
 ## 8. Executors
 
-这里管理 owner 自己的 companion executor。
+这里管理 owner 自己的执行端。当前面板支持两类 executor：
+
+- `Chrome Extension`
+  - browser-only
+  - 需要 explicit `attach / detach`
+  - 适合复用 owner 本机浏览器中的登录态
+- `Companion`
+  - 支持 `browser / http / fs / shell`
+  - 适合 owner 自控机器上的高权限执行
+
+`cloud_browser` 当前只是预留 kind，不会在这个面板里作为可用部署目标出现。
 
 你可以在这里完成：
 
 - 创建 executor
-- 设置 capability
-- 设置 `allowedHosts / allowedPaths / allowedCommands`
+- 选择 kind
+- 设置浏览器 host allowlist
+- 对 companion 设置 `allowedPaths / allowedCommands`
 - 生成 pairing code
-- 查看在线状态、最近心跳、最近任务
+- 查看在线状态、attach state、最近心跳、最近任务
+- 对 Chrome extension 执行 `Force Detach`
 
 推荐做法：
 
 1. 先按最小权限创建 scope
-2. 配对 companion
-3. 回到 `Tasks` 选择默认 executor
-4. 用一个最小的 `web_watch_report` 或 `browser_workflow` 做验证
+2. 如果是 Chrome extension：
+   - 配对扩展
+   - 把目标网页切到前台
+   - 显式 attach 当前窗口
+3. 如果是 companion：
+   - 配对本地 companion 进程
+4. 回到 `Tasks` 选择默认 executor
+5. 用一个最小的 `browser_workflow` 或 `web_watch_report` 做验证
 
 排障说明：
 
 - 如果 task run 看起来“卡住”，先到 `System Health` 导出 internal logs。
-- Health 页里的 `Download logs as...` 和 `Copy logs as...` 会包含 server internal logs，也包含 companion 通过 heartbeat 回传并被 server 摄取的执行日志。
+- Health 页里的 `Download logs as...` 和 `Copy logs as...` 会包含 server internal logs，也包含 executor 通过 heartbeat 回传并被 server 摄取的执行日志。
 - 如果要看某个 task run 的细节，再去 `Sessions` 面板查看对应的 `executor_log` 事件流。
 
 ## 9. Skills / Plugins / MCP Market
@@ -298,7 +315,7 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 5. 初始化或接管资源
 6. 配置 Provider API Key 并执行 provider test
 7. 调整 `Workspace` 和 `Profiles`
-8. 在 `Executors` 里创建并配对 companion
+8. 在 `Executors` 里创建并配对一个 executor
 9. 在 `Tasks` 里创建一个模板化 task，并先手动运行一次
 10. 在 `Automations` 里挂 schedule 或 webhook
 11. 在 `Health`、`Logs` 和 `Sessions` 面板确认系统状态
@@ -331,4 +348,4 @@ Pulsarbot 的管理台入口默认由服务端同域提供，路径为 `/miniapp
 1. `Tasks` 面板里的 capability preview 是否 ready
 2. `Sessions` 面板里 run 当前是 `queued`、`waiting_approval` 还是 `waiting_retry`
 3. `Approvals` 或 Telegram 卡片里是否还没审批
-4. `Executors` 面板里的 companion 是否在线、capability 是否匹配
+4. `Executors` 面板里的 executor 是否在线、attach 状态是否正确、capability 是否匹配

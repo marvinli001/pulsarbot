@@ -86,6 +86,164 @@ function stringifyFieldValue(field: TemplateField, config: Record<string, unknow
   return String(value);
 }
 
+type BrowserWorkflowRecipe = {
+  id: string;
+  label: string;
+  description: string;
+  title: string;
+  goal: string;
+  config: Record<string, unknown>;
+};
+
+type BrowserStepSnippet = {
+  id: string;
+  label: string;
+  description: string;
+  steps: Array<Record<string, unknown>>;
+};
+
+function browserWorkflowConfig(
+  startUrl: string,
+  steps: Array<Record<string, unknown>>,
+): Record<string, unknown> {
+  return {
+    startUrl,
+    steps,
+    captureScreenshot: true,
+    telegramTarget: {},
+  };
+}
+
+const browserWorkflowRecipes: BrowserWorkflowRecipe[] = [
+  {
+    id: "extract_text",
+    label: "Extract Page Text",
+    description: "Wait for a selector, extract its text, and keep a screenshot artifact.",
+    title: "Extract text from a logged-in page",
+    goal: "Open a page in the attached browser, wait for a key element, and extract the text for downstream agent reasoning.",
+    config: browserWorkflowConfig("https://example.com", [
+      { type: "wait_for_selector", selector: "#headline", timeoutMs: 10000 },
+      { type: "extract_text", selector: "#headline", label: "Headline" },
+    ]),
+  },
+  {
+    id: "fill_submit",
+    label: "Fill and Submit",
+    description: "Type into a form, submit it, and capture the confirmation text.",
+    title: "Fill a form in the attached browser",
+    goal: "Use the attached browser window to fill a form and report the confirmation state back to the control plane.",
+    config: browserWorkflowConfig("https://example.com/form", [
+      { type: "type", selector: "#email", text: "demo@example.com" },
+      { type: "type", selector: "#note", text: "Created by Pulsarbot" },
+      { type: "click", selector: "button[type='submit']" },
+      { type: "wait_for_selector", selector: ".success-message", timeoutMs: 10000 },
+      { type: "extract_text", selector: ".success-message", label: "Submission Result" },
+    ]),
+  },
+  {
+    id: "search_capture",
+    label: "Search and Capture",
+    description: "Type into a search box, press Enter, then extract the first result block.",
+    title: "Run a search in the attached browser",
+    goal: "Search within a logged-in site, wait for the result view, and return the top result text with a screenshot.",
+    config: browserWorkflowConfig("https://example.com/search", [
+      { type: "type", selector: "input[type='search']", text: "weekly pipeline status" },
+      { type: "press", selector: "input[type='search']", key: "Enter" },
+      { type: "wait_for_selector", selector: ".search-result", timeoutMs: 10000 },
+      { type: "extract_text", selector: ".search-result", label: "Top Result" },
+    ]),
+  },
+  {
+    id: "click_capture",
+    label: "Click and Capture",
+    description: "Click a control, wait briefly, and keep the resulting screenshot and final URL.",
+    title: "Trigger a browser action and capture the result",
+    goal: "Open a logged-in workflow page, click a known control, and capture the resulting browser state for the owner.",
+    config: browserWorkflowConfig("https://example.com/dashboard", [
+      { type: "click", selector: "#primary-action" },
+      { type: "wait", ms: 1200 },
+    ]),
+  },
+];
+
+const browserStepSnippets: BrowserStepSnippet[] = [
+  {
+    id: "snippet_click",
+    label: "Append Click",
+    description: "Add a click step with a placeholder selector.",
+    steps: [{ type: "click", selector: "#primary-action" }],
+  },
+  {
+    id: "snippet_type_press",
+    label: "Append Type + Press",
+    description: "Add a text entry step followed by Enter.",
+    steps: [
+      { type: "type", selector: "input[type='search']", text: "replace me" },
+      { type: "press", selector: "input[type='search']", key: "Enter" },
+    ],
+  },
+  {
+    id: "snippet_wait_extract",
+    label: "Append Wait + Extract",
+    description: "Wait for a result selector and extract its text.",
+    steps: [
+      { type: "wait_for_selector", selector: ".result", timeoutMs: 10000 },
+      { type: "extract_text", selector: ".result", label: "Result" },
+    ],
+  },
+];
+
+function browserPreviewCallout(preview: Record<string, unknown> | null): {
+  tone: "success" | "warning" | "danger";
+  title: string;
+  detail: string;
+} | null {
+  if (!preview) {
+    return null;
+  }
+  const blockers = Array.isArray(preview.blockers) ? preview.blockers as Array<Record<string, unknown>> : [];
+  const firstBlocker = blockers[0];
+  const code = typeof firstBlocker?.code === "string" ? firstBlocker.code : "";
+  const message = typeof firstBlocker?.message === "string" ? firstBlocker.message : "";
+
+  if (code === "browser_not_attached") {
+    return {
+      tone: "warning",
+      title: "Chrome executor is not attached",
+      detail: "Go to Executors, bring the target site to the front in Chrome, then attach the current window before running this task.",
+    };
+  }
+  if (code === "attached_origin_not_allowed") {
+    return {
+      tone: "danger",
+      title: "Attached site is outside the allowlist",
+      detail: "Update allowed hosts or re-attach a tab whose origin matches the executor allowlist.",
+    };
+  }
+  if (code === "executor_offline") {
+    return {
+      tone: "warning",
+      title: "Executor is offline",
+      detail: message || "Bring the local executor online before running this workflow.",
+    };
+  }
+  if (code === "executor_missing") {
+    return {
+      tone: "warning",
+      title: "No default executor selected",
+      detail: "Pick a Chrome extension or companion executor so this workflow has somewhere to run.",
+    };
+  }
+  if (blockers.length === 0 && preview.executor && preview.taskRunStatus !== "waiting_retry") {
+    return {
+      tone: "success",
+      title: "Browser workflow looks runnable",
+      detail: "The selected executor is ready. You can still tweak selectors or apply one of the quick recipes below.",
+    };
+  }
+  return null;
+}
+
 export function TasksPanel() {
   const tasks = useTasks();
   const profiles = useProfiles();
@@ -157,7 +315,7 @@ export function TasksPanel() {
       { value: "", label: "No executor" },
       ...(executors.data ?? []).map((executor) => ({
         value: String(executor.id ?? ""),
-        label: `${String(executor.label ?? executor.id ?? "")} · ${String(executor.status ?? "offline")}`,
+        label: `${String(executor.label ?? executor.id ?? "")} · ${String(executor.kind ?? "companion")} · ${String(executor.status ?? "offline")}${executor.kind === "chrome_extension" ? ` · ${String((executor.browserAttachment as Record<string, unknown> | undefined)?.state ?? "detached")}` : ""}`,
       })),
     ],
     [executors.data],
@@ -194,6 +352,13 @@ export function TasksPanel() {
       }),
     enabled: Boolean(selectedTemplate),
   });
+  const browserPreviewMeta = useMemo(
+    () =>
+      form.templateKind === "browser_workflow"
+        ? browserPreviewCallout(previewQuery.data ?? null)
+        : null,
+    [form.templateKind, previewQuery.data],
+  );
 
   const saveMutation = useMutation({
     mutationFn: () =>
@@ -286,6 +451,36 @@ export function TasksPanel() {
     }));
   };
 
+  const applyBrowserWorkflowRecipe = (recipe: BrowserWorkflowRecipe) => {
+    selectionChanged();
+    setEditingId("");
+    setForm((current) => ({
+      ...current,
+      title: recipe.title,
+      goal: recipe.goal,
+      templateKind: "browser_workflow",
+      approvalCheckpoints: ["before_executor", "before_telegram_push"],
+      configJson: formatJson(recipe.config),
+    }));
+  };
+
+  const appendBrowserStepSnippet = (snippet: BrowserStepSnippet) => {
+    const nextConfig = safeConfigJson(form.configJson);
+    const steps = Array.isArray(nextConfig.steps) ? nextConfig.steps : [];
+    nextConfig.steps = [...steps, ...snippet.steps];
+    if (typeof nextConfig.startUrl !== "string" || nextConfig.startUrl.length === 0) {
+      nextConfig.startUrl = "https://example.com";
+    }
+    if (typeof nextConfig.captureScreenshot === "undefined") {
+      nextConfig.captureScreenshot = true;
+    }
+    setForm((current) => ({
+      ...current,
+      templateKind: "browser_workflow",
+      configJson: formatJson(nextConfig),
+    }));
+  };
+
   const loadTask = (task: Record<string, unknown>) => {
     selectionChanged();
     setEditingId(String(task.id ?? ""));
@@ -364,17 +559,20 @@ export function TasksPanel() {
           <div className="grid gap-3">
             <Input
               value={form.title}
+              aria-label="Task title"
               onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))}
               placeholder="Task title"
             />
             <TextArea
               value={form.goal}
+              aria-label="Task goal"
               onChange={(event) => setForm((current) => ({ ...current, goal: event.target.value }))}
               rows={3}
               placeholder="What should this task accomplish?"
             />
             <TextArea
               value={form.description}
+              aria-label="Task description"
               onChange={(event) =>
                 setForm((current) => ({ ...current, description: event.target.value }))
               }
@@ -387,6 +585,7 @@ export function TasksPanel() {
               value={form.templateKind}
               onChange={(next) => applyTemplateDefaults(next)}
               options={templateOptions}
+              selectAriaLabel="Task template"
             />
             <ResourceSelectField
               label="Agent Profile"
@@ -394,14 +593,73 @@ export function TasksPanel() {
               value={form.agentProfileId}
               onChange={(next) => setForm((current) => ({ ...current, agentProfileId: next }))}
               options={profileOptions}
+              selectAriaLabel="Task agent profile"
             />
             <ResourceSelectField
               label="Default Executor"
-              hint="Companion node that should receive runs by default."
+              hint="Executor that should receive runs by default."
               value={form.defaultExecutorId}
               onChange={(next) => setForm((current) => ({ ...current, defaultExecutorId: next }))}
               options={executorOptions}
+              selectAriaLabel="Task default executor"
             />
+            {form.templateKind === "browser_workflow" ? (
+              <div className="grid gap-3 rounded-2xl border border-slate-200 p-4">
+                <div>
+                  <p className="text-sm font-medium text-slate-900">Agentflow Browser Recipes</p>
+                  <p className="text-xs text-slate-500">
+                    Start from a common browser workflow, then adjust selectors and steps below.
+                  </p>
+                </div>
+                {browserPreviewMeta ? (
+                  <div
+                    className={[
+                      "rounded-2xl border px-4 py-3 text-sm",
+                      browserPreviewMeta.tone === "success"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                        : browserPreviewMeta.tone === "danger"
+                          ? "border-rose-200 bg-rose-50 text-rose-900"
+                          : "border-amber-200 bg-amber-50 text-amber-900",
+                    ].join(" ")}
+                  >
+                    <p className="font-medium">{browserPreviewMeta.title}</p>
+                    <p className="mt-1 text-xs opacity-90">{browserPreviewMeta.detail}</p>
+                  </div>
+                ) : null}
+                <div className="grid gap-2 md:grid-cols-2">
+                  {browserWorkflowRecipes.map((recipe) => (
+                    <button
+                      key={recipe.id}
+                      type="button"
+                      onClick={() => applyBrowserWorkflowRecipe(recipe)}
+                      className="rounded-2xl border border-slate-200 px-4 py-4 text-left transition hover:border-slate-300 hover:bg-slate-50"
+                    >
+                      <p className="text-sm font-medium text-slate-900">{recipe.label}</p>
+                      <p className="mt-1 text-xs text-slate-500">{recipe.description}</p>
+                    </button>
+                  ))}
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-slate-900">Step Snippets</p>
+                  <p className="text-xs text-slate-500">
+                    Append a starter block to the current browser steps JSON.
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {browserStepSnippets.map((snippet) => (
+                    <Button
+                      key={snippet.id}
+                      type="button"
+                      tone="secondary"
+                      title={snippet.description}
+                      onClick={() => appendBrowserStepSnippet(snippet)}
+                    >
+                      {snippet.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
 
             {selectedTemplateFields.map((field) => {
               const config = safeConfigJson(form.configJson);
@@ -414,6 +672,7 @@ export function TasksPanel() {
                     <TextArea
                       value={value}
                       rows={4}
+                      aria-label={field.label}
                       placeholder={field.placeholder}
                       onChange={(event) => updateTemplateConfig(field, event.target.value)}
                     />
@@ -429,6 +688,7 @@ export function TasksPanel() {
                       value={value}
                       onChange={(next) => updateTemplateConfig(field, next)}
                       options={field.options ?? []}
+                      ariaLabel={field.label}
                     />
                   </div>
                 );
@@ -439,6 +699,7 @@ export function TasksPanel() {
                     <input
                       type="checkbox"
                       checked={value === "true"}
+                      aria-label={field.label}
                       onChange={(event) => updateTemplateConfig(field, event.target.checked)}
                     />
                     <span>
@@ -456,6 +717,7 @@ export function TasksPanel() {
                     <TextArea
                       value={value}
                       rows={8}
+                      aria-label={field.label}
                       onChange={(event) => updateTemplateConfig(field, event.target.value)}
                     />
                   </div>
@@ -467,6 +729,7 @@ export function TasksPanel() {
                   <p className="mb-2 text-xs text-slate-500">{field.description}</p>
                   <Input
                     value={value}
+                    aria-label={field.label}
                     placeholder={field.placeholder}
                     onChange={(event) => updateTemplateConfig(field, event.target.value)}
                   />
@@ -480,6 +743,7 @@ export function TasksPanel() {
                 <SelectField
                   value={form.status}
                   onChange={(next) => setForm((current) => ({ ...current, status: next }))}
+                  ariaLabel="Task status"
                   options={[
                     { value: "draft", label: "Draft" },
                     { value: "active", label: "Active" },
@@ -495,6 +759,7 @@ export function TasksPanel() {
                   onChange={(next) =>
                     setForm((current) => ({ ...current, approvalPolicy: next }))
                   }
+                  ariaLabel="Task approval policy"
                   options={[...approvalPolicyOptions]}
                 />
               </div>
@@ -517,28 +782,33 @@ export function TasksPanel() {
               <SelectField
                 value={form.memoryPolicy}
                 onChange={(next) => setForm((current) => ({ ...current, memoryPolicy: next }))}
+                ariaLabel="Task memory policy"
                 options={[...memoryPolicyOptions]}
               />
             </div>
             <div className="grid gap-3 sm:grid-cols-3">
               <Input
                 value={form.maxSteps}
+                aria-label="Task max steps"
                 onChange={(event) => setForm((current) => ({ ...current, maxSteps: event.target.value }))}
                 placeholder="Max steps"
               />
               <Input
                 value={form.maxActions}
+                aria-label="Task max actions"
                 onChange={(event) => setForm((current) => ({ ...current, maxActions: event.target.value }))}
                 placeholder="Max actions"
               />
               <Input
                 value={form.timeoutMs}
+                aria-label="Task timeout ms"
                 onChange={(event) => setForm((current) => ({ ...current, timeoutMs: event.target.value }))}
                 placeholder="Timeout ms"
               />
             </div>
             <Input
               value={form.relatedDocumentIds}
+              aria-label="Task related document ids"
               onChange={(event) =>
                 setForm((current) => ({ ...current, relatedDocumentIds: event.target.value }))
               }

@@ -10,11 +10,19 @@
 
 可以直接部署到 Railway。
 
-但按当前代码结构，**推荐只保留一个对外服务：`@pulsarbot/server`**。原因是：
+但按当前代码结构，**推荐只保留一个对外服务：`@pulsarbot/server`**。当前实际拓扑是：
+
+- Railway 上的 `@pulsarbot/server`：云端 control plane
+- owner 本地浏览器里的 `apps/chrome-extension`：browser-only executor
+- owner 自己机器上的 `apps/companion`：native executor
+
+原因是：
 
 - `apps/server` 会托管 Mini App 静态页面，入口是 `/miniapp/`
 - Telegram webhook 入口在同一个服务：`/telegram/webhook`
 - `apps/admin` 不是独立后端服务，单独部署通常是冗余的
+- Chrome extension 和 companion 都是 owner 本地执行边缘，不是第二个公网服务
+- `cloud_browser` 当前只是预留 kind，不需要准备单独基础设施
 
 ## 2. 当前项目的线上入口（重要）
 
@@ -39,6 +47,7 @@
 
 - 保留 `@pulsarbot/server`
 - 删除或停用 `@pulsarbot/admin`
+- 不为 `chrome-extension` 或 `companion` 再创建 Railway 服务
 
 如果你还在 Railway 的 staged changes（你截图里 `Apply changes` 那一层）：
 
@@ -167,6 +176,28 @@ curl -sS https://<your-domain>/healthz
 
 注意：不挂 Volume 时，服务重建/迁移后 `DATA_DIR` 里的运行数据可能丢失，因此建议在你准备长期使用时再补上 `/data` 挂载。
 
+## 3.8 Executor 与 Railway 的关系
+
+当前需要明确区分三件事：
+
+### Railway 负责什么
+
+- 部署 `@pulsarbot/server`
+- 提供 `/miniapp/`、`/api/*`、`/telegram/webhook`
+- 承担 task runtime、approval、sessions、executors control plane
+
+### Railway 不负责什么
+
+- 不托管 `apps/chrome-extension`
+- 不托管 `apps/companion`
+- 不提供可用的 `cloud_browser` backend
+
+### 这意味着什么
+
+- 如果你只想先把 Bot + Mini App 上线，Railway 单服务就够了
+- 如果你还想让任务操作浏览器登录态，再由 owner 在本地加载 Chrome extension
+- 如果你还想让任务碰 `fs / shell / 本地文件`，再由 owner 在本地运行 companion
+
 ## 4. Telegram webhook 配置
 
 Pulsarbot 使用 webhook 接收 Telegram 消息。部署成功后执行：
@@ -224,6 +255,11 @@ curl -sS "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 5. 初始化或接管资源
 6. 配置 Provider API Key 并做 provider test
 7. 回到 Telegram 私聊 Bot 发消息验证
+
+如果你要继续验证 executor：
+
+8. 在 `Executors` 面板创建并配对 `Chrome Extension` 或 `Companion`
+9. 用一个最小 task 做闭环验证
 
 ## 7. 两个容器场景说明（你当前截图对应）
 
@@ -312,3 +348,10 @@ curl -sS "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
 - Telegram 私聊 `/start` 有响应
 - Menu Button / Main App / Direct Link 都能打开 Mini App
 - Owner 账号可进入管理台，非 owner 会被限制
+- 如果启用了 Chrome extension：
+  - `Executors` 面板显示 `Attached`
+  - 当前 origin 命中 allowlist
+  - `Sessions` 中能看到 `executor_log`
+- 如果启用了 companion：
+  - `Executors` 面板显示 `online`
+  - capability / scope 与 task preview 一致

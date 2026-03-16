@@ -48,6 +48,7 @@ import {
   ApprovalPolicySchema,
   ApprovalRequestSchema,
   type AgentGraphState,
+  BrowserAttachmentSchema,
   CloudflareCredentialsSchema,
   ExecutorNodeSchema,
   MemoryPolicySchema,
@@ -71,6 +72,7 @@ import {
   type ApprovalPolicy,
   type AgentProfile,
   type AuthSession,
+  type BrowserAttachment,
   type CloudflareCredentials,
   type ConversationTurn,
   type DocumentArtifact,
@@ -359,7 +361,7 @@ const workflowTemplates: WorkflowTemplateDefinition[] = [
   {
     id: "browser_workflow",
     title: "打开网页完成浏览器流程",
-    description: "用 companion browser capability 执行结构化浏览器步骤。",
+    description: "用 executor browser capability 执行结构化浏览器步骤。",
     requiresExecutor: true,
     executionMode: "executor",
     defaultConfig: {
@@ -624,6 +626,91 @@ function taskRunSessionId(taskRunId: string): string {
 function normalizeWebhookPath(input: string): string {
   const trimmed = input.trim().replace(/^\/+/, "").replace(/\/+$/, "");
   return trimmed || `hook-${createId("trigger")}`;
+}
+
+function isHostAllowed(rawUrl: string, allowedHosts: string[]): boolean {
+  if (allowedHosts.length === 0) {
+    return false;
+  }
+  const url = new URL(rawUrl);
+  const hostname = url.hostname.toLowerCase();
+  return allowedHosts.some((pattern) => {
+    const normalized = pattern.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+    if (normalized.startsWith("*.")) {
+      const suffix = normalized.slice(1);
+      return hostname.endsWith(suffix);
+    }
+    return hostname === normalized;
+  });
+}
+
+function detachedBrowserAttachment(
+  current?: BrowserAttachment | null,
+): BrowserAttachment {
+  return BrowserAttachmentSchema.parse({
+    state: "detached",
+    mode: "single_window",
+    windowId: null,
+    tabId: null,
+    url: null,
+    origin: null,
+    title: null,
+    attachedAt: current?.attachedAt ?? null,
+    detachedAt: nowIso(),
+    lastSnapshotAt: current?.lastSnapshotAt ?? null,
+    extensionInstanceId: current?.extensionInstanceId ?? null,
+    browserName: current?.browserName ?? null,
+    browserVersion: current?.browserVersion ?? null,
+    profileLabel: current?.profileLabel ?? null,
+  });
+}
+
+function browserExecutorReady(executor: ExecutorNode): {
+  ready: boolean;
+  code?: string;
+  message?: string;
+} {
+  if (executor.kind !== "chrome_extension") {
+    return { ready: true };
+  }
+  if (
+    executor.browserAttachment.state !== "attached" ||
+    typeof executor.browserAttachment.windowId !== "number" ||
+    typeof executor.browserAttachment.tabId !== "number"
+  ) {
+    return {
+      ready: false,
+      code: "browser_not_attached",
+      message: `Executor ${executor.label} is not attached to a browser window.`,
+    };
+  }
+  const origin = executor.browserAttachment.origin;
+  if (!origin) {
+    return {
+      ready: false,
+      code: "attached_origin_missing",
+      message: `Executor ${executor.label} does not have an attached browser origin.`,
+    };
+  }
+  try {
+    if (!isHostAllowed(origin, executor.scopes.allowedHosts)) {
+      return {
+        ready: false,
+        code: "attached_origin_not_allowed",
+        message: `Executor ${executor.label} is attached to an origin outside the allowlist.`,
+      };
+    }
+  } catch {
+    return {
+      ready: false,
+      code: "attached_origin_invalid",
+      message: `Executor ${executor.label} reported an invalid attached browser origin.`,
+    };
+  }
+  return { ready: true };
 }
 
 function scheduleIntervalMinutes(config: Record<string, unknown>): number | null {
@@ -895,6 +982,15 @@ async function buildWorkflowCapabilityPreview(args: {
           message: `Executor ${executor.label} is not online.`,
         });
       }
+      if (capability === "browser" && executor.kind === "chrome_extension") {
+        const browserReady = browserExecutorReady(executor);
+        if (!browserReady.ready) {
+          blockers.push({
+            code: browserReady.code ?? "browser_not_ready",
+            message: browserReady.message ?? `Executor ${executor.label} is not ready for browser execution.`,
+          });
+        }
+      }
     }
   }
 
@@ -951,8 +1047,10 @@ async function buildWorkflowCapabilityPreview(args: {
       ? {
           id: executor.id,
           label: executor.label,
+          kind: executor.kind,
           status: executor.status,
           capabilities: executor.capabilities,
+          browserAttachment: executor.browserAttachment,
         }
       : null,
     blockers,
@@ -4151,7 +4249,7 @@ export async function createApp(
     );
   };
 
-  type NormalizedCompanionLogEntry = {
+  type NormalizedExecutorLogEntry = {
     taskRunId: string | null;
     scope: string;
     level: "debug" | "info" | "warn" | "error";
@@ -4161,7 +4259,7 @@ export async function createApp(
     occurredAt: string;
   };
 
-  const normalizeCompanionLogEntries = (value: unknown): NormalizedCompanionLogEntry[] => {
+  const normalizeExecutorLogEntries = (value: unknown): NormalizedExecutorLogEntry[] => {
     if (!Array.isArray(value)) {
       return [];
     }
@@ -4169,7 +4267,7 @@ export async function createApp(
       .map((item) => asRecord(item))
       .filter((item): item is Record<string, unknown> => Boolean(item))
       .map((item) => {
-        const level: NormalizedCompanionLogEntry["level"] =
+        const level: NormalizedExecutorLogEntry["level"] =
           item.level === "debug" || item.level === "info" || item.level === "warn" || item.level === "error"
             ? item.level
             : "info";
@@ -4177,17 +4275,17 @@ export async function createApp(
           taskRunId: typeof item.taskRunId === "string" && item.taskRunId.trim() ? item.taskRunId : null,
           scope: typeof item.scope === "string" && item.scope.trim() ? item.scope : "assignment",
           level,
-          event: typeof item.event === "string" && item.event.trim() ? item.event : "companion_log",
-          message: typeof item.message === "string" && item.message.trim() ? item.message : "Companion log entry",
+          event: typeof item.event === "string" && item.event.trim() ? item.event : "executor_log_entry",
+          message: typeof item.message === "string" && item.message.trim() ? item.message : "Executor log entry",
           detail: asRecord(item.detail) ?? {},
           occurredAt: typeof item.occurredAt === "string" && item.occurredAt.trim() ? item.occurredAt : nowIso(),
         };
       });
   };
 
-  const ingestCompanionLogs = async (args: {
+  const ingestExecutorLogs = async (args: {
     executorId: string;
-    logs: NormalizedCompanionLogEntry[];
+    logs: NormalizedExecutorLogEntry[];
   }) => {
     for (const entry of args.logs) {
       const taskRun = entry.taskRunId ? await state.repository.getTaskRun(entry.taskRunId) : null;
@@ -4209,11 +4307,11 @@ export async function createApp(
       });
       logger[entry.level](
         {
-          category: "companion_runtime",
+          category: "executor_runtime",
           executorId: args.executorId,
           taskRunId: entry.taskRunId,
           scope: entry.scope,
-          companionEvent: entry.event,
+          executorEvent: entry.event,
           detail: entry.detail,
           sourceOccurredAt: entry.occurredAt,
         },
@@ -4224,6 +4322,64 @@ export async function createApp(
 
   const isTerminalTaskRunStatus = (status: TaskRun["status"]) =>
     status === "completed" || status === "failed" || status === "aborted";
+
+  const executorTokenMatches = (executor: ExecutorNode, executorToken: string | null | undefined) =>
+    Boolean(
+      executorToken &&
+      executor.executorTokenHash &&
+      sha256(executorToken) === executor.executorTokenHash,
+    );
+
+  const syncChromeExtensionBrowserAttachment = (args: {
+    executor: ExecutorNode;
+    browserState: unknown;
+    metadata: Record<string, unknown> | null;
+    fallbackProfileLabel?: string | null;
+  }): BrowserAttachment => {
+    const current = args.executor.browserAttachment;
+    if (args.executor.kind !== "chrome_extension") {
+      return current;
+    }
+    const browserState = asRecord(args.browserState);
+    if (browserState && asString(browserState.attachState) === "detached") {
+      return detachedBrowserAttachment(current);
+    }
+    if (current.state !== "attached") {
+      return current;
+    }
+    const activeTab = asRecord(browserState?.activeTab);
+    const profileLabel =
+      asString(args.metadata?.profileLabel) ??
+      args.fallbackProfileLabel ??
+      current.profileLabel;
+    const hasBrowserState = Boolean(browserState);
+    const hasActiveTab = Boolean(activeTab);
+    return BrowserAttachmentSchema.parse({
+      ...current,
+      mode: browserState?.mode === "single_window" ? browserState.mode : current.mode,
+      windowId: typeof browserState?.windowId === "number"
+        ? browserState.windowId
+        : hasBrowserState
+          ? null
+          : current.windowId,
+      tabId: typeof activeTab?.tabId === "number"
+        ? activeTab.tabId
+        : hasActiveTab
+          ? null
+          : current.tabId,
+      url: hasActiveTab ? asString(activeTab?.url) ?? null : current.url,
+      origin: hasActiveTab ? asString(activeTab?.origin) ?? null : current.origin,
+      title: hasActiveTab ? asString(activeTab?.title) ?? null : current.title,
+      lastSnapshotAt: asString(browserState?.lastSnapshotAt) ?? current.lastSnapshotAt,
+      extensionInstanceId:
+        asString(browserState?.extensionInstanceId) ??
+        asString(args.metadata?.extensionInstanceId) ??
+        current.extensionInstanceId,
+      browserName: asString(args.metadata?.browserName) ?? current.browserName,
+      browserVersion: asString(args.metadata?.browserVersion) ?? current.browserVersion,
+      profileLabel,
+    });
+  };
 
   const resolveTaskExecutor = async (task: Task, overrideExecutorId?: string | null) => {
     const executorId = overrideExecutorId ?? task.defaultExecutorId;
@@ -8919,17 +9075,40 @@ export async function createApp(
     const body = (request.body ?? {}) as Partial<ExecutorNode>;
     const existing = body.id ? await state.repository.getExecutorNode(body.id) : null;
     const timestamp = nowIso();
+    const kind = body.kind ?? existing?.kind ?? "companion";
+    const normalizedScopes = {
+      allowedHosts: body.scopes?.allowedHosts ?? existing?.scopes.allowedHosts ?? [],
+      allowedPaths: kind === "companion"
+        ? body.scopes?.allowedPaths ?? existing?.scopes.allowedPaths ?? []
+        : [],
+      allowedCommands: kind === "companion"
+        ? body.scopes?.allowedCommands ?? existing?.scopes.allowedCommands ?? []
+        : [],
+      fsRequiresApproval: kind === "companion"
+        ? body.scopes?.fsRequiresApproval ?? existing?.scopes.fsRequiresApproval ?? true
+        : true,
+      shellRequiresApproval: kind === "companion"
+        ? body.scopes?.shellRequiresApproval ?? existing?.scopes.shellRequiresApproval ?? true
+        : true,
+    };
     const next = ExecutorNodeSchema.parse({
       id: body.id ?? existing?.id ?? createId("executor"),
       workspaceId: workspace.id,
-      label: body.label ?? existing?.label ?? "Companion Executor",
-      kind: body.kind ?? existing?.kind ?? "companion",
+      label: body.label ?? existing?.label ?? (kind === "chrome_extension"
+        ? "Chrome Extension Executor"
+        : kind === "cloud_browser"
+          ? "Cloud Browser Executor"
+          : "Companion Executor"),
+      kind,
       status: existing?.status ?? "offline",
       version: body.version ?? existing?.version ?? null,
       platform: body.platform ?? existing?.platform ?? null,
-      capabilities: body.capabilities ?? existing?.capabilities ?? [],
-      scopes: body.scopes ?? existing?.scopes ?? {},
+      capabilities: kind === "companion"
+        ? body.capabilities ?? existing?.capabilities ?? []
+        : ["browser"],
+      scopes: normalizedScopes,
       metadata: body.metadata ?? existing?.metadata ?? {},
+      browserAttachment: body.browserAttachment ?? existing?.browserAttachment ?? detachedBrowserAttachment(null),
       pairingCodeHash: existing?.pairingCodeHash ?? null,
       executorTokenHash: existing?.executorTokenHash ?? null,
       pairingIssuedAt: existing?.pairingIssuedAt ?? null,
@@ -8982,6 +9161,140 @@ export async function createApp(
     };
   });
 
+  app.post("/api/executors/:id/attach", async (request, reply) => {
+    const executor = await state.repository.getExecutorNode(
+      (request.params as { id: string }).id,
+    );
+    if (!executor) {
+      return reply.code(404).send({ error: "Executor not found" });
+    }
+    if (executor.kind !== "chrome_extension") {
+      return reply.code(400).send({ error: "Only chrome extension executors can attach a browser window" });
+    }
+    const body = (request.body ?? {}) as {
+      executorToken?: string;
+      windowId?: number;
+      tabId?: number;
+      url?: string;
+      origin?: string;
+      title?: string;
+      profileLabel?: string;
+      extensionInstanceId?: string;
+      browserName?: string;
+      browserVersion?: string;
+    };
+    if (!executorTokenMatches(executor, body.executorToken)) {
+      return reply.code(401).send({ error: "Executor token is invalid" });
+    }
+    if (typeof body.windowId !== "number" || typeof body.tabId !== "number") {
+      return reply.code(400).send({ error: "windowId and tabId are required" });
+    }
+    const origin = asString(body.origin);
+    if (!origin) {
+      return reply.code(400).send({ error: "origin is required" });
+    }
+    try {
+      if (!isHostAllowed(origin, executor.scopes.allowedHosts)) {
+        return reply.code(400).send({ error: "Origin is not allowed for this executor" });
+      }
+    } catch {
+      return reply.code(400).send({ error: "origin is invalid" });
+    }
+    const timestamp = nowIso();
+    const next = ExecutorNodeSchema.parse({
+      ...executor,
+      browserAttachment: BrowserAttachmentSchema.parse({
+        state: "attached",
+        mode: "single_window",
+        windowId: body.windowId,
+        tabId: body.tabId,
+        url: asString(body.url) ?? null,
+        origin,
+        title: asString(body.title) ?? null,
+        attachedAt: timestamp,
+        detachedAt: null,
+        lastSnapshotAt: executor.browserAttachment.lastSnapshotAt,
+        extensionInstanceId: asString(body.extensionInstanceId) ?? executor.browserAttachment.extensionInstanceId,
+        browserName: asString(body.browserName) ?? executor.browserAttachment.browserName,
+        browserVersion: asString(body.browserVersion) ?? executor.browserAttachment.browserVersion,
+        profileLabel: asString(body.profileLabel) ?? executor.browserAttachment.profileLabel,
+      }),
+      lastSeenAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveExecutorNode(next);
+    logInternalEvent("executor_attached", {
+      executorId: executor.id,
+      windowId: next.browserAttachment.windowId,
+      tabId: next.browserAttachment.tabId,
+      origin: next.browserAttachment.origin,
+      url: next.browserAttachment.url,
+    });
+    return {
+      ok: true,
+      executor: next,
+    };
+  });
+
+  app.post("/api/executors/:id/detach", async (request, reply) => {
+    const executor = await state.repository.getExecutorNode(
+      (request.params as { id: string }).id,
+    );
+    if (!executor) {
+      return reply.code(404).send({ error: "Executor not found" });
+    }
+    if (executor.kind !== "chrome_extension") {
+      return reply.code(400).send({ error: "Only chrome extension executors can detach a browser window" });
+    }
+    const body = (request.body ?? {}) as {
+      executorToken?: string;
+    };
+    if (!executorTokenMatches(executor, body.executorToken)) {
+      return reply.code(401).send({ error: "Executor token is invalid" });
+    }
+    const next = ExecutorNodeSchema.parse({
+      ...executor,
+      browserAttachment: detachedBrowserAttachment(executor.browserAttachment),
+      updatedAt: nowIso(),
+    });
+    await state.repository.saveExecutorNode(next);
+    logInternalEvent("executor_detached", {
+      executorId: executor.id,
+    });
+    return {
+      ok: true,
+      executor: next,
+    };
+  });
+
+  app.post("/api/executors/:id/force-detach", { preHandler: requireOwner }, async (request) => {
+    const executor = await state.repository.getExecutorNode(
+      (request.params as { id: string }).id,
+    );
+    if (!executor) {
+      throw app.httpErrors.notFound("Executor not found");
+    }
+    if (executor.kind !== "chrome_extension") {
+      throw app.httpErrors.badRequest("Only chrome extension executors support force detach");
+    }
+    const next = ExecutorNodeSchema.parse({
+      ...executor,
+      browserAttachment: detachedBrowserAttachment(executor.browserAttachment),
+      updatedAt: nowIso(),
+    });
+    await state.repository.saveExecutorNode(next);
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      "force_detach_executor",
+      "executor",
+      executor.id,
+    );
+    logInternalEvent("executor_force_detached", {
+      executorId: executor.id,
+    });
+    return next;
+  });
+
   app.post("/api/executors/:id/heartbeat", async (request, reply) => {
     const executor = await state.repository.getExecutorNode(
       (request.params as { id: string }).id,
@@ -8996,6 +9309,7 @@ export async function createApp(
       platform?: string;
       capabilities?: string[];
       metadata?: Record<string, unknown>;
+      browserState?: Record<string, unknown>;
       completedRuns?: Array<{
         taskRunId?: string;
         status?: "completed" | "failed" | "aborted";
@@ -9009,9 +9323,16 @@ export async function createApp(
           content?: unknown;
         }>;
       }>;
+      executorLogs?: unknown[];
       companionLogs?: unknown[];
     };
     const timestamp = nowIso();
+    const metadata = asRecord(body.metadata);
+    const resolvedMetadata = metadata ?? asRecord(executor.metadata) ?? {};
+    const browserState = asRecord(body.browserState);
+    const effectiveCapabilities = executor.kind === "companion"
+      ? (Array.isArray(body.capabilities) ? body.capabilities : executor.capabilities)
+      : ["browser"];
     let next = executor;
     let paired = false;
     let executorToken: string | null = null;
@@ -9041,10 +9362,14 @@ export async function createApp(
         status: "online",
         version: body.version ?? executor.version,
         platform: body.platform ?? executor.platform,
-        capabilities: Array.isArray(body.capabilities)
-          ? body.capabilities
-          : executor.capabilities,
-        metadata: asRecord(body.metadata ?? executor.metadata),
+        capabilities: effectiveCapabilities,
+        metadata: resolvedMetadata,
+        browserAttachment: syncChromeExtensionBrowserAttachment({
+          executor,
+          browserState,
+          metadata: resolvedMetadata,
+          fallbackProfileLabel: asString(browserState?.profileLabel),
+        }),
         pairingCodeHash: null,
         executorTokenHash: sha256(executorToken),
         pairedAt: executor.pairedAt ?? timestamp,
@@ -9076,10 +9401,14 @@ export async function createApp(
         status: "online",
         version: body.version ?? executor.version,
         platform: body.platform ?? executor.platform,
-        capabilities: Array.isArray(body.capabilities)
-          ? body.capabilities
-          : executor.capabilities,
-        metadata: asRecord(body.metadata ?? executor.metadata),
+        capabilities: effectiveCapabilities,
+        metadata: resolvedMetadata,
+        browserAttachment: syncChromeExtensionBrowserAttachment({
+          executor,
+          browserState,
+          metadata: resolvedMetadata,
+          fallbackProfileLabel: asString(browserState?.profileLabel),
+        }),
         lastHeartbeatAt: timestamp,
         lastSeenAt: timestamp,
         updatedAt: timestamp,
@@ -9089,9 +9418,9 @@ export async function createApp(
     }
 
     await state.repository.saveExecutorNode(next);
-    await ingestCompanionLogs({
+    await ingestExecutorLogs({
       executorId: executor.id,
-      logs: normalizeCompanionLogEntries(body.companionLogs),
+      logs: normalizeExecutorLogEntries(body.executorLogs ?? body.companionLogs),
     });
 
     for (const runUpdate of body.completedRuns ?? []) {
@@ -9124,9 +9453,9 @@ export async function createApp(
         finishedAt: timestamp,
       });
       await state.repository.saveTaskRun(updatedRun);
-      await ingestCompanionLogs({
+      await ingestExecutorLogs({
         executorId: executor.id,
-        logs: normalizeCompanionLogEntries(runUpdate.logs).map((entry) => ({
+        logs: normalizeExecutorLogEntries(runUpdate.logs).map((entry) => ({
           ...entry,
           taskRunId: entry.taskRunId ?? taskRun.id,
         })),
@@ -9180,6 +9509,36 @@ export async function createApp(
         continue;
       }
       const task = taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null;
+      if (
+        next.kind === "chrome_extension" &&
+        String(taskRun.executionPlan.capability ?? "") === "browser"
+      ) {
+        const browserReady = browserExecutorReady(next);
+        if (!browserReady.ready) {
+          const waitingRun = TaskRunSchema.parse({
+            ...taskRun,
+            status: "waiting_retry",
+            error: browserReady.message ?? "Chrome extension executor is not ready.",
+            updatedAt: timestamp,
+          });
+          await state.repository.saveTaskRun(waitingRun);
+          await appendSessionEvent({
+            sessionId: taskRun.sessionId,
+            eventType: "task_run_waiting_retry",
+            payload: {
+              taskRunId: taskRun.id,
+              executorId: executor.id,
+              error: waitingRun.error,
+            },
+          });
+          await sendTaskRunStatusUpdate({
+            task,
+            taskRun: waitingRun,
+            status: "waiting_retry",
+          });
+          continue;
+        }
+      }
       const startedRun = TaskRunSchema.parse({
         ...taskRun,
         status: "running",
@@ -9219,6 +9578,8 @@ export async function createApp(
       payload: {
         executorId: executor.id,
         assignmentCount: assignments.length,
+        attachState: next.browserAttachment.state,
+        attachedOrigin: next.browserAttachment.origin,
       },
     });
     logInternalEvent("executor_heartbeat", {
@@ -9227,6 +9588,8 @@ export async function createApp(
       assignmentCount: assignments.length,
       completedRunCount: Array.isArray(body.completedRuns) ? body.completedRuns.length : 0,
       onlineStatus: next.status,
+      attachState: next.browserAttachment.state,
+      attachedOrigin: next.browserAttachment.origin,
     });
 
     return {

@@ -145,3 +145,108 @@
 
 - 这只适合本地开发和 UI 联调
 - 真正的 owner 绑定、Telegram 登录态和 Bot 私聊消息链路仍应以 Telegram 内实际行为为准
+
+## 15. Chrome Extension Executor 配对失败
+
+常见现象：
+
+- 扩展 popup 里 `Pair` 后仍然是 `Unpaired`
+- popup 提示 token 无效、pairing 失败或没有拿到 executor token
+- Mini App 里的 executor 长时间停在 `pending_pairing`
+
+排查顺序：
+
+1. 确认 `apps/chrome-extension/dist` 是最新构建产物
+2. 确认扩展 popup 里填的是：
+   - 正确的 server URL
+   - 正确的 executor id
+   - 最新生成的 pairing code
+3. pairing code 过期或使用过后，回到 `Executors` 面板重新点一次 `Pair`
+4. 如果你刚改过扩展代码，回到 `chrome://extensions` 执行一次 `Reload`
+5. 确认 Mini App 里的 executor kind 确实是 `Chrome Extension`，不是 `Companion`
+
+额外说明：
+
+- pairing code 是短时凭证，不是长期 token。
+- server 端配对成功后，扩展会持久化 `executorToken`，后续心跳不再依赖 pairing code。
+
+## 16. Chrome Extension attach 失败，提示 `Origin is not allowed`
+
+这通常不是扩展坏了，而是 allowlist 或当前前台窗口不对。
+
+优先检查：
+
+1. `allowedHosts` 里写的是 hostname，不是完整 URL
+2. 允许值示例：
+   - `example.com`
+   - `*.example.com`
+   - `127.0.0.1`
+3. 不要写成：
+   - `https://example.com`
+   - `https://example.com/path`
+   - `example.com:443`
+4. 点击 `Attach Current Window` 前，先把真正要交给 agent 的网页切到前台
+5. 确认你 attach 的不是扩展 popup、Mini App 自己或别的无关标签页
+
+如果已经 attach 错了：
+
+1. 回 Mini App 的 `Executors` 面板
+2. 对该 executor 执行 `Force Detach`
+3. 把正确网页切到前台
+4. 重新 attach
+
+## 17. Chrome Extension 明明配对成功了，但 task run 仍然是 `waiting_retry`
+
+这类问题优先看 `Tasks` 面板里的 `Workflow Capability Preview` 和 `Executors` 面板里的 browser attachment。
+
+常见原因：
+
+- `browser_not_attached`
+  - 还没有显式 attach 浏览器窗口
+- `attached_origin_not_allowed`
+  - 当前附着的网页域名不在 `allowedHosts`
+- `attached_origin_missing`
+  - 当前附着标签页没有可读 URL
+- executor 在线，但 attach 状态还是 `Detached`
+
+建议顺序：
+
+1. 先看 `Executors` 面板是否显示 `Attached`
+2. 再看附着 origin 是否就是目标站点
+3. 回 `Tasks` 看 preview 里的 blocker
+4. 如果 attachment 明显陈旧，先 `Force Detach` 再重来
+5. 去 `Sessions` 看是否已经出现 `task_run_waiting_retry` 和 `executor_log`
+
+## 18. Chrome Extension attach 成功，但浏览器步骤没有执行
+
+常见现象：
+
+- run 最后变成 `failed`
+- `Sessions` 里看不到预期的 browser step
+- 没有 `DOM Snapshot` 或 `Screenshot`
+
+优先检查：
+
+1. 是否真的 attach 到了要操作的目标网页，而不是 Mini App 自己
+2. 目标网页是否仍在 allowlist 内
+3. 扩展是否已经重新加载到最新版本
+4. 任务模板里的 selector 是否正确
+5. `Sessions` 面板里是否有 `executor_log`
+
+如果你是在本地调试：
+
+1. 重新 `build`
+2. 在 `chrome://extensions` 里 `Reload` 扩展
+3. `Force Detach`
+4. 重新 `Pair` 或重新 `Attach Current Window`
+5. 再跑一次最小 `browser_workflow`
+
+## 19. Companion 在线，但任务还是跑不起来
+
+优先检查：
+
+1. `Executors` 面板里的 capability 是否覆盖了任务需要的能力
+2. `allowedHosts / allowedPaths / allowedCommands` 是否把目标操作拦掉了
+3. task preview 是否提示 capability block
+4. `Sessions` 里是否已有 `executor_log`
+5. 如果是 `fs / shell`，确认 approval checkpoint 没把任务卡在 `waiting_approval`

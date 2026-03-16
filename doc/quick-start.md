@@ -143,7 +143,55 @@ npm exec --yes pnpm@10.6.3 --filter @pulsarbot/admin dev
 - `apiFetch` 使用相对路径
 - 因此完整业务联调仍应优先通过 `apps/server` 提供的 `/miniapp/`
 
-## 8. 下一步阅读
+## 8. 可选：接入本地执行端
+
+当前本地联调时，云端 control plane 仍然是 `apps/server`。如果你要测试 executor-backed workflow，还可以把下面两类本地执行端接进来。
+
+### 8.1 Chrome Extension Executor
+
+适合操作本机浏览器里已经登录的网页。
+
+1. 先执行一次根目录 `build`
+2. 打开 `http://localhost:3000/miniapp/`
+3. 在 `Executors` 创建 kind=`Chrome Extension`
+4. 填 `allowedHosts`
+5. 点击 `Pair`
+6. 打开 `chrome://extensions`
+7. 启用 `Developer mode`
+8. `Load unpacked` -> `apps/chrome-extension/dist`
+9. 在扩展 popup 中填入：
+   - `http://localhost:3000`
+   - executor id
+   - pairing code
+10. `Pair`
+11. 把目标网页切到前台，点击 `Attach Current Window`
+
+说明：
+
+- 扩展 phase1 只有 `browser` capability。
+- 推荐单独使用 dedicated Chrome profile。
+
+### 8.2 Native Companion
+
+适合测试 `browser / http / fs / shell` 这类高权限执行。
+
+1. 在 `Executors` 创建 kind=`Companion`
+2. 点击 `Pair`
+3. 在本机运行：
+
+```bash
+PULSARBOT_SERVER_URL=http://localhost:3000 \
+PULSARBOT_EXECUTOR_ID=<executor-id> \
+PULSARBOT_PAIRING_CODE=<pairing-code> \
+npm exec --yes pnpm@10.6.3 --filter @pulsarbot/companion dev
+```
+
+说明：
+
+- pairing code 有有效期，过期后重新生成即可。
+- `cloud_browser` 当前只是预留 kind，本地快速开始里不启用。
+
+## 9. 下一步阅读
 
 - [管理台使用说明](miniapp-guide.md)
 - [仓库结构与架构](project-structure.md)

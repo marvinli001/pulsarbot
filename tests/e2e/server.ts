@@ -245,6 +245,88 @@ async function main() {
     telegramFactory: fakeTelegramFactory as never,
   });
 
+  app.get("/e2e/browser-target", async (_request, reply) =>
+    reply
+      .type("text/html; charset=utf-8")
+      .send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pulsarbot Browser Target</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      main { display: grid; gap: 12px; max-width: 520px; }
+      button, input { font: inherit; padding: 10px 12px; }
+      button { cursor: pointer; }
+      .card { border: 1px solid #cbd5e1; border-radius: 16px; padding: 16px; }
+      .spacer { height: 1200px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1 id="headline">Pulsarbot Browser Target</h1>
+        <p id="status-text">Idle</p>
+        <form id="name-form">
+          <input id="name-input" placeholder="Type here" />
+          <button id="primary-action" type="submit">Submit via form</button>
+        </form>
+        <div id="result" data-state="waiting">Waiting</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="card">
+        <p id="pointer-status">Idle</p>
+        <button id="pointer-action" type="button">Pointer Action</button>
+        <div id="pointer-result" data-state="waiting">Waiting</div>
+      </div>
+    </main>
+    <script>
+      const statusText = document.getElementById("status-text");
+      const input = document.getElementById("name-input");
+      const result = document.getElementById("result");
+      const form = document.getElementById("name-form");
+      const pointerStatus = document.getElementById("pointer-status");
+      const pointerResult = document.getElementById("pointer-result");
+      const pointerAction = document.getElementById("pointer-action");
+      let sawPointerDown = false;
+      let sawMouseDown = false;
+      let sawPointerUp = false;
+      let sawMouseUp = false;
+
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        statusText.textContent = "Submitted";
+        result.dataset.state = "submitted";
+        result.textContent = "Hello " + (input.value || "anonymous");
+      });
+
+      pointerAction.addEventListener("pointerdown", () => {
+        sawPointerDown = true;
+      });
+      pointerAction.addEventListener("mousedown", () => {
+        sawMouseDown = true;
+      });
+      pointerAction.addEventListener("pointerup", () => {
+        sawPointerUp = true;
+      });
+      pointerAction.addEventListener("mouseup", () => {
+        sawMouseUp = true;
+      });
+      pointerAction.addEventListener("click", () => {
+        const pointerReady = sawMouseDown && sawMouseUp;
+        pointerStatus.textContent = pointerReady
+          ? "Pointer ready"
+          : "Missing pointer sequence";
+        pointerResult.dataset.state = pointerReady ? "clicked" : "missing-pointer";
+        pointerResult.textContent = pointerReady
+          ? "Pointer click completed"
+          : "Pointer sequence missing";
+      });
+    </script>
+  </body>
+</html>`),
+  );
+
   const closeServer = async () => {
     await app.close();
     await rm(dataDir, { recursive: true, force: true });

@@ -697,6 +697,403 @@ describe("task control plane", () => {
     await app.close();
   });
 
+  it("pairs, attaches, detaches, and dispatches chrome extension executors", async () => {
+    const { app, cookie } = await bootstrapApp();
+
+    const createdExecutor = await app.inject({
+      method: "POST",
+      url: "/api/executors",
+      headers: { cookie },
+      payload: {
+        label: "Browser Window",
+        kind: "chrome_extension",
+        capabilities: ["browser", "http"],
+        scopes: {
+          allowedHosts: ["example.com"],
+        },
+      },
+    });
+    expect(createdExecutor.statusCode).toBe(200);
+    const executor = createdExecutor.json<Record<string, any>>();
+    expect(executor.kind).toBe("chrome_extension");
+    expect(executor.capabilities).toEqual(["browser"]);
+
+    const paired = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/pair`,
+      headers: { cookie },
+    });
+    expect(paired.statusCode).toBe(200);
+    const pairingPayload = paired.json<Record<string, any>>();
+
+    const pairedHeartbeat = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/heartbeat`,
+      payload: {
+        pairingCode: pairingPayload.pairingCode,
+        platform: "chrome-extension",
+        capabilities: ["browser"],
+        metadata: {
+          extensionInstanceId: "ext-test",
+          browserName: "chrome",
+          browserVersion: "123.0",
+          manifestVersion: 3,
+          profileLabel: "Work",
+        },
+        browserState: {
+          attachState: "detached",
+          mode: "single_window",
+          windowId: null,
+          activeTab: {
+            tabId: null,
+            url: null,
+            origin: null,
+            title: null,
+          },
+          attachedAt: null,
+          lastSnapshotAt: null,
+          extensionInstanceId: "ext-test",
+          profileLabel: "Work",
+        },
+      },
+    });
+    expect(pairedHeartbeat.statusCode).toBe(200);
+    const heartbeatPayload = pairedHeartbeat.json<Record<string, any>>();
+    const executorToken = String(heartbeatPayload.executorToken ?? "");
+    expect(executorToken).toContain("exec.");
+    expect(heartbeatPayload.executor.browserAttachment.state).toBe("detached");
+
+    const missingWindowAttach = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/attach`,
+      payload: {
+        executorToken,
+        url: "https://example.com/app",
+        origin: "https://example.com",
+        title: "Missing Window",
+      },
+    });
+    expect(missingWindowAttach.statusCode).toBe(400);
+    expect(missingWindowAttach.json<Record<string, any>>().error).toContain("windowId and tabId");
+
+    const disallowedAttach = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/attach`,
+      payload: {
+        executorToken,
+        windowId: 11,
+        tabId: 21,
+        url: "https://not-allowed.test/app",
+        origin: "https://not-allowed.test",
+        title: "Bad",
+      },
+    });
+    expect(disallowedAttach.statusCode).toBe(400);
+
+    const allowedAttach = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/attach`,
+      payload: {
+        executorToken,
+        windowId: 11,
+        tabId: 21,
+        url: "https://example.com/app",
+        origin: "https://example.com",
+        title: "Example App",
+        profileLabel: "Work",
+      },
+    });
+    expect(allowedAttach.statusCode).toBe(200);
+    expect(allowedAttach.json<Record<string, any>>().executor.browserAttachment.state).toBe("attached");
+
+    const createdTask = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: { cookie },
+      payload: {
+        title: "Chrome Browser Task",
+        goal: "Use the attached browser tab.",
+        templateKind: "browser_workflow",
+        status: "active",
+        defaultExecutorId: executor.id,
+        approvalPolicy: "auto_approve_safe",
+        approvalCheckpoints: [],
+        config: {
+          startUrl: "https://example.com/app",
+          steps: [
+            {
+              type: "extract_text",
+              selector: "body",
+              label: "Body",
+            },
+          ],
+          captureScreenshot: true,
+        },
+      },
+    });
+    const task = createdTask.json<Record<string, any>>();
+
+    const firstRun = await app.inject({
+      method: "POST",
+      url: "/api/task-runs",
+      headers: { cookie },
+      payload: {
+        taskId: task.id,
+      },
+    });
+    expect(firstRun.statusCode).toBe(200);
+    const firstRunPayload = firstRun.json<Record<string, any>>();
+    expect(firstRunPayload.taskRun.status).toBe("queued");
+
+    const disallowedHeartbeat = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/heartbeat`,
+      payload: {
+        executorToken,
+        platform: "chrome-extension",
+        browserState: {
+          attachState: "attached",
+          mode: "single_window",
+          windowId: 11,
+          activeTab: {
+            tabId: 21,
+            url: "https://bad.test/app",
+            origin: "https://bad.test",
+            title: "Blocked",
+          },
+          attachedAt: new Date().toISOString(),
+          lastSnapshotAt: null,
+          extensionInstanceId: "ext-test",
+          profileLabel: "Work",
+        },
+      },
+    });
+    expect(disallowedHeartbeat.statusCode).toBe(200);
+    expect(disallowedHeartbeat.json<Record<string, any>>().assignments).toEqual([]);
+
+    const waitingRetryRun = await app.inject({
+      method: "GET",
+      url: "/api/task-runs",
+      headers: { cookie },
+    });
+    expect(
+      waitingRetryRun
+        .json<Array<Record<string, any>>>()
+        .find((run) => run.id === firstRunPayload.taskRun.id)?.status,
+    ).toBe("waiting_retry");
+
+    const reattach = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/attach`,
+      payload: {
+        executorToken,
+        windowId: 11,
+        tabId: 22,
+        url: "https://example.com/dashboard",
+        origin: "https://example.com",
+        title: "Dashboard",
+        profileLabel: "Work",
+      },
+    });
+    expect(reattach.statusCode).toBe(200);
+
+    const secondRun = await app.inject({
+      method: "POST",
+      url: "/api/task-runs",
+      headers: { cookie },
+      payload: {
+        taskId: task.id,
+      },
+    });
+    expect(secondRun.statusCode).toBe(200);
+    const secondRunPayload = secondRun.json<Record<string, any>>();
+    expect(secondRunPayload.taskRun.status).toBe("queued");
+
+    const assignmentHeartbeat = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/heartbeat`,
+      payload: {
+        executorToken,
+        platform: "chrome-extension",
+        browserState: {
+          attachState: "attached",
+          mode: "single_window",
+          windowId: 11,
+          activeTab: {
+            tabId: 22,
+            url: "https://example.com/dashboard",
+            origin: "https://example.com",
+            title: "Dashboard",
+          },
+          attachedAt: new Date().toISOString(),
+          lastSnapshotAt: null,
+          extensionInstanceId: "ext-test",
+          profileLabel: "Work",
+        },
+      },
+    });
+    expect(assignmentHeartbeat.statusCode).toBe(200);
+    const assignmentPayload = assignmentHeartbeat.json<Record<string, any>>();
+    expect(assignmentPayload.assignments).toHaveLength(1);
+
+    const completionHeartbeat = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/heartbeat`,
+      payload: {
+        executorToken,
+        platform: "chrome-extension",
+        browserState: {
+          attachState: "attached",
+          mode: "single_window",
+          windowId: 11,
+          activeTab: {
+            tabId: 22,
+            url: "https://example.com/dashboard",
+            origin: "https://example.com",
+            title: "Dashboard",
+          },
+          attachedAt: new Date().toISOString(),
+          lastSnapshotAt: new Date().toISOString(),
+          extensionInstanceId: "ext-test",
+          profileLabel: "Work",
+        },
+        completedRuns: [
+          {
+            taskRunId: secondRunPayload.taskRun.id,
+            status: "completed",
+            outputSummary: "Browser workflow completed on dashboard",
+            artifacts: [
+              {
+                id: "artifact-dom",
+                label: "DOM Snapshot",
+                kind: "json",
+                content: {
+                  title: "Dashboard",
+                },
+              },
+              {
+                id: "artifact-shot",
+                label: "Screenshot",
+                kind: "screenshot",
+                content: {
+                  mimeType: "image/png",
+                  base64: "ZmFrZQ==",
+                },
+              },
+            ],
+            logs: [
+              {
+                taskRunId: secondRunPayload.taskRun.id,
+                scope: "assignment",
+                level: "info",
+                event: "browser_step_completed",
+                message: "Extracted text",
+                detail: {
+                  selector: "body",
+                },
+                occurredAt: new Date().toISOString(),
+              },
+            ],
+          },
+        ],
+        executorLogs: [
+          {
+            taskRunId: null,
+            scope: "heartbeat",
+            level: "info",
+            event: "heartbeat_sent",
+            message: "Heartbeat sent",
+            detail: {},
+            occurredAt: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+    expect(completionHeartbeat.statusCode).toBe(200);
+
+    const completedRuns = await app.inject({
+      method: "GET",
+      url: "/api/task-runs",
+      headers: { cookie },
+    });
+    const completedRun = completedRuns
+      .json<Array<Record<string, any>>>()
+      .find((run) => run.id === secondRunPayload.taskRun.id);
+    expect(completedRun?.status).toBe("completed");
+    expect(completedRun?.artifacts?.map((artifact: Record<string, any>) => artifact.label)).toContain("DOM Snapshot");
+    expect(completedRun?.artifacts?.map((artifact: Record<string, any>) => artifact.label)).toContain("Screenshot");
+
+    const staleStateHeartbeat = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/heartbeat`,
+      payload: {
+        executorToken,
+        platform: "chrome-extension",
+        browserState: {
+          attachState: "attached",
+          mode: "single_window",
+          windowId: null,
+          activeTab: {
+            tabId: null,
+            url: null,
+            origin: null,
+            title: null,
+          },
+          attachedAt: new Date().toISOString(),
+          lastSnapshotAt: new Date().toISOString(),
+          extensionInstanceId: "ext-test",
+          profileLabel: "Work",
+        },
+      },
+    });
+    expect(staleStateHeartbeat.statusCode).toBe(200);
+    const staleExecutor = staleStateHeartbeat.json<Record<string, any>>().executor as Record<string, any>;
+    expect(staleExecutor.browserAttachment.windowId).toBeNull();
+    expect(staleExecutor.browserAttachment.tabId).toBeNull();
+    expect(staleExecutor.browserAttachment.origin).toBeNull();
+
+    const staleRun = await app.inject({
+      method: "POST",
+      url: "/api/task-runs",
+      headers: { cookie },
+      payload: {
+        taskId: task.id,
+      },
+    });
+    expect(staleRun.statusCode).toBe(200);
+    expect(staleRun.json<Record<string, any>>().taskRun.status).toBe("waiting_retry");
+
+    const sessionEvents = await app.inject({
+      method: "GET",
+      url: `/api/system/turns/${encodeURIComponent(String(secondRunPayload.taskRun.sessionId))}/events`,
+      headers: { cookie },
+    });
+    const eventTypes = sessionEvents.json<Array<Record<string, any>>>().map((event) => event.eventType);
+    expect(eventTypes).toContain("executor_log");
+    expect(eventTypes).toContain("task_run_completed");
+
+    const forceDetached = await app.inject({
+      method: "POST",
+      url: `/api/executors/${executor.id}/force-detach`,
+      headers: { cookie },
+    });
+    expect(forceDetached.statusCode).toBe(200);
+    expect(forceDetached.json<Record<string, any>>().browserAttachment.state).toBe("detached");
+
+    const thirdRun = await app.inject({
+      method: "POST",
+      url: "/api/task-runs",
+      headers: { cookie },
+      payload: {
+        taskId: task.id,
+      },
+    });
+    expect(thirdRun.statusCode).toBe(200);
+    expect(thirdRun.json<Record<string, any>>().taskRun.status).toBe("waiting_retry");
+
+    await app.close();
+  });
+
   it("expires stale approvals and aborts waiting runs", async () => {
     const { app, cookie } = await bootstrapApp();
     const appState = app as typeof app & {
