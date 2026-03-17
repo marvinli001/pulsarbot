@@ -3,6 +3,7 @@ import {
   buildForumTopicNameFromReply,
   createTelegramBot,
   createTelegramStreamController,
+  formatTelegramRichText,
   getImplicitForumTopicThreadId,
   isForumTopicServiceMessage,
   splitTelegramMessageText,
@@ -33,14 +34,18 @@ describe("Telegram streaming controller", () => {
     await vi.advanceTimersByTimeAsync(800);
 
     expect(reply).toHaveBeenCalledTimes(1);
-    expect(reply).toHaveBeenLastCalledWith("he", undefined);
+    expect(reply).toHaveBeenLastCalledWith("he", {
+      parse_mode: "HTML",
+    });
     expect(editMessageText).toHaveBeenCalledTimes(0);
 
     await controller.emit("hel");
     await controller.finalize("hello");
 
     expect(editMessageText).toHaveBeenCalledTimes(1);
-    expect(editMessageText).toHaveBeenLastCalledWith(42, 7, "hello");
+    expect(editMessageText).toHaveBeenLastCalledWith(42, 7, "hello", {
+      parse_mode: "HTML",
+    });
     expect(reply).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(2_000);
@@ -70,7 +75,9 @@ describe("Telegram streaming controller", () => {
 
     expect(editMessageText).toHaveBeenCalledTimes(1);
     expect(reply).toHaveBeenCalledTimes(2);
-    expect(reply).toHaveBeenLastCalledWith("hello", undefined);
+    expect(reply).toHaveBeenLastCalledWith("hello", {
+      parse_mode: "HTML",
+    });
   });
 
   it("splits oversized final replies into multiple Telegram messages", async () => {
@@ -97,7 +104,9 @@ describe("Telegram streaming controller", () => {
     const expectedChunks = splitTelegramMessageText(longReply);
     expect(expectedChunks.length).toBeGreaterThan(1);
     expect(editMessageText).toHaveBeenCalledTimes(1);
-    expect(editMessageText).toHaveBeenLastCalledWith(42, 7, expectedChunks[0]);
+    expect(editMessageText).toHaveBeenLastCalledWith(42, 7, expectedChunks[0], {
+      parse_mode: "HTML",
+    });
     expect(reply).toHaveBeenCalledTimes(expectedChunks.length);
     expect(reply.mock.calls.slice(1).map((call) => call[0])).toEqual(expectedChunks.slice(1));
     expect(expectedChunks.every((chunk) => Array.from(chunk).length <= 4096)).toBe(true);
@@ -149,6 +158,46 @@ describe("Telegram service message filters", () => {
     expect(buildForumTopicNameFromReply("  hello\n\nworld  ")).toBe("helloworld");
     expect(buildForumTopicNameFromReply("   ")).toBeNull();
     expect(buildForumTopicNameFromReply("a".repeat(140))).toHaveLength(10);
+  });
+
+  it("formats markdown-style reply text into Telegram HTML", () => {
+    expect(formatTelegramRichText([
+      "### Summary",
+      "",
+      "1. **Bold point**",
+      "  - Child detail",
+      "",
+      "| Item | Value |",
+      "| --- | --- |",
+      "| Product | 5G MAX |",
+      "| Price | $70 |",
+      "",
+      "> quoted",
+      "> continuation",
+      "[Example](https://example.com)",
+      "`code`",
+      "```ts",
+      "const x = 1 < 2;",
+      "```",
+      "~~done~~",
+    ].join("\n"))).toEqual({
+      parse_mode: "HTML",
+      text: [
+        "<b>Summary</b>",
+        "",
+        "1. <b>Bold point</b>",
+        "&nbsp;&nbsp;&nbsp;&nbsp;- Child detail",
+        "",
+        "- Product: 5G MAX",
+        "- Price: $70",
+        "",
+        "<blockquote>quoted\ncontinuation</blockquote>",
+        "<a href=\"https://example.com\">Example</a>",
+        "<code>code</code>",
+        "<pre><code>const x = 1 &lt; 2;</code></pre>",
+        "<s>done</s>",
+      ].join("\n"),
+    });
   });
 
   it("splits long Telegram text on natural boundaries", () => {
@@ -246,6 +295,7 @@ describe("Telegram service message filters", () => {
     expect(sentMessages[1]).toMatchObject({
       chat_id: 42,
       message_thread_id: 777,
+      parse_mode: "HTML",
       text: "  Topic   Name\nFrom Agent  ",
     });
     expect(resolveForumTopicName).toHaveBeenCalledTimes(1);
@@ -290,5 +340,88 @@ describe("Telegram service message filters", () => {
     } as never);
 
     expect(onMessage).toHaveBeenCalledTimes(0);
+  });
+
+  it("returns from the webhook without throwing when processing exceeds the timeout", async () => {
+    const sentMessages: Array<Record<string, unknown>> = [];
+    const { bot, handler } = createTelegramBot({
+      token: "123456:TESTTOKEN",
+      webhook: {
+        onTimeout: "return",
+        timeoutMilliseconds: 5,
+      },
+      onMessage: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "slow reply";
+      },
+    });
+    bot.botInfo = {
+      id: 999001,
+      is_bot: true,
+      first_name: "PulsarBot",
+      username: "pulsarbot_test",
+      can_join_groups: true,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+    } as never;
+    bot.api.config.use(async (_prev, method, payload) => {
+      if (method === "sendChatAction") {
+        return true as never;
+      }
+      if (method === "sendMessage") {
+        sentMessages.push(payload as Record<string, unknown>);
+        return {
+          ok: true,
+          result: { message_id: 901 },
+        } as never;
+      }
+      if (method === "editMessageText") {
+        return true as never;
+      }
+      throw new Error(`Unexpected Telegram API method in test: ${method}`);
+    });
+
+    const reply = {
+      payload: null as unknown,
+      statusCode: 200,
+      code(statusCode: number) {
+        this.statusCode = statusCode;
+        return this;
+      },
+      headers(_headers: Record<string, string>) {
+        return this;
+      },
+      send(payload: unknown) {
+        this.payload = payload;
+        return payload;
+      },
+    };
+
+    await expect(handler({
+      body: {
+        update_id: 3001,
+        message: {
+          message_id: 601,
+          date: 4,
+          chat: { id: 42, type: "private" },
+          from: { id: 77, is_bot: false, first_name: "Owner" },
+          text: "slow webhook",
+        },
+      },
+      headers: {},
+    } as never, reply as never)).resolves.toBeUndefined();
+
+    expect(reply.statusCode).toBe(200);
+    expect(reply.payload).toBe("");
+    expect(sentMessages).toHaveLength(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0]).toMatchObject({
+      chat_id: 42,
+      parse_mode: "HTML",
+      text: "slow reply",
+    });
   });
 });

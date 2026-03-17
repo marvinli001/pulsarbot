@@ -263,10 +263,12 @@ export function LogsPanel() {
             {mcpLogs.map((item) => (
               <div
                 key={asString(item.serverId)}
-                className="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
+                className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs"
               >
-                <div className="flex items-center justify-between gap-3">
-                  <p className="font-medium text-slate-900">{asString(item.label)}</p>
+                <div className="flex min-w-0 items-center justify-between gap-3">
+                  <p className="min-w-0 break-words font-medium text-slate-900">
+                    {asString(item.label)}
+                  </p>
                   <Badge tone={toneForStatus(asString(item.lastHealthStatus))}>
                     {asString(item.lastHealthStatus)}
                   </Badge>
@@ -274,7 +276,13 @@ export function LogsPanel() {
                 <p className="mt-1 text-slate-500">
                   checked {asString(item.lastHealthCheckedAt)}
                 </p>
-                <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-slate-500">
+                <pre
+                  className="mt-2 max-w-full overflow-x-auto whitespace-pre-wrap break-all text-slate-500"
+                  style={{
+                    overflowWrap: "anywhere",
+                    wordBreak: "break-word",
+                  }}
+                >
                   {Array.isArray(item.logs) ? item.logs.slice(-4).join("\n") : ""}
                 </pre>
               </div>

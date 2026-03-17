@@ -118,7 +118,203 @@ type FinalizedReplyContext = {
   replyText: string;
 };
 
+type TelegramWebhookOptions = {
+  onTimeout?: "throw" | "return" | ((...args: unknown[]) => unknown);
+  timeoutMilliseconds?: number;
+  secretToken?: string;
+};
+
+type TelegramFormattedText = {
+  text: string;
+  parse_mode: "HTML";
+};
+
 const TELEGRAM_TEXT_LIMIT = 4096;
+const DEFAULT_WEBHOOK_OPTIONS: Required<Pick<TelegramWebhookOptions, "onTimeout" | "timeoutMilliseconds">> = {
+  // Return 200 before Telegram's webhook deadline and let the bot finish in the background.
+  onTimeout: "return",
+  timeoutMilliseconds: 9_000,
+};
+const TELEGRAM_RICH_TEXT_PLACEHOLDER = "\u0007tg";
+
+function escapeTelegramHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function stashTelegramRichTextSegment(segments: string[], html: string) {
+  const index = segments.push(html) - 1;
+  return `${TELEGRAM_RICH_TEXT_PLACEHOLDER}${index}${TELEGRAM_RICH_TEXT_PLACEHOLDER}`;
+}
+
+function restoreTelegramRichTextSegments(value: string, segments: string[]) {
+  const pattern = new RegExp(
+    `${TELEGRAM_RICH_TEXT_PLACEHOLDER}(\\d+)${TELEGRAM_RICH_TEXT_PLACEHOLDER}`,
+    "gu",
+  );
+  return value.replace(pattern, (_match, rawIndex: string) => {
+    const index = Number(rawIndex);
+    return Number.isInteger(index) ? (segments[index] ?? "") : "";
+  });
+}
+
+function isSafeTelegramHref(rawHref: string) {
+  try {
+    const href = new URL(rawHref);
+    return href.protocol === "http:" ||
+      href.protocol === "https:" ||
+      href.protocol === "mailto:" ||
+      href.protocol === "tg:";
+  } catch {
+    return false;
+  }
+}
+
+function isMarkdownTableSeparator(line: string) {
+  return /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/u.test(line);
+}
+
+function isMarkdownTableRow(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) {
+    return false;
+  }
+  const normalized = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
+  const candidate = normalized.endsWith("|") ? normalized.slice(0, -1) : normalized;
+  return candidate.split("|").length >= 2;
+}
+
+function splitMarkdownTableRow(line: string) {
+  const trimmed = line.trim();
+  const normalized = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
+  const candidate = normalized.endsWith("|") ? normalized.slice(0, -1) : normalized;
+  return candidate.split("|").map((cell) => cell.trim());
+}
+
+function downgradeMarkdownTables(text: string) {
+  const lines = text.split("\n");
+  const output: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index] ?? "";
+    const separator = lines[index + 1] ?? "";
+    if (!isMarkdownTableRow(header) || !isMarkdownTableSeparator(separator)) {
+      output.push(header);
+      continue;
+    }
+
+    const headerCells = splitMarkdownTableRow(header);
+    const rows: string[][] = [];
+    let cursor = index + 2;
+    while (cursor < lines.length && isMarkdownTableRow(lines[cursor] ?? "")) {
+      rows.push(splitMarkdownTableRow(lines[cursor] ?? ""));
+      cursor += 1;
+    }
+
+    if (rows.length === 0) {
+      output.push(header);
+      continue;
+    }
+
+    const downgradedRows = rows.map((cells) => {
+      if (cells.length === 2) {
+        return `- ${cells[0]}: ${cells[1]}`;
+      }
+      return `- ${cells.map((cell, cellIndex) => {
+        const headerLabel = headerCells[cellIndex] ?? `Column ${cellIndex + 1}`;
+        return `${headerLabel}: ${cell}`;
+      }).join(" | ")}`;
+    });
+    output.push(...downgradedRows);
+    index = cursor - 1;
+  }
+
+  return output.join("\n");
+}
+
+function formatTelegramDisplayLine(line: string) {
+  const listItem = line.match(/^(\s*)((?:\d+\.)|[-*+])\s+(.+)$/u);
+  if (!listItem) {
+    return line;
+  }
+  const indent = listItem[1].replace(/\t/g, "  ");
+  const depth = Math.max(0, Math.floor(indent.length / 2));
+  const prefix = "&nbsp;".repeat(depth * 4);
+  return `${prefix}${listItem[2]} ${listItem[3]}`;
+}
+
+function renderTelegramDisplayLines(text: string) {
+  const lines = text.split("\n");
+  const output: string[] = [];
+  let quoteBuffer: string[] = [];
+
+  const flushQuoteBuffer = () => {
+    if (quoteBuffer.length === 0) {
+      return;
+    }
+    output.push(`<blockquote>${quoteBuffer.join("\n")}</blockquote>`);
+    quoteBuffer = [];
+  };
+
+  for (const line of lines) {
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+)$/u);
+    const quote = line.match(/^\s*&gt;\s?(.*)$/u);
+    if (quote) {
+      quoteBuffer.push(quote[1]);
+      continue;
+    }
+
+    flushQuoteBuffer();
+
+    if (heading) {
+      output.push(`<b>${heading[1].trim()}</b>`);
+      continue;
+    }
+
+    output.push(formatTelegramDisplayLine(line));
+  }
+
+  flushQuoteBuffer();
+  return output.join("\n");
+}
+
+export function formatTelegramRichText(text: string): TelegramFormattedText {
+  const segments: string[] = [];
+  let rendered = downgradeMarkdownTables(text.replace(/\r\n/g, "\n"));
+
+  rendered = rendered.replace(/```([^\n`]*)\n([\s\S]*?)```/gu, (_match, _language: string, code: string) =>
+    stashTelegramRichTextSegment(
+      segments,
+      `<pre><code>${escapeTelegramHtml(code.replace(/\n+$/u, ""))}</code></pre>`,
+    ));
+
+  rendered = rendered.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/gu, (match, label: string, href: string) => {
+    if (!isSafeTelegramHref(href)) {
+      return match;
+    }
+    return stashTelegramRichTextSegment(
+      segments,
+      `<a href="${escapeTelegramHtml(href)}">${escapeTelegramHtml(label)}</a>`,
+    );
+  });
+
+  rendered = rendered.replace(/`([^`\n]+)`/gu, (_match, code: string) =>
+    stashTelegramRichTextSegment(segments, `<code>${escapeTelegramHtml(code)}</code>`));
+
+  rendered = escapeTelegramHtml(rendered);
+  rendered = renderTelegramDisplayLines(rendered);
+
+  rendered = rendered.replace(/\*\*([^*\n][^*\n]*?)\*\*/gu, "<b>$1</b>");
+  rendered = rendered.replace(/~~([^~\n][^~\n]*?)~~/gu, "<s>$1</s>");
+
+  return {
+    text: restoreTelegramRichTextSegments(rendered, segments),
+    parse_mode: "HTML",
+  };
+}
 
 function trimLeadingWhitespace(value: string) {
   return value.replace(/^\s+/u, "");
@@ -178,7 +374,11 @@ async function replyWithTelegramText(
 ) {
   const messages: Array<{ message_id: number }> = [];
   for (const chunk of splitTelegramMessageText(text)) {
-    messages.push(await ctx.reply(chunk, replyOptions));
+    const formatted = formatTelegramRichText(chunk);
+    messages.push(await ctx.reply(formatted.text, {
+      ...replyOptions,
+      parse_mode: formatted.parse_mode,
+    }));
   }
   return messages;
 }
@@ -354,7 +554,7 @@ async function dispatchMessage(args: {
 }) {
   const { ctx, content, onMessage, token, onFinalizedReply } = args;
   if (!ensurePrivate(ctx)) {
-    await ctx.reply("This version only supports private chats.");
+    await replyWithTelegramText(ctx, "This version only supports private chats.");
     return;
   }
 
@@ -539,8 +739,12 @@ export function createTelegramStreamController(args: {
     }
 
     try {
+      const formatted = formatTelegramRichText(nextRenderedText);
       if (streamedMessageId === null) {
-        const message = await args.ctx.reply(nextRenderedText, args.replyOptions);
+        const message = await args.ctx.reply(formatted.text, {
+          ...args.replyOptions,
+          parse_mode: formatted.parse_mode,
+        });
         streamedMessageId = message.message_id;
         lastRenderedText = nextRenderedText;
         lastFlushAt = Date.now();
@@ -552,7 +756,8 @@ export function createTelegramStreamController(args: {
       await args.ctx.api.editMessageText(
         args.ctx.chat!.id,
         streamedMessageId,
-        nextRenderedText,
+        formatted.text,
+        { parse_mode: formatted.parse_mode },
       );
       lastRenderedText = nextRenderedText;
       lastFlushAt = Date.now();
@@ -607,19 +812,28 @@ export function createTelegramStreamController(args: {
       if (finalChunks.length > 1) {
         const firstChunk = finalChunks[0] ?? "";
         try {
+          const formattedFirstChunk = formatTelegramRichText(firstChunk);
           if (streamedMessageId === null) {
-            const message = await args.ctx.reply(firstChunk, args.replyOptions);
+            const message = await args.ctx.reply(formattedFirstChunk.text, {
+              ...args.replyOptions,
+              parse_mode: formattedFirstChunk.parse_mode,
+            });
             streamedMessageId = message.message_id;
           } else {
             await args.ctx.api.editMessageText(
               args.ctx.chat!.id,
               streamedMessageId,
-              firstChunk,
+              formattedFirstChunk.text,
+              { parse_mode: formattedFirstChunk.parse_mode },
             );
           }
           lastRenderedText = firstChunk;
           for (const chunk of finalChunks.slice(1)) {
-            await args.ctx.reply(chunk, args.replyOptions);
+            const formattedChunk = formatTelegramRichText(chunk);
+            await args.ctx.reply(formattedChunk.text, {
+              ...args.replyOptions,
+              parse_mode: formattedChunk.parse_mode,
+            });
           }
         } catch {
           try {
@@ -634,7 +848,11 @@ export function createTelegramStreamController(args: {
       try {
         const flushed = await flush(true);
         if (!flushed || latestText !== lastRenderedText) {
-          const message = await args.ctx.reply(latestText, args.replyOptions);
+          const formatted = formatTelegramRichText(latestText);
+          const message = await args.ctx.reply(formatted.text, {
+            ...args.replyOptions,
+            parse_mode: formatted.parse_mode,
+          });
           streamedMessageId = streamedMessageId ?? message.message_id;
           lastRenderedText = latestText;
         }
@@ -642,7 +860,11 @@ export function createTelegramStreamController(args: {
         lastRenderedText = latestText;
         if (streamedMessageId === null) {
           try {
-            const message = await args.ctx.reply(latestText, args.replyOptions);
+            const formatted = formatTelegramRichText(latestText);
+            const message = await args.ctx.reply(formatted.text, {
+              ...args.replyOptions,
+              parse_mode: formatted.parse_mode,
+            });
             streamedMessageId = message.message_id;
           } catch {
             // Do not throw from finalize if Telegram rejects fallback send.
@@ -660,6 +882,7 @@ export function createTelegramBot(args: {
   resolveForumTopicName?: ForumTopicNameResolver;
   commandHandlers?: TelegramCommandHandlers;
   onCallbackQuery?: TelegramCallbackQueryHandler;
+  webhook?: TelegramWebhookOptions;
 }) {
   const bot = new Bot(args.token);
   const implicitTopicNames = new Map<string, { effectiveMessageCount: number }>();
@@ -983,7 +1206,10 @@ export function createTelegramBot(args: {
 
   return {
     bot,
-    handler: webhookCallback(bot, "fastify"),
+    handler: webhookCallback(bot, "fastify", {
+      ...DEFAULT_WEBHOOK_OPTIONS,
+      ...args.webhook,
+    }),
     describeWebhookState() {
       return { ...webhookState };
     },

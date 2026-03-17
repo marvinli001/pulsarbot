@@ -3632,6 +3632,130 @@ describe("server flows", () => {
     await appState.app.close();
   }, 15_000);
 
+  it("falls back to legacy unscoped R2 keys for document inspect and re-extraction", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir, {
+      backgroundPollMs: 50,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const exported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/export",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        exportPassphrase: "bundle-passphrase",
+      },
+    });
+    const bundle = exported.json<Record<string, any>>();
+    const documentId = "doc-legacy-r2-key";
+    const sourcePath = "documents/doc-legacy-r2-key/source/legacy-note.txt";
+    const derivedTextPath = "documents/doc-legacy-r2-key/derived/content.md";
+
+    bundle.documents = [
+      ...(Array.isArray(bundle.documents) ? bundle.documents : []),
+      {
+        id: documentId,
+        workspaceId: "main",
+        sourceType: "import",
+        kind: "text",
+        title: "legacy-note.txt",
+        path: sourcePath,
+        derivedTextPath,
+        sourceObjectKey: "workspace/main/missing-legacy-note.txt",
+        derivedTextObjectKey: null,
+        previewText: "legacy preview",
+        fileId: null,
+        sizeBytes: 24,
+        mimeType: "text/plain",
+        extractionStatus: "failed",
+        extractionMethod: null,
+        extractionProviderProfileId: null,
+        lastExtractionError: "stale",
+        lastExtractedAt: null,
+        lastIndexedAt: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+
+    const imported = await appState.app.inject({
+      method: "POST",
+      url: "/api/settings/import",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        accessToken: "dev-access-token",
+        importPassphrase: "bundle-passphrase",
+        bundle,
+      },
+    });
+    expect(imported.statusCode).toBe(200);
+
+    fakeObjects.set(
+      `main-r2:${sourcePath}`,
+      "legacy content recovered from an unscoped R2 key",
+    );
+
+    const inspectBeforeReextract = await appState.app.inject({
+      method: "GET",
+      url: `/api/documents/${documentId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(inspectBeforeReextract.statusCode).toBe(200);
+    expect(inspectBeforeReextract.json<Record<string, any>>()).toMatchObject({
+      id: documentId,
+      sourceAvailable: true,
+      sourceObjectKey: sourcePath,
+    });
+
+    const reextract = await appState.app.inject({
+      method: "POST",
+      url: `/api/documents/${documentId}/re-extract`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(reextract.statusCode).toBe(200);
+
+    await waitForCondition(async () => {
+      const response = await appState.app.inject({
+        method: "GET",
+        url: `/api/documents/${documentId}`,
+        headers: {
+          cookie: appState.cookie,
+        },
+      });
+      return response.json<Record<string, any>>().extractionStatus === "completed";
+    });
+
+    const documentResponse = await appState.app.inject({
+      method: "GET",
+      url: `/api/documents/${documentId}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(documentResponse.statusCode).toBe(200);
+    expect(documentResponse.json<Record<string, any>>()).toMatchObject({
+      id: documentId,
+      extractionStatus: "completed",
+      sourceObjectKey: sourcePath,
+      sourceAvailable: true,
+      sourcePreview: "legacy content recovered from an unscoped R2 key",
+    });
+
+    await appState.app.close();
+  }, 15_000);
+
   it("marks a document as failed when re-extraction crashes before completion", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);

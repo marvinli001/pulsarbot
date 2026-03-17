@@ -520,6 +520,8 @@ describe("AgentRuntime", () => {
     expect(systemPrompt).toContain("Enabled MCP servers: Exa Search");
     expect(systemPrompt).toContain("Blocked runtime references: plugin:web-browse-fetcher");
     expect(systemPrompt).toContain("Available tool ids right now:");
+    expect(systemPrompt).toContain("Telegram reply formatting rules:");
+    expect(systemPrompt).toContain("Never output markdown tables.");
   });
 
   it("executes native tool calls and feeds tool results back to the provider", async () => {

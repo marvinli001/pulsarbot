@@ -485,11 +485,20 @@ export class AgentRuntime {
 
     const currentSummary = () => agentState.summary.working || agentState.summary.existing;
     const scratchpadTexts = () => agentState.scratchpad.map((entry) => entry.text);
+    const telegramReplyStyleGuide = [
+      "Telegram reply formatting rules:",
+      "- Use only this formatting subset when styling helps: ### headings, **bold**, > blockquotes, numbered or hyphen lists, `inline code`, fenced code blocks, [label](https://url), and ~~strikethrough~~.",
+      "- Never output markdown tables. Rewrite them as bullets or 'Label: value' lines.",
+      "- Keep list nesting shallow: at most two levels.",
+      "- Do not output raw HTML.",
+      "- Prefer short paragraphs and flat bullets when formatting is optional.",
+    ].join("\n");
     const promptContext = () =>
       [
         args.input.profile.systemPrompt,
         `Current time: ${args.input.context.nowIso} (${args.input.context.timezone})`,
         ...args.skillPrompts,
+        telegramReplyStyleGuide,
         this.buildRuntimeCapabilitySummary(args.input.context, args.toolDescriptors),
         "Available tools:",
         ...args.toolDescriptors.map((tool) => `- ${tool.id}: ${tool.description}`),

@@ -115,6 +115,7 @@ import {
 } from "@pulsarbot/storage";
 import {
   createTelegramBot,
+  formatTelegramRichText,
   splitTelegramMessageText,
   type TelegramUpdatePayload,
 } from "@pulsarbot/telegram";
@@ -849,6 +850,87 @@ function summarizeTextLocally(input: string, maxParagraphs = 3): string {
     .join("\n\n");
 }
 
+function buildDocumentObjectKeyCandidates(args: {
+  workspaceId: string;
+  relativePath?: string | null;
+  explicitObjectKey?: string | null;
+}): string[] {
+  return [...new Set(
+    [
+      args.explicitObjectKey,
+      args.relativePath ? `workspace/${args.workspaceId}/${args.relativePath}` : null,
+      args.relativePath,
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+  )];
+}
+
+async function readStoredDocumentObjectRaw(args: {
+  state: RuntimeState;
+  workspaceId: string;
+  document: DocumentMetadata;
+  kind: "source" | "derived";
+}): Promise<{
+  key: string;
+  raw: {
+    body: Uint8Array;
+    contentType?: string | null | undefined;
+  };
+} | null> {
+  const cloudflare = args.state.cloudflare;
+  if (!cloudflare?.credentials.r2BucketName) {
+    return null;
+  }
+
+  const keyCandidates = args.kind === "source"
+    ? buildDocumentObjectKeyCandidates({
+        workspaceId: args.workspaceId,
+        relativePath: args.document.path,
+        explicitObjectKey: args.document.sourceObjectKey,
+      })
+    : buildDocumentObjectKeyCandidates({
+        workspaceId: args.workspaceId,
+        relativePath: args.document.derivedTextPath,
+        explicitObjectKey: args.document.derivedTextObjectKey,
+      });
+
+  for (const key of keyCandidates) {
+    const raw = await cloudflare.client.getR2ObjectRaw({
+      bucketName: cloudflare.credentials.r2BucketName,
+      key,
+    });
+    if (raw) {
+      return { key, raw };
+    }
+  }
+
+  return null;
+}
+
+async function persistResolvedDocumentObjectKeys(args: {
+  state: RuntimeState;
+  document: DocumentMetadata;
+  sourceObjectKey?: string | null;
+  derivedTextObjectKey?: string | null;
+}): Promise<DocumentMetadata> {
+  const nextSourceObjectKey = args.sourceObjectKey ?? args.document.sourceObjectKey;
+  const nextDerivedTextObjectKey = args.derivedTextObjectKey ?? args.document.derivedTextObjectKey;
+
+  if (
+    nextSourceObjectKey === args.document.sourceObjectKey &&
+    nextDerivedTextObjectKey === args.document.derivedTextObjectKey
+  ) {
+    return args.document;
+  }
+
+  const nextDocument = {
+    ...args.document,
+    sourceObjectKey: nextSourceObjectKey,
+    derivedTextObjectKey: nextDerivedTextObjectKey,
+  };
+  await args.state.repository.saveDocument(nextDocument);
+  return nextDocument;
+}
+
 async function loadTaskDocumentText(args: {
   state: RuntimeState;
   documentId: string;
@@ -856,28 +938,44 @@ async function loadTaskDocumentText(args: {
   document: DocumentMetadata;
   text: string;
 }> {
-  const document = (await args.state.repository.listDocuments()).find((item) => item.id === args.documentId);
+  let document = (await args.state.repository.listDocuments()).find((item) => item.id === args.documentId);
   if (!document) {
     throw new Error("Task document was not found");
   }
 
-  const cloudflare = args.state.cloudflare;
   let text = "";
-  if (cloudflare?.credentials.r2BucketName && document.derivedTextObjectKey) {
-    text = await cloudflare.client.getR2Object({
-      bucketName: cloudflare.credentials.r2BucketName,
-      key: document.derivedTextObjectKey,
-    }) ?? "";
-  }
-  if (!text && cloudflare?.credentials.r2BucketName && document.sourceObjectKey) {
-    const raw = await cloudflare.client.getR2ObjectRaw({
-      bucketName: cloudflare.credentials.r2BucketName,
-      key: document.sourceObjectKey,
+  const derivedObject = await readStoredDocumentObjectRaw({
+    state: args.state,
+    workspaceId: document.workspaceId,
+    document,
+    kind: "derived",
+  });
+  if (derivedObject) {
+    text = decodeBestEffortText(derivedObject.raw.body);
+    document = await persistResolvedDocumentObjectKeys({
+      state: args.state,
+      document,
+      derivedTextObjectKey: derivedObject.key,
     });
-    if (raw) {
-      text = decodeBestEffortText(raw.body);
+  }
+
+  if (!text) {
+    const sourceObject = await readStoredDocumentObjectRaw({
+      state: args.state,
+      workspaceId: document.workspaceId,
+      document,
+      kind: "source",
+    });
+    if (sourceObject) {
+      text = decodeBestEffortText(sourceObject.raw.body);
+      document = await persistResolvedDocumentObjectKeys({
+        state: args.state,
+        document,
+        sourceObjectKey: sourceObject.key,
+      });
     }
   }
+
   if (!text && document.previewText) {
     text = document.previewText;
   }
@@ -5564,22 +5662,30 @@ export async function createApp(
   const reExtractDocument = async (documentId: string) => {
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
-    const document = (await state.repository.listDocuments()).find(
+    let document = (await state.repository.listDocuments()).find(
       (item) => item.id === documentId,
     );
     if (!document) {
       throw new Error("Document not found");
     }
-    const sourceObjectKey = document.sourceObjectKey ??
-      `workspace/${workspace.id}/${document.path}`;
-    const raw = await state.requireCloudflare().client.getR2ObjectRaw({
-      bucketName: state.requireCloudflare().credentials.r2BucketName!,
-      key: sourceObjectKey,
+
+    const sourceObject = await readStoredDocumentObjectRaw({
+      state,
+      workspaceId: workspace.id,
+      document,
+      kind: "source",
     });
-    if (!raw) {
+
+    if (!sourceObject) {
       await saveDocumentExtractionFailure(document, "Document source object is unavailable in R2");
       throw new Error("Document source object is unavailable in R2");
     }
+
+    document = await persistResolvedDocumentObjectKeys({
+      state,
+      document,
+      sourceObjectKey: sourceObject.key,
+    });
 
     const profiles = await state.repository.listAgentProfiles();
     const profile =
@@ -5598,11 +5704,11 @@ export async function createApp(
     });
 
     try {
-      const content = buildInboundContentForStoredDocument(document, raw.body);
+      const content = buildInboundContentForStoredDocument(document, sourceObject.raw.body);
       const extracted = await extractDocumentBodyText({
         title: document.title,
         content,
-        rawBody: raw.body,
+        rawBody: sourceObject.raw.body,
         kind: document.kind,
         profile,
       });
@@ -5611,7 +5717,7 @@ export async function createApp(
         content,
         kind: document.kind,
         normalizedText: document.previewText ?? document.title,
-        rawBody: raw.body,
+        rawBody: sourceObject.raw.body,
       });
       const derivedText = (extractedText || fallbackDerivedText).slice(0, 30_000);
       const extractionCompleted = hasCompletedDocumentExtraction({
@@ -7201,21 +7307,28 @@ export async function createApp(
     try {
       if (threadId === null) {
         for (const chunk of splitTelegramMessageText(normalizedReplyText)) {
-          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), chunk);
+          const formatted = formatTelegramRichText(chunk);
+          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), formatted.text, {
+            parse_mode: formatted.parse_mode,
+          });
         }
         return;
       }
 
       try {
         for (const chunk of splitTelegramMessageText(normalizedReplyText)) {
-          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), chunk, {
+          const formatted = formatTelegramRichText(chunk);
+          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), formatted.text, {
+            parse_mode: formatted.parse_mode,
             message_thread_id: threadId,
           });
         }
         return;
       } catch {
         for (const chunk of splitTelegramMessageText(normalizedReplyText)) {
-          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), chunk, {
+          const formatted = formatTelegramRichText(chunk);
+          await telegram.bot.api.sendMessage(Math.trunc(parsedChatId), formatted.text, {
+            parse_mode: formatted.parse_mode,
             direct_messages_topic_id: threadId,
           });
         }
@@ -7652,7 +7765,9 @@ export async function createApp(
     try {
       const messageChunks = splitTelegramMessageText(lines.join("\n"));
       for (const [index, chunk] of messageChunks.entries()) {
-        await api.sendMessage(target.chatId, chunk, {
+        const formatted = formatTelegramRichText(chunk);
+        await api.sendMessage(target.chatId, formatted.text, {
+          parse_mode: formatted.parse_mode,
           ...(target.threadId !== null ? { message_thread_id: target.threadId } : {}),
           ...(index === 0 && replyMarkup ? { reply_markup: replyMarkup } : {}),
         });
@@ -10143,39 +10258,55 @@ export async function createApp(
       if (!document) {
         return reply.code(404).send({ error: "Document not found" });
       }
+      let resolvedDocument = document;
       const cloudflare = state.cloudflare;
       let sourcePreview: string | null = null;
       let derivedText: string | null = null;
       let sourceAvailable = false;
 
       if (cloudflare?.credentials.r2BucketName) {
-        if (document.sourceObjectKey) {
-          const raw = await cloudflare.client.getR2ObjectRaw({
-            bucketName: cloudflare.credentials.r2BucketName,
-            key: document.sourceObjectKey,
+        const sourceObject = await readStoredDocumentObjectRaw({
+          state,
+          workspaceId: document.workspaceId,
+          document: resolvedDocument,
+          kind: "source",
+        });
+        sourceAvailable = Boolean(sourceObject);
+        if (sourceObject) {
+          resolvedDocument = await persistResolvedDocumentObjectKeys({
+            state,
+            document: resolvedDocument,
+            sourceObjectKey: sourceObject.key,
           });
-          sourceAvailable = Boolean(raw);
-          if (
-            raw &&
-            (
-              ["text", "json", "csv"].includes(document.kind) ||
-              document.mimeType?.startsWith("text/")
-            )
-          ) {
-            sourcePreview = decodeBestEffortText(raw.body).slice(0, 4_000);
-          }
+        }
+        if (
+          sourceObject &&
+          (
+            ["text", "json", "csv"].includes(document.kind) ||
+            document.mimeType?.startsWith("text/")
+          )
+        ) {
+          sourcePreview = decodeBestEffortText(sourceObject.raw.body).slice(0, 4_000);
         }
 
-        if (document.derivedTextObjectKey) {
-          derivedText = await cloudflare.client.getR2Object({
-            bucketName: cloudflare.credentials.r2BucketName,
-            key: document.derivedTextObjectKey,
+        const derivedObject = await readStoredDocumentObjectRaw({
+          state,
+          workspaceId: document.workspaceId,
+          document: resolvedDocument,
+          kind: "derived",
+        });
+        if (derivedObject) {
+          resolvedDocument = await persistResolvedDocumentObjectKeys({
+            state,
+            document: resolvedDocument,
+            derivedTextObjectKey: derivedObject.key,
           });
+          derivedText = decodeBestEffortText(derivedObject.raw.body);
         }
       }
 
       return {
-        ...document,
+        ...resolvedDocument,
         sourceAvailable,
         sourcePreview,
         derivedText,
