@@ -1442,6 +1442,21 @@ function turnGraphNonResumableNodes(graphVersion: TurnState["graphVersion"]): Se
   return graphVersion === "v1" ? TURN_GRAPH_NON_RESUMABLE_NODES_V1 : TURN_GRAPH_NON_RESUMABLE_NODES_V2;
 }
 
+function resolveTelegramTurnConcurrencyWindow(maxTurnDurationMs?: number | null): {
+  queueWaitMs: number;
+  lockTtlMs: number;
+} {
+  const normalizedMaxTurnDurationMs =
+    typeof maxTurnDurationMs === "number" && Number.isFinite(maxTurnDurationMs)
+      ? Math.max(Math.trunc(maxTurnDurationMs), 0)
+      : 0;
+  const queueWaitMs = Math.max(normalizedMaxTurnDurationMs, 60_000);
+  return {
+    queueWaitMs,
+    lockTtlMs: Math.max(queueWaitMs + 30_000, 90_000),
+  };
+}
+
 function toTurnError(args: {
   error: unknown;
   nodeId: string;
@@ -4909,6 +4924,7 @@ export async function createApp(
     profileId: string;
     telegramChatId: string;
     telegramUserId: string;
+    maxTurnDurationMs?: number | null;
     turnId?: string;
     graphVersion?: string | null;
     stateSnapshotId?: string | null;
@@ -4917,7 +4933,8 @@ export async function createApp(
   }) => {
     const timestamp = nowIso();
     const turnId = args.turnId ?? createId("turn");
-    const lockExpiresAt = isoAfter(90_000);
+    const { lockTtlMs } = resolveTelegramTurnConcurrencyWindow(args.maxTurnDurationMs);
+    const lockExpiresAt = isoAfter(lockTtlMs);
     const claim = await state.repository.claimConversationTurnLock({
       conversationId: args.conversationId,
       turnId,
@@ -6444,6 +6461,15 @@ export async function createApp(
         ) {
           return "This Pulsarbot instance only responds to the configured owner.";
         }
+        const profiles = await state.repository.listAgentProfiles();
+        const selectedProfile =
+          profiles.find((item) => item.id === workspace.activeAgentProfileId) ??
+          profiles.find((item) => item.label === "balanced") ??
+          profiles[0] ??
+          null;
+        const turnConcurrencyWindow = resolveTelegramTurnConcurrencyWindow(
+          selectedProfile?.maxTurnDurationMs,
+        );
 
         const resolvedPayload = payload;
         const resolvedConversationId = resolvedPayload.threadId === null
@@ -6485,7 +6511,7 @@ export async function createApp(
         activeTurnSlot = await acquireActiveTurnSlot(
           resolvedConversationId,
           resolvedPayload,
-          60_000,
+          turnConcurrencyWindow.queueWaitMs,
         );
         if (!activeTurnSlot) {
           return "A previous agent turn is still running for this chat. Please try again in a moment.";
@@ -6911,11 +6937,7 @@ export async function createApp(
             ingest_input: {
               id: "ingest_input",
               run: async () => {
-                const profiles = await state.repository.listAgentProfiles();
-                const profile =
-                  profiles.find((item) => item.id === workspace.activeAgentProfileId) ??
-                  profiles.find((item) => item.label === "balanced") ??
-                  profiles[0];
+                const profile = selectedProfile;
                 if (!profile) {
                   turnState.status = "aborted";
                   turnState.error = {
@@ -6954,6 +6976,7 @@ export async function createApp(
                   profileId,
                   telegramChatId: String(resolvedPayload.chatId),
                   telegramUserId: String(resolvedPayload.userId),
+                  maxTurnDurationMs: graphContext.profile?.maxTurnDurationMs ?? null,
                   turnId: turnState.turnId,
                   graphVersion: TURN_GRAPH_VERSION,
                   stateSnapshotId: turnState.id,
@@ -10699,6 +10722,9 @@ export async function createApp(
       } else {
         try {
           const runtime = await state.resolveRuntime(activeProfile);
+          const turnConcurrencyWindow = resolveTelegramTurnConcurrencyWindow(
+            activeProfile.maxTurnDurationMs,
+          );
           const tools = await state.agent.previewTools({
             profile: activeProfile,
             context: {
@@ -10713,15 +10739,16 @@ export async function createApp(
           });
           runtimeDiagnostics = {
             activeProfile: {
+              ...turnConcurrencyWindow,
               id: activeProfile.id,
               label: activeProfile.label,
               maxPlanningSteps: activeProfile.maxPlanningSteps,
               maxToolCalls: activeProfile.maxToolCalls,
               maxTurnDurationMs: activeProfile.maxTurnDurationMs,
               maxToolDurationMs: activeProfile.maxToolDurationMs,
-              effectiveMaxTurnDurationMs: Math.max(activeProfile.maxTurnDurationMs, 60_000),
+              effectiveMaxTurnDurationMs: turnConcurrencyWindow.queueWaitMs,
               effectiveMaxPlannerDurationMs: Math.min(
-                Math.max(activeProfile.maxTurnDurationMs, 60_000),
+                turnConcurrencyWindow.queueWaitMs,
                 Math.max(activeProfile.maxToolDurationMs, 45_000),
               ),
               effectiveMaxToolDurationMs: Math.max(activeProfile.maxToolDurationMs, 30_000),

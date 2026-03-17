@@ -2236,6 +2236,104 @@ describe("server flows", () => {
     await appState.app.close();
   });
 
+  it("sizes Telegram turn lock TTL to the active profile turn budget", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const slowProviderInvoker = vi.fn(
+      async (args: {
+        profile: ProviderProfile;
+        apiKey: string;
+        input: ProviderInvocationInput;
+      }): Promise<ProviderInvocationResult> => {
+        void args.profile;
+        void args.apiKey;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const user = args.input.messages.find((message) => message.role === "user")?.content ?? "";
+        return {
+          text: `Echo: ${user}`,
+          raw: {},
+        };
+      },
+    );
+
+    const appState = await bootstrapApp(dataDir, {
+      providerInvoker: slowProviderInvoker,
+      backgroundPollMs: 50,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const workspaceResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/workspace",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const workspace = workspaceResponse.json<Record<string, any>>().workspace as Record<string, any>;
+    const profilesResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/agent-profiles",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const profiles = profilesResponse.json<Array<Record<string, any>>>();
+    const activeProfile =
+      profiles.find((item) => item.id === workspace.activeAgentProfileId) ?? profiles[0];
+
+    expect(activeProfile).toBeTruthy();
+
+    const updatedProfile = await appState.app.inject({
+      method: "PUT",
+      url: `/api/agent-profiles/${String(activeProfile!.id)}`,
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        maxTurnDurationMs: 180_000,
+      },
+    });
+    expect(updatedProfile.statusCode).toBe(200);
+
+    const firstTurn = appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        message: {
+          text: "slow lock window",
+          chat: { id: 7002 },
+          from: { id: 42, username: "owner" },
+        },
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const internals = (appState.app as any).__pulsarbot as {
+      state: {
+        repository: {
+          listConversationTurns(args?: Record<string, unknown>): Promise<Array<Record<string, any>>>;
+        };
+      };
+    };
+    const runningTurns = await internals.state.repository.listConversationTurns({
+      status: "running",
+    });
+
+    expect(runningTurns).toHaveLength(1);
+    const runningTurn = runningTurns[0];
+    expect(
+      Date.parse(String(runningTurn.lockExpiresAt ?? "")) -
+        Date.parse(String(runningTurn.startedAt ?? "")),
+    ).toBeGreaterThanOrEqual(200_000);
+
+    const completedTurn = await firstTurn;
+    expect(completedTurn.statusCode).toBe(200);
+
+    await appState.app.close();
+  });
+
   it("deduplicates repeated Telegram webhook deliveries by update_id", async () => {
     const dataDir = await createTempDataDir();
     createdDirs.push(dataDir);
