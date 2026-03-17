@@ -240,10 +240,11 @@ function formatTelegramDisplayLine(line: string) {
   if (!listItem) {
     return line;
   }
-  const indent = listItem[1].replace(/\t/g, "  ");
+  const [, rawIndent = "", marker = "", content = ""] = listItem;
+  const indent = rawIndent.replace(/\t/g, "  ");
   const depth = Math.max(0, Math.floor(indent.length / 2));
   const prefix = "&nbsp;".repeat(depth * 4);
-  return `${prefix}${listItem[2]} ${listItem[3]}`;
+  return `${prefix}${marker} ${content}`;
 }
 
 function renderTelegramDisplayLines(text: string) {
@@ -263,14 +264,16 @@ function renderTelegramDisplayLines(text: string) {
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.+)$/u);
     const quote = line.match(/^\s*&gt;\s?(.*)$/u);
     if (quote) {
-      quoteBuffer.push(quote[1]);
+      const [, quoteContent = ""] = quote;
+      quoteBuffer.push(quoteContent);
       continue;
     }
 
     flushQuoteBuffer();
 
     if (heading) {
-      output.push(`<b>${heading[1].trim()}</b>`);
+      const [, headingContent = ""] = heading;
+      output.push(`<b>${headingContent.trim()}</b>`);
       continue;
     }
 
