@@ -211,7 +211,7 @@ describe("Telegram service message filters", () => {
     expect(chunks.join("\n")).toContain("tail");
   });
 
-  it("renames implicit forum topic after enough threaded messages accumulate", async () => {
+  it("renames implicit forum topic after the first threaded user message", async () => {
     const onMessage = vi.fn(async () => "  Topic   Name\nFrom Agent  ");
     const resolveForumTopicName = vi.fn(async () => "会话感知");
     const { bot } = createTelegramBot({
@@ -275,24 +275,8 @@ describe("Telegram service message filters", () => {
     } as never);
 
     expect(onMessage).toHaveBeenCalledTimes(1);
-    expect(resolveForumTopicName).toHaveBeenCalledTimes(0);
-    expect(editForumTopicSpy).toHaveBeenCalledTimes(0);
-
-    await bot.handleUpdate({
-      update_id: 1003,
-      message: {
-        message_id: 12,
-        date: 3,
-        chat: { id: 42, type: "private" },
-        from: { id: 77, is_bot: false, first_name: "Owner" },
-        message_thread_id: 777,
-        text: "still need help",
-      },
-    } as never);
-
-    expect(onMessage).toHaveBeenCalledTimes(2);
-    expect(sentMessages).toHaveLength(2);
-    expect(sentMessages[1]).toMatchObject({
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0]).toMatchObject({
       chat_id: 42,
       message_thread_id: 777,
       parse_mode: "HTML",
@@ -302,7 +286,7 @@ describe("Telegram service message filters", () => {
     expect(resolveForumTopicName).toHaveBeenCalledWith({
       chatId: 42,
       threadId: 777,
-      requestText: "still need help",
+      requestText: "hello",
       replyText: "  Topic   Name\nFrom Agent  ",
     });
     expect(editForumTopicSpy).toHaveBeenCalledTimes(1);

@@ -390,7 +390,7 @@ type ForumTopicNameResolver = (
   context: FinalizedReplyContext,
 ) => Promise<string | null> | string | null;
 
-const IMPLICIT_FORUM_TOPIC_RENAME_MESSAGE_THRESHOLD = 2;
+const IMPLICIT_FORUM_TOPIC_RENAME_MESSAGE_THRESHOLD = 1;
 
 function parseThreadId(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {

@@ -276,7 +276,7 @@ const fakeProviderMediaInvoker = vi.fn(
   },
 );
 
-const IMPLICIT_THREAD_RENAME_THRESHOLD = 2;
+const IMPLICIT_THREAD_RENAME_THRESHOLD = 1;
 
 function buildFakeTelegramContent(message: Record<string, any>, body: Record<string, any>) {
   if (typeof message.text === "string" || typeof body.text === "string") {
@@ -2613,7 +2613,6 @@ describe("server flows", () => {
           expect(system).toContain("语言为 中文");
           expect(user).toContain("用户消息：我感冒了怎么办");
           expect(user).toContain("助手消息：OK");
-          expect(user).toContain("用户消息：还有咳嗽");
           return {
             text: "感冒建议！！！",
             raw: {},
@@ -2663,27 +2662,6 @@ describe("server flows", () => {
 
     expect(firstResponse.statusCode).toBe(200);
     expect(firstResponse.json<Record<string, unknown>>()).toMatchObject({
-      ok: true,
-      response: "OK",
-      topicName: null,
-    });
-
-    const secondResponse = await appState.app.inject({
-      method: "POST",
-      url: "/telegram/webhook",
-      payload: {
-        message: {
-          text: "还有咳嗽",
-          message_id: 902,
-          message_thread_id: 777,
-          chat: { id: 7107 },
-          from: { id: 42, username: "owner" },
-        },
-      },
-    });
-
-    expect(secondResponse.statusCode).toBe(200);
-    expect(secondResponse.json<Record<string, unknown>>()).toMatchObject({
       ok: true,
       response: "OK",
       topicName: "感冒建议",
@@ -3419,7 +3397,13 @@ describe("server flows", () => {
 
     await internals.recoverInterruptedTurns();
 
-    expect(internals.telegram.bot.api.sendMessage).toHaveBeenCalledWith(4242, "OK");
+    expect(internals.telegram.bot.api.sendMessage).toHaveBeenCalledWith(
+      4242,
+      "OK",
+      expect.objectContaining({
+        parse_mode: "HTML",
+      }),
+    );
     const recoveredTurn = await internals.state.repository.getConversationTurn(turnId);
     expect(recoveredTurn).toMatchObject({
       id: turnId,
