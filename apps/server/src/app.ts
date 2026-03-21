@@ -48,6 +48,7 @@ import {
   ApprovalPolicySchema,
   ApprovalRequestSchema,
   type AgentGraphState,
+  AutomationSessionTargetSchema,
   BrowserAttachmentSchema,
   CloudflareCredentialsSchema,
   ExecutorNodeSchema,
@@ -55,16 +56,19 @@ import {
   McpServerConfigSchema,
   McpProviderConfigSchema,
   McpProviderCatalogServerSchema,
+  JobRecordSchema,
   ProviderTestCapabilitySchema,
   ProviderProfileSchema,
   ResolvedRuntimeSnapshotSchema,
   SearchSettingsSchema,
   TaskRunSchema,
+  TaskRetryPolicySchema,
   TaskSchema,
   TaskTriggerKindSchema,
   TurnEventTypeSchema,
   TurnStateSchema,
   TriggerSchema,
+  WorkflowApprovalCheckpointSchema,
   WorkflowBudgetSchema,
   WorkspaceExportBundleSchema,
   WorkspaceSchema,
@@ -72,6 +76,7 @@ import {
   type ApprovalPolicy,
   type AgentProfile,
   type AuthSession,
+  type AutomationSessionTarget,
   type BrowserAttachment,
   type CloudflareCredentials,
   type ConversationTurn,
@@ -92,6 +97,8 @@ import {
   type ResolvedRuntimeSnapshot,
   type SearchSettings,
   type Task,
+  type TaskRetryCondition,
+  type TaskRetryPolicy,
   type TaskRun,
   type TaskTriggerKind,
   type TelegramInboundContent,
@@ -119,6 +126,16 @@ import {
   splitTelegramMessageText,
   type TelegramUpdatePayload,
 } from "@pulsarbot/telegram";
+import {
+  cloneLooseRecord,
+  describeTriggerSchedule,
+  isAutomationAuthoringMessage,
+  mergeLooseRecords,
+  nextScheduledRunAt,
+  planAutomationFromText,
+  type AutomationPlanningResult,
+} from "./automation-assistant.js";
+import { IndependentJobRunner } from "./job-runner.js";
 
 const logger = createLogger({ name: "server" });
 const repoRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -136,6 +153,13 @@ interface BootstrapWorkspaceSelection {
   r2BucketName?: string;
   vectorizeIndexName?: string;
   aiSearchIndexName?: string;
+}
+
+interface AutomationConversationState {
+  pendingPlan: AutomationPlanningResult | null;
+  latestTaskId: string | null;
+  latestTriggerId: string | null;
+  updatedAt: string;
 }
 
 interface CreateAppOptions {
@@ -576,7 +600,17 @@ function normalizeWorkflowTemplateConfig(args: {
 
   for (const field of template.fields) {
     const rawValue = getNestedValue(source, field.key);
-    if (typeof rawValue === "undefined" || rawValue === null || rawValue === "") {
+    if (typeof rawValue === "undefined" || rawValue === null) {
+      continue;
+    }
+    if (
+      rawValue === "" &&
+      (field.kind === "text" || field.kind === "textarea")
+    ) {
+      setNestedValue(next, field.key, "");
+      continue;
+    }
+    if (rawValue === "") {
       continue;
     }
     if (field.kind === "number") {
@@ -715,20 +749,11 @@ function browserExecutorReady(executor: ExecutorNode): {
   return { ready: true };
 }
 
-function scheduleIntervalMinutes(config: Record<string, unknown>): number | null {
-  const value = Number(config.intervalMinutes ?? config.everyMinutes ?? config.minutes ?? NaN);
-  if (!Number.isFinite(value) || value <= 0) {
-    return null;
-  }
-  return Math.max(Math.trunc(value * 100) / 100, 0.01);
-}
-
-function nextScheduledRunAt(config: Record<string, unknown>, baseMs = Date.now()): string | null {
-  const intervalMinutes = scheduleIntervalMinutes(config);
-  if (!intervalMinutes) {
-    return null;
-  }
-  return new Date(baseMs + intervalMinutes * 60_000).toISOString();
+function hasValidScheduledTriggerConfig(
+  config: Record<string, unknown>,
+  defaultTimeZone: string,
+): boolean {
+  return Boolean(nextScheduledRunAt(config, Date.now(), defaultTimeZone));
 }
 
 function approvalPolicyNeedsReview(policy: string): boolean {
@@ -938,7 +963,7 @@ async function loadTaskDocumentText(args: {
   document: DocumentMetadata;
   text: string;
 }> {
-  let document = (await args.state.repository.listDocuments()).find((item) => item.id === args.documentId);
+  let document = await args.state.repository.getDocument(args.documentId);
   if (!document) {
     throw new Error("Task document was not found");
   }
@@ -1093,6 +1118,36 @@ async function buildWorkflowCapabilityPreview(args: {
     }
   }
 
+  if (
+    task.templateKind === "web_watch_report" &&
+    !firstStringField(config, ["url", "targetUrl", "watchUrl"])
+  ) {
+    blockers.push({
+      code: "url_missing",
+      message: "This workflow requires a URL to watch.",
+    });
+  }
+
+  if (
+    task.templateKind === "browser_workflow" &&
+    !firstStringField(config, ["startUrl", "url"])
+  ) {
+    blockers.push({
+      code: "start_url_missing",
+      message: "This workflow requires a browser startUrl.",
+    });
+  }
+
+  if (
+    task.templateKind === "telegram_followup" &&
+    !firstStringField(config, ["url", "targetUrl"])
+  ) {
+    blockers.push({
+      code: "followup_url_missing",
+      message: "This workflow requires a follow-up URL.",
+    });
+  }
+
   if (task.templateKind === "document_digest_memory") {
     const documentId =
       firstStringField(config, ["documentId"]) ??
@@ -1104,7 +1159,7 @@ async function buildWorkflowCapabilityPreview(args: {
         message: "This workflow requires a documentId or related document.",
       });
     } else {
-      const document = (await args.state.repository.listDocuments()).find((item) => item.id === documentId);
+      const document = await args.state.repository.getDocument(documentId);
       if (!document) {
         blockers.push({
           code: "document_not_found",
@@ -1874,12 +1929,13 @@ class RuntimeState {
         listEnabledMcpServers: (ids) => this.listEnabledMcpServers(ids),
         listConversationSummaries: (conversationId) =>
           this.repository.listConversationSummaries(conversationId),
-        enqueueJob: (input) =>
-          this.queueJob({
+        enqueueJob: async (input) => {
+          await this.queueJob({
             workspaceId: input.workspaceId,
             kind: input.kind,
             payload: input.payload,
-          }),
+          });
+        },
         ...(options.mcpSupervisor
           ? {
               mcpSupervisor: options.mcpSupervisor,
@@ -2462,16 +2518,50 @@ class RuntimeState {
 
   public async queueJob(args: {
     workspaceId: string;
-    kind: "memory_reindex_document" | "memory_reindex_all" | "memory_refresh_before_compact" | "document_extract" | "telegram_file_fetch" | "telegram_voice_transcribe" | "telegram_image_describe" | "mcp_healthcheck" | "export_bundle_build";
+    kind: "memory_reindex_document" | "memory_reindex_all" | "memory_refresh_before_compact" | "document_extract" | "telegram_file_fetch" | "telegram_voice_transcribe" | "telegram_image_describe" | "mcp_healthcheck" | "task_run_retry" | "export_bundle_build";
     payload: Record<string, unknown>;
     runAfter?: string | null;
+    dedupeKey?: string | null;
+    replacePending?: boolean;
+    cancelReason?: string | null;
   }) {
     const timestamp = nowIso();
-    await this.repository.saveJob({
+    const dedupeKey = typeof args.dedupeKey === "string" && args.dedupeKey.trim()
+      ? args.dedupeKey.trim()
+      : null;
+
+    if (dedupeKey) {
+      const existing = await this.repository.getActiveJobByDedupeKey({
+        workspaceId: args.workspaceId,
+        kind: args.kind,
+        dedupeKey,
+      });
+      if (existing?.status === "running") {
+        return existing;
+      }
+      if (existing?.status === "pending" && !args.replacePending) {
+        return existing;
+      }
+      if (existing?.status === "pending" && args.replacePending) {
+        await this.repository.saveJob({
+          ...existing,
+          status: "cancelled",
+          cancelledAt: timestamp,
+          cancelReason: args.cancelReason ?? "superseded_by_dedupe",
+          lockedAt: null,
+          lockedBy: null,
+          completedAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
+    }
+
+    const next = JobRecordSchema.parse({
       id: createId("job"),
       workspaceId: args.workspaceId,
       kind: args.kind,
       status: "pending",
+      dedupeKey,
       payload: toLooseJsonRecord(args.payload),
       result: {},
       attempts: 0,
@@ -2479,13 +2569,17 @@ class RuntimeState {
       lockedAt: null,
       lockedBy: null,
       completedAt: null,
+      cancelledAt: null,
+      cancelReason: null,
       createdAt: timestamp,
       updatedAt: timestamp,
     });
+    await this.repository.saveJob(next);
+    return next;
   }
 
   public async releaseExpiredConversationLocks(): Promise<void> {
-    const conversations = await this.repository.listConversations();
+    const conversations = await this.repository.listConversationsWithActiveTurnLock();
     const timestamp = nowIso();
     for (const conversation of conversations) {
       if (
@@ -3152,9 +3246,7 @@ class RuntimeState {
     document: MemoryDocument;
     content: string;
   }> {
-    const document = (await this.repository.listMemoryDocuments()).find(
-      (item) => item.id === documentId,
-    );
+    const document = await this.repository.getMemoryDocument(documentId);
     if (!document) {
       throw new Error("Memory document not found");
     }
@@ -3205,15 +3297,13 @@ class RuntimeState {
     workspaceId: string,
   ): Promise<MemoryDocument[]> {
     const cloudflare = this.cloudflare;
-    const documents = await this.repository.listMemoryDocuments();
+    const documents = await this.repository.listMemoryDocumentsByWorkspace(workspaceId);
 
     if (!cloudflare?.credentials.r2BucketName) {
-      return documents.filter((item) => item.workspaceId === workspaceId);
+      return documents;
     }
-
-    const scoped = documents.filter((item) => item.workspaceId === workspaceId);
     const enriched = await Promise.all(
-      scoped.map(async (document) => ({
+      documents.map(async (document) => ({
         ...document,
         content:
           (await cloudflare.client.getR2Object({
@@ -4512,6 +4602,261 @@ export async function createApp(
     });
   };
 
+  const conversationIdForTelegramTarget = (chatId: string, threadId: number | null) =>
+    threadId === null ? `telegram:${chatId}` : `telegram:${chatId}:thread:${threadId}`;
+
+  const conversationIdForAutomationSession = (automationSessionKey: string) =>
+    `automation:${automationSessionKey}`;
+
+  const resolveSessionTargetConversationId = (target: AutomationSessionTarget) => {
+    if (target.conversationId) {
+      return target.conversationId;
+    }
+    if (target.kind === "isolated_automation_session" && target.automationSessionKey) {
+      return conversationIdForAutomationSession(target.automationSessionKey);
+    }
+    if (target.telegramChatId) {
+      return conversationIdForTelegramTarget(target.telegramChatId, target.telegramThreadId ?? null);
+    }
+    return null;
+  };
+
+  const normalizeSessionTarget = async (
+    value: Partial<AutomationSessionTarget> | null | undefined,
+    options?: {
+      automationSessionKey?: string | null;
+      telegramChatId?: string | null;
+      telegramThreadId?: number | null;
+    },
+  ): Promise<AutomationSessionTarget | null> => {
+    if (!value) {
+      return null;
+    }
+    const workspace = await state.repository.getWorkspace();
+    const parsed = AutomationSessionTargetSchema.parse(value);
+    if (parsed.kind === "owner_chat") {
+      const chatId = parsed.telegramChatId ?? workspace?.ownerTelegramUserId ?? null;
+      if (!chatId) {
+        return null;
+      }
+      return AutomationSessionTargetSchema.parse({
+        ...parsed,
+        telegramChatId: chatId,
+        conversationId: conversationIdForTelegramTarget(chatId, parsed.telegramThreadId ?? null),
+      });
+    }
+    if (parsed.kind === "isolated_automation_session") {
+      const automationSessionKey =
+        parsed.automationSessionKey ??
+        options?.automationSessionKey ??
+        null;
+      if (!automationSessionKey) {
+        return null;
+      }
+      const chatId =
+        parsed.telegramChatId ??
+        options?.telegramChatId ??
+        workspace?.ownerTelegramUserId ??
+        null;
+      return AutomationSessionTargetSchema.parse({
+        ...parsed,
+        telegramChatId: chatId,
+        telegramThreadId: parsed.telegramThreadId ?? options?.telegramThreadId ?? null,
+        automationSessionKey,
+        conversationId:
+          parsed.conversationId ??
+          conversationIdForAutomationSession(automationSessionKey),
+      });
+    }
+    if (!parsed.telegramChatId) {
+      return null;
+    }
+    return AutomationSessionTargetSchema.parse({
+      ...parsed,
+      conversationId:
+        parsed.conversationId ??
+        conversationIdForTelegramTarget(parsed.telegramChatId, parsed.telegramThreadId ?? null),
+    });
+  };
+
+  const normalizeRetryPolicy = (
+    value: Partial<TaskRetryPolicy> | null | undefined,
+  ): TaskRetryPolicy => TaskRetryPolicySchema.parse(value ?? {
+    enabled: false,
+    maxAttempts: 1,
+    backoffSeconds: [],
+    retryOn: ["executor_unavailable"],
+  });
+
+  const defaultRetryPolicyForTriggerKind = (kind: Trigger["kind"]): TaskRetryPolicy => {
+    if (kind === "schedule") {
+      return normalizeRetryPolicy({
+        enabled: true,
+        maxAttempts: 4,
+        backoffSeconds: [300, 900, 3600],
+        retryOn: ["executor_unavailable", "task_failed"],
+      });
+    }
+    if (kind === "webhook") {
+      return normalizeRetryPolicy({
+        enabled: true,
+        maxAttempts: 3,
+        backoffSeconds: [60, 300, 900],
+        retryOn: ["executor_unavailable", "task_failed"],
+      });
+    }
+    return normalizeRetryPolicy({
+      enabled: false,
+      maxAttempts: 1,
+      backoffSeconds: [],
+      retryOn: ["executor_unavailable"],
+    });
+  };
+
+  const retryBackoffSeconds = (policy: TaskRetryPolicy, retryCount: number) => {
+    if (policy.backoffSeconds.length === 0) {
+      return 300;
+    }
+    return policy.backoffSeconds[Math.min(retryCount, policy.backoffSeconds.length - 1)] ?? 300;
+  };
+
+  const canRetryTaskRun = (args: {
+    taskRun: TaskRun;
+    reason: TaskRetryCondition;
+  }) => {
+    const policy = normalizeRetryPolicy(args.taskRun.retryPolicy);
+    if (!policy.enabled) {
+      return false;
+    }
+    if (!policy.retryOn.includes(args.reason)) {
+      return false;
+    }
+    return args.taskRun.attemptCount < policy.maxAttempts;
+  };
+
+  const scheduleTaskRunRetry = async (args: {
+    task: Task | null;
+    taskRun: TaskRun;
+    reason: TaskRetryCondition;
+    error: string;
+    baseTimeMs?: number;
+  }) => {
+    if (!canRetryTaskRun({ taskRun: args.taskRun, reason: args.reason })) {
+      return null;
+    }
+    const policy = normalizeRetryPolicy(args.taskRun.retryPolicy);
+    const scheduledAt = new Date(
+      (args.baseTimeMs ?? Date.now()) + retryBackoffSeconds(policy, args.taskRun.retryCount) * 1000,
+    ).toISOString();
+    const updatedRun = TaskRunSchema.parse({
+      ...args.taskRun,
+      status: "waiting_retry",
+      error: args.error,
+      retryPolicy: policy,
+      nextRetryAt: scheduledAt,
+      updatedAt: nowIso(),
+    });
+    const queuedJob = await state.queueJob({
+      workspaceId: updatedRun.workspaceId,
+      kind: "task_run_retry",
+      payload: {
+        taskRunId: updatedRun.id,
+      },
+      runAfter: scheduledAt,
+      dedupeKey: `task_run_retry:${updatedRun.id}`,
+    });
+    const persistedRun = TaskRunSchema.parse({
+      ...updatedRun,
+      nextRetryAt: queuedJob.runAfter ?? scheduledAt,
+    });
+    await state.repository.saveTaskRun(persistedRun);
+    await appendSessionEvent({
+      sessionId: persistedRun.sessionId,
+      eventType: "task_run_waiting_retry",
+      payload: {
+        taskRunId: persistedRun.id,
+        executorId: persistedRun.executorId,
+        error: persistedRun.error,
+        nextRetryAt: persistedRun.nextRetryAt,
+        attemptCount: persistedRun.attemptCount,
+        retryCount: persistedRun.retryCount,
+        retryJobId: queuedJob.id,
+      },
+    });
+    await sendTaskRunStatusUpdate({
+      task: args.task,
+      taskRun: persistedRun,
+      status: "waiting_retry",
+    });
+    return persistedRun;
+  };
+
+  const resolveTaskRunSessionTarget = async (args: {
+    task: Task;
+    trigger?: Trigger | null;
+    inputSnapshot?: Record<string, unknown>;
+  }): Promise<AutomationSessionTarget | null> => {
+    const triggerTarget = await normalizeSessionTarget(args.trigger?.sessionTarget, {
+      automationSessionKey:
+        args.trigger?.sessionTarget?.automationSessionKey ??
+        (args.trigger?.id ? `trigger:${args.trigger.id}` : `task:${args.task.id}`),
+    });
+    if (triggerTarget) {
+      return triggerTarget;
+    }
+    const input = asRecord(args.inputSnapshot) ?? {};
+    const taskConfig = asRecord(args.task.config) ?? {};
+    const taskTelegramTarget = asRecord(taskConfig.telegramTarget) ?? {};
+    const inputChatId =
+      typeof input.chatId === "number"
+        ? String(input.chatId)
+        : typeof input.chatId === "string" && input.chatId.trim()
+          ? input.chatId.trim()
+          : null;
+    const inputThreadId =
+      typeof input.threadId === "number"
+        ? input.threadId
+        : typeof input.threadId === "string" && input.threadId.trim()
+          ? Number(input.threadId)
+          : null;
+    if (inputChatId) {
+      return normalizeSessionTarget({
+        kind: "telegram_chat",
+        telegramChatId: inputChatId,
+        telegramThreadId: Number.isFinite(inputThreadId) ? Number(inputThreadId) : null,
+      });
+    }
+    const configChatId =
+      typeof taskTelegramTarget.chatId === "number"
+        ? String(taskTelegramTarget.chatId)
+        : typeof taskTelegramTarget.chatId === "string" && taskTelegramTarget.chatId.trim()
+          ? taskTelegramTarget.chatId.trim()
+          : null;
+    const configThreadId =
+      typeof taskTelegramTarget.threadId === "number"
+        ? taskTelegramTarget.threadId
+        : typeof taskTelegramTarget.threadId === "string" && taskTelegramTarget.threadId.trim()
+          ? Number(taskTelegramTarget.threadId)
+          : null;
+    if (configChatId) {
+      return normalizeSessionTarget({
+        kind: "telegram_chat",
+        telegramChatId: configChatId,
+        telegramThreadId: Number.isFinite(configThreadId) ? Number(configThreadId) : null,
+      });
+    }
+    return normalizeSessionTarget({
+      kind: "owner_chat",
+      telegramChatId: null,
+      telegramThreadId: null,
+      automationSessionKey: `task:${args.task.id}`,
+    });
+  };
+
+  const resolveTaskRunRetryPolicy = (args: {
+    trigger?: Trigger | null;
+  }): TaskRetryPolicy => normalizeRetryPolicy(args.trigger?.retryPolicy);
+
   let sendTaskRunStatusUpdate: (args: {
     task: Task | null;
     taskRun: TaskRun;
@@ -4529,6 +4874,7 @@ export async function createApp(
     task: Task;
     triggerType: TaskTriggerKind;
     triggerId?: string | null;
+    trigger?: Trigger | null;
     inputSnapshot?: Record<string, unknown>;
     sourceTurnId?: string | null;
     overrideExecutorId?: string | null;
@@ -4538,6 +4884,14 @@ export async function createApp(
     const executionPlan = buildTaskExecutionPlan({
       task: args.task,
       inputSnapshot: args.inputSnapshot,
+    });
+    const sessionTarget = await resolveTaskRunSessionTarget({
+      task: args.task,
+      trigger: args.trigger ?? null,
+      ...(args.inputSnapshot ? { inputSnapshot: args.inputSnapshot } : {}),
+    });
+    const retryPolicy = resolveTaskRunRetryPolicy({
+      trigger: args.trigger ?? null,
     });
     const planned = await state.taskRuntime.stageRun({
       workspaceId: args.task.workspaceId,
@@ -4556,43 +4910,57 @@ export async function createApp(
     const taskRun = {
       ...planned.taskRun,
       executorId: args.overrideExecutorId ?? planned.taskRun.executorId,
+      sessionTarget,
+      retryPolicy,
     };
-    await state.repository.saveTaskRun(taskRun);
+    let persistedTaskRun = TaskRunSchema.parse(taskRun);
+    await state.repository.saveTaskRun(persistedTaskRun);
     if (planned.approval) {
       await state.repository.saveApprovalRequest(planned.approval);
     }
-    await touchTaskAfterRun(args.task, taskRun);
+    if (persistedTaskRun.status === "waiting_retry") {
+      persistedTaskRun = await scheduleTaskRunRetry({
+        task: args.task,
+        taskRun: persistedTaskRun,
+        reason: "executor_unavailable",
+        error: persistedTaskRun.error ?? "Executor is unavailable",
+      }) ?? persistedTaskRun;
+    }
+    await touchTaskAfterRun(args.task, persistedTaskRun);
     await appendSessionEvent({
-      sessionId: taskRun.sessionId,
+      sessionId: persistedTaskRun.sessionId,
       eventType: "trigger_fired",
       payload: {
         taskId: args.task.id,
         triggerType: args.triggerType,
         triggerId: args.triggerId ?? null,
+        sessionTarget: persistedTaskRun.sessionTarget,
       },
     });
-    await appendSessionEvent({
-      sessionId: taskRun.sessionId,
-      eventType: taskRun.status === "waiting_approval"
+    if (persistedTaskRun.status !== "waiting_retry" || !persistedTaskRun.nextRetryAt) {
+      await appendSessionEvent({
+        sessionId: persistedTaskRun.sessionId,
+        eventType: persistedTaskRun.status === "waiting_approval"
         ? "task_run_waiting_approval"
-        : taskRun.status === "waiting_retry"
+        : persistedTaskRun.status === "waiting_retry"
           ? "task_run_waiting_retry"
           : "task_run_queued",
-      payload: {
-        taskId: args.task.id,
-        taskRunId: taskRun.id,
-        triggerType: taskRun.triggerType,
-        triggerId: taskRun.triggerId,
-        executorId: taskRun.executorId,
-        approvalId: planned.approval?.id ?? null,
-      },
-    });
+        payload: {
+          taskId: args.task.id,
+          taskRunId: persistedTaskRun.id,
+          triggerType: persistedTaskRun.triggerType,
+          triggerId: persistedTaskRun.triggerId,
+          executorId: persistedTaskRun.executorId,
+          approvalId: planned.approval?.id ?? null,
+        },
+      });
+    }
     if (planned.approval) {
       await appendSessionEvent({
-        sessionId: taskRun.sessionId,
+        sessionId: persistedTaskRun.sessionId,
         eventType: "approval_requested",
         payload: {
-          taskRunId: taskRun.id,
+          taskRunId: persistedTaskRun.id,
           approvalId: planned.approval.id,
           executorId: planned.approval.executorId,
           requestedCapabilities: planned.approval.requestedCapabilities,
@@ -4601,26 +4969,27 @@ export async function createApp(
     }
     await sendTaskRunStatusUpdate({
       task: args.task,
-      taskRun,
-      status: taskRun.status === "waiting_approval"
+      taskRun: persistedTaskRun,
+      status: persistedTaskRun.status === "waiting_approval"
         ? "waiting_approval"
-        : taskRun.status === "waiting_retry"
+        : persistedTaskRun.status === "waiting_retry"
           ? "waiting_retry"
           : "started",
       approval: planned.approval,
     });
     logInternalEvent("task_run_staged", {
       taskId: args.task.id,
-      taskRunId: taskRun.id,
-      templateKind: taskRun.templateKind,
-      triggerType: taskRun.triggerType,
-      triggerId: taskRun.triggerId,
-      status: taskRun.status,
-      executorId: taskRun.executorId,
+      taskRunId: persistedTaskRun.id,
+      templateKind: persistedTaskRun.templateKind,
+      triggerType: persistedTaskRun.triggerType,
+      triggerId: persistedTaskRun.triggerId,
+      status: persistedTaskRun.status,
+      executorId: persistedTaskRun.executorId,
       approvalId: planned.approval?.id ?? null,
+      nextRetryAt: persistedTaskRun.nextRetryAt,
     });
     return {
-      taskRun,
+      taskRun: persistedTaskRun,
       approval: planned.approval,
     };
   };
@@ -4779,6 +5148,375 @@ export async function createApp(
     });
     await state.repository.saveTask(next);
     return next;
+  };
+
+  const upsertTaskRecord = async (args: {
+    workspace: Workspace;
+    actor: string;
+    body: Partial<Task>;
+  }) => {
+    const existing = args.body.id ? await state.repository.getTask(args.body.id) : null;
+    if (args.body.agentProfileId) {
+      const profiles = await state.repository.listAgentProfiles();
+      if (!profiles.some((profile) => profile.id === args.body.agentProfileId)) {
+        throw new Error("Agent profile not found for task");
+      }
+    }
+    if (args.body.defaultExecutorId) {
+      const executor = await state.repository.getExecutorNode(args.body.defaultExecutorId);
+      if (!executor) {
+        throw new Error("Default executor not found for task");
+      }
+    }
+    const timestamp = nowIso();
+    const templateKind = args.body.templateKind ?? existing?.templateKind ?? "web_watch_report";
+    const next = TaskSchema.parse({
+      id: args.body.id ?? existing?.id ?? createId("task"),
+      workspaceId: args.workspace.id,
+      title: args.body.title ?? existing?.title ?? "Untitled Task",
+      goal: args.body.goal ?? existing?.goal ?? "",
+      description: args.body.description ?? existing?.description ?? "",
+      config: normalizeWorkflowTemplateConfig({
+        templateKind,
+        config: args.body.config ?? existing?.config ?? {},
+      }),
+      templateKind,
+      status: args.body.status ?? existing?.status ?? "draft",
+      agentProfileId: args.body.agentProfileId ?? existing?.agentProfileId ?? null,
+      defaultExecutorId: args.body.defaultExecutorId ?? existing?.defaultExecutorId ?? null,
+      approvalPolicy: args.body.approvalPolicy ?? existing?.approvalPolicy ?? "auto_approve_safe",
+      approvalCheckpoints:
+        Array.isArray((args.body as { approvalCheckpoints?: unknown[] }).approvalCheckpoints)
+          ? (args.body as { approvalCheckpoints: unknown[] }).approvalCheckpoints.map((item) => String(item))
+          : existing?.approvalCheckpoints ?? defaultApprovalCheckpointsForTemplate(templateKind),
+      memoryPolicy: args.body.memoryPolicy ?? existing?.memoryPolicy ?? "chat_only",
+      defaultRunBudget: WorkflowBudgetSchema.parse(
+        args.body.defaultRunBudget ?? existing?.defaultRunBudget ?? {},
+      ),
+      triggerIds: args.body.triggerIds ?? existing?.triggerIds ?? [],
+      relatedDocumentIds: args.body.relatedDocumentIds ?? existing?.relatedDocumentIds ?? [],
+      relatedThreadIds: args.body.relatedThreadIds ?? existing?.relatedThreadIds ?? [],
+      latestRunId: existing?.latestRunId ?? null,
+      lastRunAt: existing?.lastRunAt ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveTask(next);
+    await audit(
+      args.actor,
+      existing ? "update_task" : "create_task",
+      "task",
+      next.id,
+      {
+        templateKind: next.templateKind,
+        status: next.status,
+      },
+    );
+    return next;
+  };
+
+  const upsertTriggerRecord = async (args: {
+    workspace: Workspace;
+    actor: string;
+    body: Partial<Trigger>;
+  }) => {
+    const existing = args.body.id ? await state.repository.getTrigger(args.body.id) : null;
+    const triggerId = args.body.id ?? existing?.id ?? createId("trigger");
+    if (args.body.taskId) {
+      const task = await state.repository.getTask(args.body.taskId);
+      if (!task) {
+        throw new Error("Task not found for trigger");
+      }
+    }
+    const kind = TaskTriggerKindSchema.parse(args.body.kind ?? existing?.kind ?? "manual");
+    const taskId = args.body.taskId ?? existing?.taskId ?? null;
+    if (kind !== "manual" && !taskId) {
+      throw new Error("taskId is required for non-manual triggers");
+    }
+    const config = asRecord(args.body.config ?? existing?.config ?? {}) ?? {};
+    if (kind === "schedule" && !hasValidScheduledTriggerConfig(config, args.workspace.timezone)) {
+      throw new Error("Schedule triggers require a valid recurring schedule");
+    }
+    const sessionTarget = await normalizeSessionTarget(
+      args.body.sessionTarget ?? existing?.sessionTarget ?? null,
+      {
+        automationSessionKey:
+          asString(
+            asRecord(args.body.sessionTarget)?.automationSessionKey,
+          ) ??
+          existing?.sessionTarget?.automationSessionKey ??
+          (taskId ? `task:${taskId}` : `trigger:${triggerId}`),
+      },
+    );
+    const retryPolicy = normalizeRetryPolicy(
+      args.body.retryPolicy ?? existing?.retryPolicy ?? defaultRetryPolicyForTriggerKind(kind),
+    );
+    if (kind === "telegram_shortcut") {
+      const command = normalizeTelegramShortcutCommand(config.command);
+      if (!command) {
+        throw new Error("Only /digest is currently supported for telegram shortcut triggers");
+      }
+      config.command = command;
+    }
+    const rawWebhookSecret = typeof args.body.webhookSecret === "string"
+      ? args.body.webhookSecret.trim()
+      : "";
+    const persistedWebhookSecret = kind === "webhook"
+      ? rawWebhookSecret ||
+        await state.resolveTriggerWebhookSecret({
+          workspaceId: args.workspace.id,
+          trigger: existing ?? TriggerSchema.parse({
+            id: triggerId,
+            workspaceId: args.workspace.id,
+            label: args.body.label ?? "Trigger",
+            kind,
+          }),
+        }) ||
+        createId("hooksecret")
+      : null;
+    const webhookSecretRef = kind === "webhook" && persistedWebhookSecret
+      ? await state.saveTriggerWebhookSecret({
+          workspaceId: args.workspace.id,
+          triggerId,
+          secret: persistedWebhookSecret,
+        })
+      : null;
+    const normalizedWebhookPath = kind === "webhook"
+      ? normalizeWebhookPath(
+            String(args.body.webhookPath ?? existing?.webhookPath ?? args.body.label ?? "trigger"),
+        )
+      : null;
+    const nextEnabled = args.body.enabled ?? existing?.enabled ?? true;
+    if (kind === "webhook" && normalizedWebhookPath && nextEnabled) {
+      const conflictingTrigger = (await state.repository.listTriggers({
+        kind: "webhook",
+        enabled: true,
+      })).find((trigger) =>
+        trigger.id !== existing?.id && trigger.webhookPath === normalizedWebhookPath
+      );
+      if (conflictingTrigger) {
+        throw new Error("Webhook path is already used by another enabled trigger");
+      }
+    }
+    const timestamp = nowIso();
+    const next = TriggerSchema.parse({
+      id: triggerId,
+      workspaceId: args.workspace.id,
+      taskId,
+      label: args.body.label ?? existing?.label ?? "Trigger",
+      kind,
+      enabled: args.body.enabled ?? existing?.enabled ?? true,
+      config,
+      sessionTarget,
+      retryPolicy,
+      webhookPath: normalizedWebhookPath,
+      webhookSecret: null,
+      webhookSecretRef,
+      nextRunAt: kind === "schedule"
+        ? String(
+            args.body.nextRunAt ??
+              existing?.nextRunAt ??
+              nextScheduledRunAt(config, Date.now(), args.workspace.timezone) ??
+              nowIso(),
+          )
+        : null,
+      lastTriggeredAt: existing?.lastTriggeredAt ?? null,
+      lastRunId: existing?.lastRunId ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+    await state.repository.saveTrigger(next);
+    if (next.taskId) {
+      const task = await state.repository.getTask(next.taskId);
+      if (task) {
+        await state.repository.saveTask({
+          ...task,
+          triggerIds: [...new Set([...task.triggerIds, next.id])],
+          updatedAt: nowIso(),
+        });
+      }
+    }
+    await audit(
+      args.actor,
+      existing ? "update_trigger" : "create_trigger",
+      "trigger",
+      next.id,
+      {
+        taskId: next.taskId,
+        kind: next.kind,
+        enabled: next.enabled,
+      },
+    );
+    return next;
+  };
+
+  const automationConversationStateMessageId = (conversationId: string) =>
+    `automation:context:${conversationId}`;
+
+  const ensureConversationRecord = async (args: {
+    workspace: Workspace;
+    conversationId: string;
+    chatId: number;
+    userId: number;
+  }) => {
+    const existing = await state.repository.getConversation(args.conversationId);
+    await state.repository.saveConversation({
+      id: args.conversationId,
+      workspaceId: args.workspace.id,
+      telegramChatId: String(args.chatId),
+      telegramUserId: String(args.userId),
+      mode: "private",
+      activeTurnLock: existing?.activeTurnLock ?? false,
+      activeTurnLockExpiresAt: existing?.activeTurnLockExpiresAt ?? null,
+      lastTurnId: existing?.lastTurnId ?? null,
+      lastCompactedAt: existing?.lastCompactedAt ?? null,
+      lastSummaryId: existing?.lastSummaryId ?? null,
+      createdAt: existing?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    });
+  };
+
+  const readAutomationConversationState = async (
+    conversationId: string,
+  ): Promise<AutomationConversationState> => {
+    const messages = await state.repository.listConversationMessages(conversationId);
+    const message = messages.find((item) => item.id === automationConversationStateMessageId(conversationId));
+    const metadata = asRecord(message?.metadata) ?? {};
+    return {
+      pendingPlan: metadata.pendingPlan
+        ? JSON.parse(JSON.stringify(metadata.pendingPlan)) as AutomationPlanningResult
+        : null,
+      latestTaskId: asString(metadata.latestTaskId),
+      latestTriggerId: asString(metadata.latestTriggerId),
+      updatedAt: asString(metadata.updatedAt) ?? message?.createdAt ?? nowIso(),
+    };
+  };
+
+  const saveAutomationConversationState = async (args: {
+    conversationId: string;
+    stateSnapshot: AutomationConversationState;
+  }) => {
+    const messages = await state.repository.listConversationMessages(args.conversationId);
+    const existing = messages.find((item) => item.id === automationConversationStateMessageId(args.conversationId));
+    await state.repository.saveConversationMessage(args.conversationId, {
+      id: automationConversationStateMessageId(args.conversationId),
+      conversationId: args.conversationId,
+      role: "system",
+      content: "[automation_context]",
+      sourceType: "system",
+      telegramMessageId: null,
+      metadata: toLooseJsonRecord({
+        kind: "automation_context",
+        pendingPlan: args.stateSnapshot.pendingPlan,
+        latestTaskId: args.stateSnapshot.latestTaskId,
+        latestTriggerId: args.stateSnapshot.latestTriggerId,
+        updatedAt: args.stateSnapshot.updatedAt,
+      }),
+      createdAt: existing?.createdAt ?? nowIso(),
+    });
+  };
+
+  const appendAutomationConversationReply = async (args: {
+    conversationId: string;
+    payload: TelegramUpdatePayload;
+    userText: string;
+    assistantText: string;
+    metadata?: Record<string, unknown>;
+  }) => {
+    const messageKey = String(args.payload.updateId ?? args.payload.messageId ?? createId("automation"));
+    await state.repository.saveConversationMessage(args.conversationId, {
+      id: `automation:user:${messageKey}`,
+      conversationId: args.conversationId,
+      role: "user",
+      content: args.userText,
+      sourceType: "text",
+      telegramMessageId: args.payload.messageId ? String(args.payload.messageId) : null,
+      metadata: toLooseJsonRecord({
+        automation: true,
+      }),
+      createdAt: nowIso(),
+    });
+    await state.repository.saveConversationMessage(args.conversationId, {
+      id: `automation:assistant:${messageKey}`,
+      conversationId: args.conversationId,
+      role: "assistant",
+      content: args.assistantText,
+      sourceType: "system",
+      telegramMessageId: null,
+      metadata: toLooseJsonRecord({
+        automation: true,
+        ...(args.metadata ?? {}),
+      }),
+      createdAt: nowIso(),
+    });
+  };
+
+  const suggestDefaultExecutorIdForTaskDraft = async (args: {
+    workspace: Workspace;
+    existingTask?: Task | null;
+    taskDraft: Partial<Task>;
+  }) => {
+    if (args.taskDraft.defaultExecutorId || args.existingTask?.defaultExecutorId) {
+      return args.taskDraft.defaultExecutorId ?? args.existingTask?.defaultExecutorId ?? null;
+    }
+    const previewTask = TaskSchema.parse({
+      id: args.existingTask?.id ?? "automation-preview",
+      workspaceId: args.workspace.id,
+      title: args.taskDraft.title ?? args.existingTask?.title ?? "Automation Preview",
+      goal: args.taskDraft.goal ?? args.existingTask?.goal ?? "Automation preview",
+      description: args.taskDraft.description ?? args.existingTask?.description ?? "",
+      config: args.taskDraft.config ?? args.existingTask?.config ?? {},
+      templateKind:
+        args.taskDraft.templateKind ?? args.existingTask?.templateKind ?? "web_watch_report",
+      status: args.taskDraft.status ?? args.existingTask?.status ?? "draft",
+      agentProfileId: args.taskDraft.agentProfileId ?? args.existingTask?.agentProfileId ?? null,
+      defaultExecutorId: null,
+      approvalPolicy:
+        args.taskDraft.approvalPolicy ?? args.existingTask?.approvalPolicy ?? "auto_approve_safe",
+      approvalCheckpoints:
+        args.taskDraft.approvalCheckpoints ??
+        args.existingTask?.approvalCheckpoints ??
+        defaultApprovalCheckpointsForTemplate(
+          args.taskDraft.templateKind ?? args.existingTask?.templateKind ?? "web_watch_report",
+        ),
+      memoryPolicy: args.taskDraft.memoryPolicy ?? args.existingTask?.memoryPolicy ?? "task_context",
+      defaultRunBudget: args.taskDraft.defaultRunBudget ?? args.existingTask?.defaultRunBudget ?? {
+        maxSteps: 8,
+        maxActions: 6,
+        timeoutMs: 60_000,
+      },
+      triggerIds: args.existingTask?.triggerIds ?? [],
+      relatedDocumentIds: args.taskDraft.relatedDocumentIds ?? args.existingTask?.relatedDocumentIds ?? [],
+      relatedThreadIds: args.existingTask?.relatedThreadIds ?? [],
+      latestRunId: args.existingTask?.latestRunId ?? null,
+      lastRunAt: args.existingTask?.lastRunAt ?? null,
+      createdAt: args.existingTask?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    });
+    const executionPlan = buildTaskExecutionPlan({ task: previewTask });
+    const capability = String(executionPlan.capability ?? "");
+    if (!capability || capability === "internal") {
+      return null;
+    }
+    const executors = await state.repository.listExecutorNodes();
+    const matching = executors.filter((executor) =>
+      executor.capabilities.includes(capability as never)
+    );
+    const ready = matching.filter((executor) =>
+      executor.status === "online" &&
+      (capability !== "browser" || executor.kind !== "chrome_extension" || browserExecutorReady(executor).ready)
+    );
+    return ready[0]?.id ?? matching.find((executor) => executor.status === "online")?.id ?? matching[0]?.id ?? null;
+  };
+
+  const findPreferredAutomationTrigger = async (args: {
+    taskId: string;
+    kind: Trigger["kind"];
+  }) => {
+    const triggers = await state.repository.listTriggers({ taskId: args.taskId });
+    return triggers
+      .filter((trigger) => trigger.kind === args.kind)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null;
   };
 
   const buildRuntimePreview = async (profile: AgentProfile) => {
@@ -5169,6 +5907,249 @@ export async function createApp(
     }
 
     return null;
+  };
+
+  const resolveAutomationPlannerProvider = async (workspace: Workspace): Promise<{
+    profile: ProviderProfile;
+    apiKey: string;
+  } | null> => {
+    const activeProfile = workspace.activeAgentProfileId
+      ? (await state.repository.listAgentProfiles()).find((item) => item.id === workspace.activeAgentProfileId) ?? null
+      : null;
+    const candidateIds = [
+      activeProfile?.backgroundModelProfileId,
+      activeProfile?.primaryModelProfileId,
+      workspace.backgroundModelProfileId,
+      workspace.primaryModelProfileId,
+    ].filter((value): value is string => Boolean(value));
+
+    for (const candidateId of candidateIds) {
+      try {
+        const provider = await state.resolveProviderProfile(candidateId);
+        if (!provider.enabled) {
+          continue;
+        }
+        return {
+          profile: provider,
+          apiKey: await state.resolveApiKey(provider.apiKeyRef),
+        };
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  };
+
+  const planAutomationWithLlm = async (args: {
+    workspace: Workspace;
+    text: string;
+    taskSummaries: Array<{
+      id: string;
+      title: string;
+      goal: string;
+      status: Task["status"];
+      templateKind: WorkflowTemplateKind;
+    }>;
+    pendingPlan: AutomationPlanningResult | null;
+    latestTaskId: string | null;
+    chatId: number;
+    threadId: number | null;
+  }): Promise<AutomationPlanningResult | null> => {
+    const provider = await resolveAutomationPlannerProvider(args.workspace);
+    if (!provider) {
+      return null;
+    }
+
+    const prompt = [
+      "You compile Telegram automation requests into a strict JSON control-plane plan.",
+      "Return strict JSON only. No markdown.",
+      "Allowed action values: none, clarify, create_task, update_task, pause_task, run_task.",
+      "Allowed templateKind values: web_watch_report, browser_workflow, document_digest_memory, telegram_followup, webhook_fetch_analyze_push.",
+      "Allowed trigger.kind values: schedule, webhook, telegram_shortcut.",
+      "For schedule config, support:",
+      '- {"intervalMinutes": 30}',
+      '- {"schedule":{"mode":"daily","time":"08:00","timezone":"UTC"}}',
+      '- {"schedule":{"mode":"weekly","time":"09:00","timezone":"UTC","weekdays":[1,3,5]}}',
+      '- {"schedule":{"mode":"cron","cron":"0 8 * * 1-5","timezone":"UTC"}}',
+      'Trigger sessionTarget must be one of {"kind":"owner_chat"}, {"kind":"telegram_chat","telegramChatId":"...","telegramThreadId":123|null}, or {"kind":"isolated_automation_session","automationSessionKey":"task:abc","telegramChatId":"...","telegramThreadId":123|null}.',
+      'Trigger retryPolicy must be {"enabled":boolean,"maxAttempts":number,"backoffSeconds":[...],"retryOn":["executor_unavailable","task_failed"]}.',
+      "If information is missing, set action=clarify and provide clarificationQuestion.",
+      "Prefer updating the latest task when the user refers to 'this automation'.",
+      "Do not invent URLs, document ids, or webhook paths.",
+    ].join("\n");
+
+    const userPayload = {
+      text: args.text,
+      timezone: args.workspace.timezone,
+      latestTaskId: args.latestTaskId,
+      currentTelegramTarget: {
+        chatId: String(args.chatId),
+        threadId: args.threadId,
+      },
+      pendingPlan: args.pendingPlan,
+      tasks: args.taskSummaries,
+    };
+
+    try {
+      const result = await state.runProvider({
+        profile: provider.profile,
+        apiKey: provider.apiKey,
+        input: {
+          jsonMode: true,
+          maxOutputTokens: 1600,
+          messages: [
+            {
+              role: "system",
+              content: prompt,
+            },
+            {
+              role: "user",
+              content: JSON.stringify(userPayload),
+            },
+          ],
+        },
+        timeoutMs: 12_000,
+      });
+      const parsed = JSON.parse(result.text) as Record<string, unknown>;
+      const action = asString(parsed.action);
+      if (!action) {
+        return null;
+      }
+
+      const taskRecord = asRecord(parsed.task);
+      const triggerRecord = asRecord(parsed.trigger);
+      return {
+        action: [
+          "none",
+          "clarify",
+          "create_task",
+          "update_task",
+          "pause_task",
+          "run_task",
+        ].includes(action)
+          ? action as AutomationPlanningResult["action"]
+          : "none",
+        confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
+        explanation: asString(parsed.explanation) ?? "llm_plan",
+        clarificationQuestion: asString(parsed.clarificationQuestion),
+        taskId: asString(parsed.taskId),
+        task: taskRecord
+          ? {
+              title: asString(taskRecord.title),
+              goal: asString(taskRecord.goal),
+              description: asString(taskRecord.description),
+              templateKind: asString(taskRecord.templateKind) as WorkflowTemplateKind | null,
+              status: asString(taskRecord.status) as Task["status"] | null,
+              config: cloneLooseRecord(asRecord(taskRecord.config) as Record<string, LooseJsonValue> | undefined),
+              approvalPolicy: asString(taskRecord.approvalPolicy) as ApprovalPolicy | null,
+              approvalCheckpoints: Array.isArray(taskRecord.approvalCheckpoints)
+                ? taskRecord.approvalCheckpoints.map((item) => String(item))
+                : null,
+              memoryPolicy: asString(taskRecord.memoryPolicy) as MemoryPolicy | null,
+            }
+          : null,
+        trigger: triggerRecord && ["schedule", "webhook", "telegram_shortcut"].includes(String(triggerRecord.kind ?? ""))
+          ? {
+              kind: String(triggerRecord.kind) as "schedule" | "webhook" | "telegram_shortcut",
+              label: asString(triggerRecord.label),
+              enabled: typeof triggerRecord.enabled === "boolean" ? triggerRecord.enabled : true,
+              config: cloneLooseRecord(asRecord(triggerRecord.config) as Record<string, LooseJsonValue> | undefined),
+              webhookPath: asString(triggerRecord.webhookPath),
+              sessionTarget: asRecord(triggerRecord.sessionTarget)
+                ? AutomationSessionTargetSchema.parse(asRecord(triggerRecord.sessionTarget))
+                : null,
+              retryPolicy: asRecord(triggerRecord.retryPolicy)
+                ? TaskRetryPolicySchema.parse(asRecord(triggerRecord.retryPolicy))
+                : null,
+            }
+          : null,
+      };
+    } catch (error) {
+      logger.debug({ error }, "LLM automation planning fell back to rule-based parsing");
+      return null;
+    }
+  };
+
+  const mergeAutomationPlans = (
+    base: AutomationPlanningResult,
+    override: AutomationPlanningResult | null,
+  ): AutomationPlanningResult => {
+    if (!override || override.action === "none" || override.confidence < 0.6) {
+      return base;
+    }
+    return {
+      ...base,
+      ...override,
+      task: override.task || base.task
+        ? {
+            ...(base.task ?? {}),
+            ...(override.task ?? {}),
+            config: mergeLooseRecords(base.task?.config ?? undefined, override.task?.config ?? undefined),
+          }
+        : null,
+      trigger: override.trigger || base.trigger
+        ? {
+            kind: override.trigger?.kind ?? base.trigger?.kind ?? "schedule",
+            label: override.trigger?.label ?? base.trigger?.label ?? null,
+            enabled: override.trigger?.enabled ?? base.trigger?.enabled ?? true,
+            config: mergeLooseRecords(base.trigger?.config ?? undefined, override.trigger?.config ?? undefined),
+            webhookPath: override.trigger?.webhookPath ?? base.trigger?.webhookPath ?? null,
+            sessionTarget: override.trigger?.sessionTarget ?? base.trigger?.sessionTarget ?? null,
+            retryPolicy: override.trigger?.retryPolicy ?? base.trigger?.retryPolicy ?? null,
+          }
+        : null,
+    };
+  };
+
+  const extractAutomationTaskTitle = (text: string): string | null => {
+    const match = text.match(/["“”'「](.+?)["“”'」]/u);
+    return match?.[1]?.trim() || null;
+  };
+
+  const extractAutomationTaskId = (text: string): string | null =>
+    text.toLowerCase().match(/\btask_[a-z0-9_-]+\b/u)?.[0] ?? null;
+
+  const dedupeAutomationTaskSummaries = (
+    tasks: Array<Pick<Task, "id" | "title" | "goal" | "status" | "templateKind"> | null | undefined>,
+  ) => {
+    const seen = new Set<string>();
+    const next: Array<Pick<Task, "id" | "title" | "goal" | "status" | "templateKind">> = [];
+    for (const task of tasks) {
+      if (!task || seen.has(task.id)) {
+        continue;
+      }
+      seen.add(task.id);
+      next.push(task);
+    }
+    return next;
+  };
+
+  const loadAutomationTaskSummaries = async (args: {
+    text: string;
+    latestTaskId: string | null | undefined;
+  }): Promise<Array<Pick<Task, "id" | "title" | "goal" | "status" | "templateKind">>> => {
+    const recentTasks = await state.repository.listTasksByStatus({
+      statuses: ["active", "paused", "draft", "archived"],
+      limit: 30,
+    });
+    const explicitTaskId = extractAutomationTaskId(args.text);
+    const explicitTask = explicitTaskId ? await state.repository.getTask(explicitTaskId) : null;
+    const exactTitle = extractAutomationTaskTitle(args.text);
+    const exactTitleTask = exactTitle ? await state.repository.getTaskByTitle(exactTitle) : null;
+    const latestTask = args.latestTaskId ? await state.repository.getTask(args.latestTaskId) : null;
+    return dedupeAutomationTaskSummaries([
+      latestTask,
+      explicitTask,
+      exactTitleTask,
+      ...recentTasks,
+    ]).map((task) => ({
+      id: task.id,
+      title: task.title,
+      goal: task.goal,
+      status: task.status,
+      templateKind: task.templateKind,
+    }));
   };
 
   const generateTelegramForumTopicName = async (args: {
@@ -5679,9 +6660,7 @@ export async function createApp(
   const reExtractDocument = async (documentId: string) => {
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
-    let document = (await state.repository.listDocuments()).find(
-      (item) => item.id === documentId,
-    );
+    let document = await state.repository.getDocument(documentId);
     if (!document) {
       throw new Error("Document not found");
     }
@@ -5872,7 +6851,7 @@ export async function createApp(
         }, "warn");
         await state.repository.saveTrigger({
           ...trigger,
-          nextRunAt: nextScheduledRunAt(trigger.config, Date.now()),
+          nextRunAt: nextScheduledRunAt(trigger.config, Date.now(), workspace.timezone),
           updatedAt: nowIso(),
         });
         continue;
@@ -5881,6 +6860,7 @@ export async function createApp(
         task,
         triggerType: "schedule",
         triggerId: trigger.id,
+        trigger,
         inputSnapshot: {
           schedule: trigger.config,
           firedAt: nowIso(),
@@ -5890,7 +6870,7 @@ export async function createApp(
         ...trigger,
         lastTriggeredAt: nowIso(),
         lastRunId: created.taskRun.id,
-        nextRunAt: nextScheduledRunAt(trigger.config, Date.now()),
+        nextRunAt: nextScheduledRunAt(trigger.config, Date.now(), workspace.timezone),
         updatedAt: nowIso(),
       });
       logInternalEvent("schedule_trigger_fired", {
@@ -5950,9 +6930,10 @@ export async function createApp(
           `task:${args.task.id}`,
           `# ${args.task.title}\n\n${summary}`,
         );
-        const memoryDocument = (await state.repository.listMemoryDocuments()).find((item) =>
-          item.workspaceId === args.task.workspaceId && item.path === relativePath
-        );
+        const memoryDocument = await state.repository.findMemoryDocumentByPath({
+          workspaceId: args.task.workspaceId,
+          path: relativePath,
+        });
         if (memoryDocument) {
           relatedMemoryDocumentIds.push(memoryDocument.id);
         }
@@ -6082,7 +7063,7 @@ export async function createApp(
           relatedMemoryDocumentIds: result.relatedMemoryDocumentIds,
         });
       } catch (error) {
-        const failedRun = TaskRunSchema.parse({
+        let failedRun = TaskRunSchema.parse({
           ...startedRun,
           status: "failed",
           error: error instanceof Error ? error.message : String(error),
@@ -6090,20 +7071,31 @@ export async function createApp(
           updatedAt: nowIso(),
         });
         await state.repository.saveTaskRun(failedRun);
-        await appendSessionEvent({
-          sessionId: failedRun.sessionId,
-          eventType: "task_run_failed",
-          payload: {
-            taskRunId: failedRun.id,
-            mode: "internal",
-            error: failedRun.error,
-          },
-        });
-        await sendTaskRunStatusUpdate({
+        const retriedRun = await scheduleTaskRunRetry({
           task,
           taskRun: failedRun,
-          status: "failed",
+          reason: "task_failed",
+          error: failedRun.error ?? "Internal task run failed",
+          baseTimeMs: Date.now(),
         });
+        if (retriedRun) {
+          failedRun = retriedRun;
+        } else {
+          await appendSessionEvent({
+            sessionId: failedRun.sessionId,
+            eventType: "task_run_failed",
+            payload: {
+              taskRunId: failedRun.id,
+              mode: "internal",
+              error: failedRun.error,
+            },
+          });
+          await sendTaskRunStatusUpdate({
+            task,
+            taskRun: failedRun,
+            status: "failed",
+          });
+        }
         await audit(
           "server:internal-runner",
           "fail_internal_task_run",
@@ -6138,12 +7130,13 @@ export async function createApp(
       logger.debug({ error }, "Skipping memory worker tick");
     }
 
-    const pending = (await state.repository.listJobs({ status: "pending" }))
-      .filter((job) =>
-        job.workspaceId === workspace.id &&
-        (!job.runAfter || Date.parse(job.runAfter) <= Date.now()) &&
-        !job.lockedAt,
-      )
+    const pending = (await state.repository.listJobs({
+      status: "pending",
+      workspaceId: workspace.id,
+      runAfterLte: nowIso(),
+      lockedState: "unlocked",
+      limit: Math.max(limit * 5, 50),
+    }))
       .filter((job) =>
         ![
           "memory_reindex_document",
@@ -6193,6 +7186,92 @@ export async function createApp(
           });
         }
 
+        if (job.kind === "task_run_retry") {
+          const taskRunId = String(job.payload.taskRunId ?? "");
+          const taskRun = taskRunId ? await state.repository.getTaskRun(taskRunId) : null;
+          if (!taskRun) {
+            throw new Error("Task run not found for retry job");
+          }
+          if (taskRun.status !== "waiting_retry") {
+            await state.repository.saveJob({
+              ...job,
+              status: "completed",
+              attempts: job.attempts + 1,
+              result: {
+                processedAt: nowIso(),
+                skipped: true,
+                reason: `task_run_status_${taskRun.status}`,
+              },
+              error: undefined,
+              lockedAt: null,
+              lockedBy: null,
+              completedAt: nowIso(),
+              updatedAt: nowIso(),
+            });
+            continue;
+          }
+          const task = taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null;
+          if (!task || task.status === "archived" || task.status === "paused") {
+            const failedRun = TaskRunSchema.parse({
+              ...taskRun,
+              status: "failed",
+              finishedAt: nowIso(),
+              updatedAt: nowIso(),
+              error: task ? "Task is not active for retry" : "Task for retryable run was not found",
+              nextRetryAt: null,
+            });
+            await state.repository.saveTaskRun(failedRun);
+            await appendSessionEvent({
+              sessionId: failedRun.sessionId,
+              eventType: "task_run_failed",
+              payload: {
+                taskRunId: failedRun.id,
+                error: failedRun.error,
+              },
+            });
+            await sendTaskRunStatusUpdate({
+              task,
+              taskRun: failedRun,
+              status: "failed",
+            });
+          } else {
+            const retriedRun = TaskRunSchema.parse({
+              ...taskRun,
+              status: "queued",
+              retryCount: taskRun.retryCount + 1,
+              attemptCount: taskRun.attemptCount + 1,
+              lastRetryAt: nowIso(),
+              nextRetryAt: null,
+              error: null,
+              updatedAt: nowIso(),
+              finishedAt: null,
+            });
+            await state.repository.saveTaskRun(retriedRun);
+            await appendSessionEvent({
+              sessionId: retriedRun.sessionId,
+              eventType: "task_run_queued",
+              payload: {
+                taskRunId: retriedRun.id,
+                retryCount: retriedRun.retryCount,
+                attemptCount: retriedRun.attemptCount,
+                triggerType: retriedRun.triggerType,
+              },
+            });
+            await sendTaskRunStatusUpdate({
+              task,
+              taskRun: retriedRun,
+              status: "started",
+            });
+            logInternalEvent("task_run_retry_requeued", {
+              taskRunId: retriedRun.id,
+              taskId: retriedRun.taskId,
+              retryCount: retriedRun.retryCount,
+              attemptCount: retriedRun.attemptCount,
+              jobId: job.id,
+            });
+          }
+        }
+
         await state.repository.saveJob({
           ...job,
           status: "completed",
@@ -6218,7 +7297,7 @@ export async function createApp(
           ].includes(job.kind)
         ) {
           const documentId = String(job.payload.documentId ?? "");
-          const document = (await state.repository.listDocuments()).find((item) => item.id === documentId);
+          const document = await state.repository.getDocument(documentId);
           if (document) {
             await saveDocumentExtractionFailure(document, message);
           }
@@ -6317,6 +7396,325 @@ export async function createApp(
     };
   };
 
+  const tryHandleAutomationAuthoring = async (args: {
+    workspace: Workspace;
+    payload: TelegramUpdatePayload;
+    conversationId: string;
+  }): Promise<string | null> => {
+    if (args.payload.content.kind !== "text") {
+      return null;
+    }
+
+    const userText = args.payload.content.text?.trim() ?? "";
+    if (!userText) {
+      return null;
+    }
+
+    const conversationState = await readAutomationConversationState(args.conversationId);
+    if (!isAutomationAuthoringMessage(userText, Boolean(conversationState.pendingPlan))) {
+      return null;
+    }
+
+    const taskSummaries = await loadAutomationTaskSummaries({
+      text: userText,
+      latestTaskId: conversationState.latestTaskId,
+    });
+    const rulePlan = planAutomationFromText({
+      text: userText,
+      timezone: args.workspace.timezone,
+      existingTasks: taskSummaries,
+      latestTaskId: conversationState.latestTaskId,
+      pendingPlan: conversationState.pendingPlan,
+      chatId: args.payload.chatId,
+      threadId: args.payload.threadId,
+    });
+    const llmPlan = await planAutomationWithLlm({
+      workspace: args.workspace,
+      text: userText,
+      taskSummaries,
+      pendingPlan: conversationState.pendingPlan,
+      latestTaskId: conversationState.latestTaskId ?? null,
+      chatId: args.payload.chatId,
+      threadId: args.payload.threadId,
+    });
+    const plan = mergeAutomationPlans(rulePlan, llmPlan);
+
+    if (plan.action === "none") {
+      return null;
+    }
+
+    await ensureConversationRecord({
+      workspace: args.workspace,
+      conversationId: args.conversationId,
+      chatId: args.payload.chatId,
+      userId: args.payload.userId,
+    });
+
+    const actor = `telegram:${args.payload.userId}`;
+
+    if (plan.action === "clarify") {
+      const reply = plan.clarificationQuestion ?? "还需要补充一点信息才能完成自动化设置。";
+      await saveAutomationConversationState({
+        conversationId: args.conversationId,
+        stateSnapshot: {
+          pendingPlan: plan,
+          latestTaskId: conversationState.latestTaskId,
+          latestTriggerId: conversationState.latestTriggerId,
+          updatedAt: nowIso(),
+        },
+      });
+      await appendAutomationConversationReply({
+        conversationId: args.conversationId,
+        payload: args.payload,
+        userText,
+        assistantText: reply,
+        metadata: {
+          kind: "automation_clarification",
+          pending: true,
+        },
+      });
+      return reply;
+    }
+
+    if (plan.action === "pause_task") {
+      const taskId = plan.taskId;
+      if (!taskId) {
+        return "要暂停哪个自动化？请直接说任务标题。";
+      }
+      const task = await pauseTask(taskId);
+      const reply = `已暂停自动化「${task.title}」。如果要恢复或改时间，直接继续说。`;
+      await saveAutomationConversationState({
+        conversationId: args.conversationId,
+        stateSnapshot: {
+          pendingPlan: null,
+          latestTaskId: task.id,
+          latestTriggerId: conversationState.latestTriggerId,
+          updatedAt: nowIso(),
+        },
+      });
+      await appendAutomationConversationReply({
+        conversationId: args.conversationId,
+        payload: args.payload,
+        userText,
+        assistantText: reply,
+        metadata: {
+          kind: "automation_result",
+          action: plan.action,
+          taskId: task.id,
+        },
+      });
+      return reply;
+    }
+
+    if (plan.action === "run_task") {
+      const taskId = plan.taskId;
+      if (!taskId) {
+        return "要运行哪个自动化？请直接说任务标题。";
+      }
+      const task = await state.repository.getTask(taskId);
+      if (!task) {
+        return "没有找到要运行的自动化任务。";
+      }
+      const created = await createTaskRun({
+        task,
+        triggerType: "manual",
+        inputSnapshot: {
+          launchedFrom: "telegram_agentflow",
+          requestedBy: args.payload.userId,
+          requestText: userText,
+        },
+      });
+      const reply = `已立即运行「${task.title}」。Run ${created.taskRun.id} 当前状态是 ${created.taskRun.status}。`;
+      await saveAutomationConversationState({
+        conversationId: args.conversationId,
+        stateSnapshot: {
+          pendingPlan: null,
+          latestTaskId: task.id,
+          latestTriggerId: conversationState.latestTriggerId,
+          updatedAt: nowIso(),
+        },
+      });
+      await appendAutomationConversationReply({
+        conversationId: args.conversationId,
+        payload: args.payload,
+        userText,
+        assistantText: reply,
+        metadata: {
+          kind: "automation_result",
+          action: plan.action,
+          taskId: task.id,
+          taskRunId: created.taskRun.id,
+        },
+      });
+      return reply;
+    }
+
+    const existingTask = plan.taskId ? await state.repository.getTask(plan.taskId) : null;
+    const mergedTaskConfig = mergeLooseRecords(
+      cloneLooseRecord(asRecord(existingTask?.config) as Record<string, LooseJsonValue> | undefined),
+      plan.task?.config ?? undefined,
+    );
+    const taskBody: Partial<Task> = {
+      ...(existingTask ? { id: existingTask.id } : {}),
+      title: plan.task?.title ?? existingTask?.title ?? "Untitled Task",
+      goal: plan.task?.goal ?? existingTask?.goal ?? userText,
+      description: plan.task?.description ?? existingTask?.description ?? userText,
+      templateKind: plan.task?.templateKind ?? existingTask?.templateKind ?? "web_watch_report",
+      status: plan.task?.status ?? existingTask?.status ?? "active",
+      config: mergedTaskConfig,
+      approvalPolicy: plan.task?.approvalPolicy ?? existingTask?.approvalPolicy ?? "auto_approve_safe",
+      memoryPolicy: plan.task?.memoryPolicy ?? existingTask?.memoryPolicy ?? "task_context",
+      agentProfileId: existingTask?.agentProfileId ?? null,
+      defaultExecutorId: existingTask?.defaultExecutorId ?? null,
+      relatedDocumentIds: existingTask?.relatedDocumentIds ?? [],
+      relatedThreadIds: existingTask?.relatedThreadIds ?? [],
+      ...(existingTask?.defaultRunBudget
+        ? {
+            defaultRunBudget: existingTask.defaultRunBudget,
+          }
+        : {}),
+    };
+    if (plan.task?.approvalCheckpoints ?? existingTask?.approvalCheckpoints) {
+      taskBody.approvalCheckpoints = (
+        plan.task?.approvalCheckpoints ??
+        existingTask?.approvalCheckpoints ??
+        []
+      ).map((checkpoint) => WorkflowApprovalCheckpointSchema.parse(checkpoint));
+    }
+
+    taskBody.defaultExecutorId = await suggestDefaultExecutorIdForTaskDraft({
+      workspace: args.workspace,
+      existingTask,
+      taskDraft: taskBody,
+    });
+
+    const savedTask = await upsertTaskRecord({
+      workspace: args.workspace,
+      actor,
+      body: taskBody,
+    });
+
+    let savedTrigger: Trigger | null = null;
+    if (plan.trigger) {
+      const existingTrigger = plan.action === "update_task"
+        ? await findPreferredAutomationTrigger({
+            taskId: savedTask.id,
+            kind: plan.trigger.kind,
+          })
+        : null;
+      const triggerConfig = mergeLooseRecords(
+        cloneLooseRecord(asRecord(existingTrigger?.config) as Record<string, LooseJsonValue> | undefined),
+        plan.trigger.config ?? undefined,
+      );
+      savedTrigger = await upsertTriggerRecord({
+        workspace: args.workspace,
+        actor,
+        body: {
+          ...(existingTrigger ? { id: existingTrigger.id } : {}),
+          taskId: savedTask.id,
+          label:
+            plan.trigger.label ??
+            existingTrigger?.label ??
+            `${savedTask.title} ${plan.trigger.kind === "webhook" ? "Webhook" : "Trigger"}`,
+          kind: plan.trigger.kind,
+          enabled: plan.trigger.enabled ?? true,
+          config: triggerConfig,
+          sessionTarget: plan.trigger.sessionTarget ?? existingTrigger?.sessionTarget ?? null,
+          ...(plan.trigger.retryPolicy ?? existingTrigger?.retryPolicy
+            ? {
+                retryPolicy: plan.trigger.retryPolicy ?? existingTrigger?.retryPolicy ?? normalizeRetryPolicy(undefined),
+              }
+            : {}),
+          ...(plan.trigger.webhookPath ?? existingTrigger?.webhookPath
+            ? {
+                webhookPath: plan.trigger.webhookPath ?? existingTrigger?.webhookPath ?? null,
+              }
+            : {}),
+        },
+      });
+    }
+
+    const preview = await buildWorkflowCapabilityPreview({
+      state,
+      taskDraft: {
+        id: savedTask.id,
+        title: savedTask.title,
+        goal: savedTask.goal,
+        templateKind: savedTask.templateKind,
+        config: asRecord(savedTask.config) ?? {},
+        defaultExecutorId: savedTask.defaultExecutorId,
+        approvalPolicy: savedTask.approvalPolicy,
+        approvalCheckpoints: savedTask.approvalCheckpoints,
+        memoryPolicy: savedTask.memoryPolicy,
+        relatedDocumentIds: savedTask.relatedDocumentIds,
+      },
+    });
+    const blockers = Array.isArray((preview as { blockers?: unknown[] }).blockers)
+      ? ((preview as { blockers?: Array<{ code?: string; message?: string }> }).blockers ?? [])
+      : [];
+
+    const replyLines = [
+      plan.action === "create_task" ? `已创建自动化「${savedTask.title}」。` : `已更新自动化「${savedTask.title}」。`,
+      `模板: ${savedTask.templateKind}`,
+    ];
+
+    if (savedTrigger?.kind === "schedule") {
+      replyLines.push(
+        `触发: ${describeTriggerSchedule(asRecord(savedTrigger.config) ?? {}, args.workspace.timezone)}`,
+      );
+      if (savedTrigger.nextRunAt) {
+        replyLines.push(`下次执行: ${savedTrigger.nextRunAt}`);
+      }
+    } else if (savedTrigger?.kind === "telegram_shortcut") {
+      const command = asString(asRecord(savedTrigger.config)?.command) ?? "/digest";
+      replyLines.push(`触发: Telegram 快捷命令 ${command}`);
+    } else if (savedTrigger?.kind === "webhook") {
+      const webhookSecret = await state.resolveTriggerWebhookSecret({
+        workspaceId: args.workspace.id,
+        trigger: savedTrigger,
+      });
+      replyLines.push(`Webhook Path: /api/triggers/webhook/${savedTrigger.webhookPath}`);
+      if (webhookSecret) {
+        replyLines.push(`Webhook Secret: ${webhookSecret}`);
+      }
+    }
+
+    if (savedTask.defaultExecutorId) {
+      replyLines.push(`默认执行器: ${savedTask.defaultExecutorId}`);
+    }
+    if (blockers.length > 0) {
+      replyLines.push("当前还有这些运行阻塞:");
+      for (const blocker of blockers.slice(0, 3)) {
+        replyLines.push(`- ${blocker.message ?? blocker.code ?? "unknown blocker"}`);
+      }
+    }
+    replyLines.push("后续直接回复“改成每天 09:00”或“暂停这个自动化”即可继续调整。");
+
+    const reply = replyLines.join("\n");
+    await saveAutomationConversationState({
+      conversationId: args.conversationId,
+      stateSnapshot: {
+        pendingPlan: null,
+        latestTaskId: savedTask.id,
+        latestTriggerId: savedTrigger?.id ?? conversationState.latestTriggerId,
+        updatedAt: nowIso(),
+      },
+    });
+    await appendAutomationConversationReply({
+      conversationId: args.conversationId,
+      payload: args.payload,
+      userText,
+      assistantText: reply,
+      metadata: {
+        kind: "automation_result",
+        action: plan.action,
+        taskId: savedTask.id,
+        triggerId: savedTrigger?.id ?? null,
+      },
+    });
+    return reply;
+  };
+
   const telegram = (options.telegramFactory ?? createTelegramBot)({
     token: state.env.TELEGRAM_BOT_TOKEN,
     resolveForumTopicName: async ({ chatId, threadId, requestText, replyText }) =>
@@ -6331,9 +7729,10 @@ export async function createApp(
     commandHandlers: {
       onTasks: async (context) => {
         await assertOwnerCommandAccess(context.userId);
-        const tasks = (await state.repository.listTasks())
-          .filter((task) => task.status === "active" || task.status === "paused")
-          .slice(0, 5);
+        const tasks = await state.repository.listTasksByStatus({
+          statuses: ["active", "paused"],
+          limit: 5,
+        });
         if (tasks.length === 0) {
           return "No active tasks yet. Create one from the Mini App Tasks panel.";
         }
@@ -6370,10 +7769,14 @@ export async function createApp(
       onDigest: async (context) => {
         await assertOwnerCommandAccess(context.userId);
         const shortcut = await resolveTelegramShortcutTarget("/digest");
-        const tasks = shortcut ? [] : await state.repository.listTasks();
+        const tasks = shortcut
+          ? []
+          : await state.repository.listTasksByStatus({
+            statuses: ["active"],
+          });
         const target = shortcut?.task ?? tasks.find((task) =>
-          task.status === "active" && task.templateKind === "web_watch_report"
-        ) ?? tasks.find((task) => task.status === "active");
+          task.templateKind === "web_watch_report"
+        ) ?? tasks[0];
         if (!target) {
           return "No active task is ready for /digest. Create and activate a task first.";
         }
@@ -6381,6 +7784,7 @@ export async function createApp(
           task: target,
           triggerType: "telegram_shortcut",
           triggerId: shortcut?.trigger.id ?? null,
+          trigger: shortcut?.trigger ?? null,
           inputSnapshot: {
             command: "/digest",
             chatId: context.chatId,
@@ -6476,6 +7880,29 @@ export async function createApp(
           ? `telegram:${resolvedPayload.chatId}`
           : `telegram:${resolvedPayload.chatId}:thread:${resolvedPayload.threadId}`;
         conversationId = resolvedConversationId;
+
+        let automationReply: string | null = null;
+        try {
+          automationReply = await tryHandleAutomationAuthoring({
+            workspace,
+            payload: resolvedPayload,
+            conversationId: resolvedConversationId,
+          });
+        } catch (error) {
+          logger.warn(
+            {
+              error,
+              conversationId: resolvedConversationId,
+              userId: resolvedPayload.userId,
+            },
+            "Automation authoring flow failed",
+          );
+          return `自动化设置失败：${error instanceof Error ? error.message : "unknown error"}`;
+        }
+        if (automationReply !== null) {
+          return automationReply;
+        }
+
         const duplicateActiveTurn = activeTurns.get(resolvedConversationId);
         if (duplicateActiveTurn && matchesTelegramDelivery(duplicateActiveTurn, resolvedPayload)) {
           logger.info(
@@ -7707,13 +9134,16 @@ export async function createApp(
     const input = asRecord(args.taskRun.inputSnapshot) ?? {};
     const taskConfig = asRecord(args.task?.config) ?? {};
     const targetRecord = asRecord(taskConfig.telegramTarget) ?? {};
+    const taskRunTarget = args.taskRun.sessionTarget;
     const workspace = await state.repository.getWorkspace();
     const rawChatId =
+      taskRunTarget?.telegramChatId ??
       input.chatId ??
       targetRecord.chatId ??
       workspace?.ownerTelegramUserId ??
       null;
     const rawThreadId =
+      taskRunTarget?.telegramThreadId ??
       input.threadId ??
       targetRecord.threadId ??
       args.task?.relatedThreadIds[0] ??
@@ -7737,12 +9167,57 @@ export async function createApp(
     };
   };
 
+  const appendTaskRunConversationMessage = async (args: {
+    task: Task | null;
+    taskRun: TaskRun;
+    text: string;
+  }) => {
+    const conversationId = resolveSessionTargetConversationId(args.taskRun.sessionTarget ?? {
+      kind: "owner_chat",
+      telegramChatId: null,
+      telegramThreadId: null,
+      conversationId: null,
+      automationSessionKey: null,
+    });
+    if (!conversationId) {
+      return;
+    }
+    const workspace = await state.repository.getWorkspace();
+    const target = await resolveTaskRunTelegramTarget(args);
+    const existingConversation = await state.repository.getConversation(conversationId);
+    await state.repository.saveConversation({
+      id: conversationId,
+      workspaceId: args.taskRun.workspaceId,
+      telegramChatId: target ? String(target.chatId) : workspace?.ownerTelegramUserId ?? "0",
+      telegramUserId: workspace?.ownerTelegramUserId ?? "0",
+      mode: "private",
+      activeTurnLock: existingConversation?.activeTurnLock ?? false,
+      activeTurnLockExpiresAt: existingConversation?.activeTurnLockExpiresAt ?? null,
+      lastTurnId: existingConversation?.lastTurnId ?? null,
+      lastCompactedAt: existingConversation?.lastCompactedAt ?? null,
+      lastSummaryId: existingConversation?.lastSummaryId ?? null,
+      createdAt: existingConversation?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    });
+    await state.repository.saveConversationMessage(conversationId, {
+      id: createId("automationmsg"),
+      conversationId,
+      role: "system",
+      content: args.text,
+      sourceType: "system",
+      telegramMessageId: null,
+      metadata: toLooseJsonRecord({
+        taskRunId: args.taskRun.id,
+        taskId: args.task?.id ?? args.taskRun.taskId,
+        sessionTarget: args.taskRun.sessionTarget,
+      }),
+      createdAt: nowIso(),
+    });
+  };
+
   sendTaskRunStatusUpdate = async (args) => {
     const target = await resolveTaskRunTelegramTarget(args);
     const api = (telegram as { bot?: { api?: { sendMessage?: (...params: any[]) => Promise<unknown> } } }).bot?.api;
-    if (!target || !api?.sendMessage) {
-      return;
-    }
     const statusLabel = {
       started: "Started",
       waiting_approval: "Waiting Approval",
@@ -7762,12 +9237,25 @@ export async function createApp(
     }
     if (args.status === "waiting_retry" && args.taskRun.error) {
       lines.push(`Error: ${args.taskRun.error}`);
+      if (args.taskRun.nextRetryAt) {
+        lines.push(`Retry At: ${args.taskRun.nextRetryAt}`);
+      }
+      lines.push(`Attempt: ${args.taskRun.attemptCount}/${args.taskRun.retryPolicy.maxAttempts}`);
     }
     if (args.status === "completed" && args.taskRun.outputSummary) {
       lines.push(`Summary: ${args.taskRun.outputSummary}`);
     }
     if (args.status === "failed" && args.taskRun.error) {
       lines.push(`Error: ${args.taskRun.error}`);
+    }
+    await appendTaskRunConversationMessage({
+      task: args.task,
+      taskRun: args.taskRun,
+      text: lines.join("\n"),
+    });
+
+    if (!target || !api?.sendMessage) {
+      return;
     }
 
     const replyMarkup = args.status === "waiting_approval" && args.approval
@@ -7876,29 +9364,63 @@ export async function createApp(
     );
   }
 
-  const backgroundWorker = setInterval(() => {
-    void processBackgroundJobs(10).catch((error) => {
+  const controlPlaneRunner = new IndependentJobRunner();
+  const controlPlanePollMs = options.backgroundPollMs ?? 5_000;
+  controlPlaneRunner.register({
+    name: "background_jobs",
+    intervalMs: controlPlanePollMs,
+    run: async () => {
+      await processBackgroundJobs(10);
+    },
+    onError: (error) => {
       logger.error({ error }, "Background job tick failed");
-    });
-    void expirePendingApprovals(20).catch((error) => {
+    },
+  });
+  controlPlaneRunner.register({
+    name: "approval_expiry",
+    intervalMs: controlPlanePollMs,
+    run: async () => {
+      await expirePendingApprovals(20);
+    },
+    onError: (error) => {
       logger.error({ error }, "Approval expiration tick failed");
-    });
-    void processInternalTaskRuns(5).catch((error) => {
+    },
+  });
+  controlPlaneRunner.register({
+    name: "internal_task_runs",
+    intervalMs: controlPlanePollMs,
+    run: async () => {
+      await processInternalTaskRuns(5);
+    },
+    onError: (error) => {
       logger.error({ error }, "Internal task runner tick failed");
-    });
-    void processScheduledTriggers(10).catch((error) => {
+    },
+  });
+  controlPlaneRunner.register({
+    name: "scheduled_triggers",
+    intervalMs: controlPlanePollMs,
+    run: async () => {
+      await processScheduledTriggers(10);
+    },
+    onError: (error) => {
       logger.error({ error }, "Scheduled trigger tick failed");
-    });
-  }, options.backgroundPollMs ?? 5_000);
-  const turnEventPruner = setInterval(() => {
-    void pruneOldTurnEvents().catch((error) => {
+    },
+  });
+  controlPlaneRunner.register({
+    name: "turn_event_pruner",
+    intervalMs: 24 * 60 * 60 * 1000,
+    run: async () => {
+      await pruneOldTurnEvents();
+    },
+    onError: (error) => {
       logger.warn({ error }, "Failed to prune turn events");
-    });
-  }, 24 * 60 * 60 * 1000);
+    },
+    immediate: false,
+  });
+  controlPlaneRunner.start();
 
   app.addHook("onClose", async () => {
-    clearInterval(backgroundWorker);
-    clearInterval(turnEventPruner);
+    controlPlaneRunner.stop();
     await mcpSupervisor.closeAll();
   });
 
@@ -8789,64 +10311,15 @@ export async function createApp(
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
     const body = (request.body ?? {}) as Partial<Task>;
-    const existing = body.id ? await state.repository.getTask(body.id) : null;
-    if (body.agentProfileId) {
-      const profiles = await state.repository.listAgentProfiles();
-      if (!profiles.some((profile) => profile.id === body.agentProfileId)) {
-        throw app.httpErrors.badRequest("Agent profile not found for task");
-      }
+    try {
+      return await upsertTaskRecord({
+        workspace,
+        actor: (request.user as { sub?: string }).sub ?? "unknown",
+        body,
+      });
+    } catch (error) {
+      throw app.httpErrors.badRequest(error instanceof Error ? error.message : "Task save failed");
     }
-    if (body.defaultExecutorId) {
-      const executor = await state.repository.getExecutorNode(body.defaultExecutorId);
-      if (!executor) {
-        throw app.httpErrors.badRequest("Default executor not found for task");
-      }
-    }
-    const timestamp = nowIso();
-    const templateKind = body.templateKind ?? existing?.templateKind ?? "web_watch_report";
-    const next = TaskSchema.parse({
-      id: body.id ?? existing?.id ?? createId("task"),
-      workspaceId: workspace.id,
-      title: body.title ?? existing?.title ?? "Untitled Task",
-      goal: body.goal ?? existing?.goal ?? "",
-      description: body.description ?? existing?.description ?? "",
-      config: normalizeWorkflowTemplateConfig({
-        templateKind,
-        config: body.config ?? existing?.config ?? {},
-      }),
-      templateKind,
-      status: body.status ?? existing?.status ?? "draft",
-      agentProfileId: body.agentProfileId ?? existing?.agentProfileId ?? null,
-      defaultExecutorId: body.defaultExecutorId ?? existing?.defaultExecutorId ?? null,
-      approvalPolicy: body.approvalPolicy ?? existing?.approvalPolicy ?? "auto_approve_safe",
-      approvalCheckpoints:
-        Array.isArray((body as { approvalCheckpoints?: unknown[] }).approvalCheckpoints)
-          ? (body as { approvalCheckpoints: unknown[] }).approvalCheckpoints.map((item) => String(item))
-          : existing?.approvalCheckpoints ?? defaultApprovalCheckpointsForTemplate(templateKind),
-      memoryPolicy: body.memoryPolicy ?? existing?.memoryPolicy ?? "chat_only",
-      defaultRunBudget: WorkflowBudgetSchema.parse(
-        body.defaultRunBudget ?? existing?.defaultRunBudget ?? {},
-      ),
-      triggerIds: body.triggerIds ?? existing?.triggerIds ?? [],
-      relatedDocumentIds: body.relatedDocumentIds ?? existing?.relatedDocumentIds ?? [],
-      relatedThreadIds: body.relatedThreadIds ?? existing?.relatedThreadIds ?? [],
-      latestRunId: existing?.latestRunId ?? null,
-      lastRunAt: existing?.lastRunAt ?? null,
-      createdAt: existing?.createdAt ?? timestamp,
-      updatedAt: timestamp,
-    });
-    await state.repository.saveTask(next);
-    await audit(
-      (request.user as { sub?: string }).sub ?? "unknown",
-      existing ? "update_task" : "create_task",
-      "task",
-      next.id,
-      {
-        templateKind: next.templateKind,
-        status: next.status,
-      },
-    );
-    return next;
   });
 
   app.get(
@@ -8898,10 +10371,12 @@ export async function createApp(
     if (task.status === "archived" || task.status === "paused") {
       throw app.httpErrors.conflict("Task is not active");
     }
+    const trigger = body.triggerId ? await state.repository.getTrigger(body.triggerId) : null;
     const { taskRun, approval } = await createTaskRun({
       task,
       triggerType: TaskTriggerKindSchema.parse(body.triggerType ?? "manual"),
       triggerId: body.triggerId ?? null,
+      trigger,
       inputSnapshot: asRecord(body.inputSnapshot ?? {}) ?? {},
       sourceTurnId: typeof body.sourceTurnId === "string" ? body.sourceTurnId : null,
       overrideExecutorId,
@@ -8923,6 +10398,68 @@ export async function createApp(
     };
   });
 
+  app.post("/api/task-runs/:id/retry", { preHandler: requireOwner }, async (request) => {
+    const { id } = request.params as { id: string };
+    const taskRun = await state.repository.getTaskRun(id);
+    if (!taskRun) {
+      throw app.httpErrors.notFound("Task run not found");
+    }
+    if (!["waiting_retry", "failed", "aborted"].includes(taskRun.status)) {
+      throw app.httpErrors.conflict("Only waiting_retry, failed, or aborted runs can be retried");
+    }
+    const task = taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null;
+    if (!task || task.status === "archived" || task.status === "paused") {
+      throw app.httpErrors.conflict("Task is not active");
+    }
+    const queuedAt = nowIso();
+    const queuedJob = await state.queueJob({
+      workspaceId: taskRun.workspaceId,
+      kind: "task_run_retry",
+      payload: {
+        taskRunId: taskRun.id,
+        manual: true,
+      },
+      runAfter: queuedAt,
+      dedupeKey: `task_run_retry:${taskRun.id}`,
+      replacePending: true,
+      cancelReason: "manual_retry_replaced_pending",
+    });
+    const retriedRun = TaskRunSchema.parse({
+      ...taskRun,
+      status: "waiting_retry",
+      nextRetryAt: queuedJob.runAfter ?? queuedAt,
+      updatedAt: queuedAt,
+    });
+    await state.repository.saveTaskRun(retriedRun);
+    await appendSessionEvent({
+      sessionId: retriedRun.sessionId,
+      eventType: "task_run_waiting_retry",
+      payload: {
+        taskRunId: retriedRun.id,
+        retryCount: retriedRun.retryCount,
+        attemptCount: retriedRun.attemptCount,
+        manual: true,
+        retryJobId: queuedJob.id,
+      },
+    });
+    await sendTaskRunStatusUpdate({
+      task,
+      taskRun: retriedRun,
+      status: "waiting_retry",
+    });
+    await audit(
+      (request.user as { sub?: string }).sub ?? "unknown",
+      "retry_task_run",
+      "task_run",
+      retriedRun.id,
+      {
+        retryCount: retriedRun.retryCount,
+        attemptCount: retriedRun.attemptCount,
+      },
+    );
+    return retriedRun;
+  });
+
   app.get("/api/triggers", { preHandler: requireOwner }, async (request) => {
     const query = request.query as {
       taskId?: string;
@@ -8942,113 +10479,19 @@ export async function createApp(
     const workspace = await state.repository.getWorkspace();
     requireWorkspace(workspace);
     const body = (request.body ?? {}) as Partial<Trigger>;
-    const existing = body.id ? await state.repository.getTrigger(body.id) : null;
-    const triggerId = body.id ?? existing?.id ?? createId("trigger");
-    if (body.taskId) {
-      const task = await state.repository.getTask(body.taskId);
-      if (!task) {
-        throw app.httpErrors.badRequest("Task not found for trigger");
+    try {
+      return await upsertTriggerRecord({
+        workspace,
+        actor: (request.user as { sub?: string }).sub ?? "unknown",
+        body,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Trigger save failed";
+      if (message.includes("already used")) {
+        throw app.httpErrors.conflict(message);
       }
+      throw app.httpErrors.badRequest(message);
     }
-    const kind = TaskTriggerKindSchema.parse(body.kind ?? existing?.kind ?? "manual");
-    const taskId = body.taskId ?? existing?.taskId ?? null;
-    if (kind !== "manual" && !taskId) {
-      throw app.httpErrors.badRequest("taskId is required for non-manual triggers");
-    }
-    const config = asRecord(body.config ?? existing?.config ?? {}) ?? {};
-    if (kind === "schedule" && !scheduleIntervalMinutes(config)) {
-      throw app.httpErrors.badRequest("Schedule triggers require a positive intervalMinutes value");
-    }
-    if (kind === "telegram_shortcut") {
-      const command = normalizeTelegramShortcutCommand(config.command);
-      if (!command) {
-        throw app.httpErrors.badRequest("Only /digest is currently supported for telegram shortcut triggers");
-      }
-      config.command = command;
-    }
-    const rawWebhookSecret = typeof body.webhookSecret === "string"
-      ? body.webhookSecret.trim()
-      : "";
-    const persistedWebhookSecret = kind === "webhook"
-      ? rawWebhookSecret ||
-        await state.resolveTriggerWebhookSecret({
-          workspaceId: workspace.id,
-          trigger: existing ?? TriggerSchema.parse({
-            id: triggerId,
-            workspaceId: workspace.id,
-            label: body.label ?? "Trigger",
-            kind,
-          }),
-        }) ||
-        createId("hooksecret")
-      : null;
-    const webhookSecretRef = kind === "webhook" && persistedWebhookSecret
-      ? await state.saveTriggerWebhookSecret({
-          workspaceId: workspace.id,
-          triggerId,
-          secret: persistedWebhookSecret,
-        })
-      : null;
-    const normalizedWebhookPath = kind === "webhook"
-      ? normalizeWebhookPath(
-            String(body.webhookPath ?? existing?.webhookPath ?? body.label ?? "trigger"),
-        )
-      : null;
-    const nextEnabled = body.enabled ?? existing?.enabled ?? true;
-    if (kind === "webhook" && normalizedWebhookPath && nextEnabled) {
-      const conflictingTrigger = (await state.repository.listTriggers({
-        kind: "webhook",
-        enabled: true,
-      })).find((trigger) =>
-        trigger.id !== existing?.id && trigger.webhookPath === normalizedWebhookPath
-      );
-      if (conflictingTrigger) {
-        throw app.httpErrors.conflict("Webhook path is already used by another enabled trigger");
-      }
-    }
-    const timestamp = nowIso();
-    const next = TriggerSchema.parse({
-      id: triggerId,
-      workspaceId: workspace.id,
-      taskId,
-      label: body.label ?? existing?.label ?? "Trigger",
-      kind,
-      enabled: body.enabled ?? existing?.enabled ?? true,
-      config,
-      webhookPath: normalizedWebhookPath,
-      webhookSecret: null,
-      webhookSecretRef,
-      nextRunAt: kind === "schedule"
-        ? String(body.nextRunAt ?? existing?.nextRunAt ?? nextScheduledRunAt(config) ?? nowIso())
-        : null,
-      lastTriggeredAt: existing?.lastTriggeredAt ?? null,
-      lastRunId: existing?.lastRunId ?? null,
-      createdAt: existing?.createdAt ?? timestamp,
-      updatedAt: timestamp,
-    });
-    await state.repository.saveTrigger(next);
-    if (next.taskId) {
-      const task = await state.repository.getTask(next.taskId);
-      if (task) {
-        await state.repository.saveTask({
-          ...task,
-          triggerIds: [...new Set([...task.triggerIds, next.id])],
-          updatedAt: nowIso(),
-        });
-      }
-    }
-    await audit(
-      (request.user as { sub?: string }).sub ?? "unknown",
-      existing ? "update_trigger" : "create_trigger",
-      "trigger",
-      next.id,
-      {
-        taskId: next.taskId,
-        kind: next.kind,
-        enabled: next.enabled,
-      },
-    );
-    return next;
   });
 
   app.post("/api/triggers/webhook/:path", async (request, reply) => {
@@ -9078,6 +10521,7 @@ export async function createApp(
       task,
       triggerType: "webhook",
       triggerId: trigger.id,
+      trigger,
       inputSnapshot: {
         headers: request.headers,
         body: request.body ?? null,
@@ -9579,11 +11023,12 @@ export async function createApp(
       if (!taskRun || taskRun.executorId !== executor.id) {
         continue;
       }
+      const task = taskRun.taskId ? await state.repository.getTask(taskRun.taskId) : null;
       const nextStatus = runUpdate.status ?? "completed";
       if (isTerminalTaskRunStatus(taskRun.status) && taskRun.finishedAt) {
         continue;
       }
-      const updatedRun = TaskRunSchema.parse({
+      let updatedRun = TaskRunSchema.parse({
         ...taskRun,
         status: nextStatus,
         outputSummary: runUpdate.outputSummary ?? taskRun.outputSummary,
@@ -9608,20 +11053,32 @@ export async function createApp(
           taskRunId: entry.taskRunId ?? taskRun.id,
         })),
       });
-      await appendSessionEvent({
-        sessionId: taskRun.sessionId,
-        eventType: nextStatus === "completed"
-          ? "task_run_completed"
-          : nextStatus === "failed"
-            ? "task_run_failed"
+      if (nextStatus !== "completed") {
+        const retriedRun = await scheduleTaskRunRetry({
+          task,
+          taskRun: updatedRun,
+          reason: "task_failed",
+          error: updatedRun.error ?? "Executor run failed",
+          baseTimeMs: Date.now(),
+        });
+        if (retriedRun) {
+          updatedRun = retriedRun;
+        }
+      }
+      if (updatedRun.status !== "waiting_retry") {
+        await appendSessionEvent({
+          sessionId: taskRun.sessionId,
+          eventType: updatedRun.status === "completed"
+            ? "task_run_completed"
             : "task_run_failed",
-        payload: {
-          taskRunId: taskRun.id,
-          executorId: executor.id,
-          status: nextStatus,
-          error: updatedRun.error,
-        },
-      });
+          payload: {
+            taskRunId: taskRun.id,
+            executorId: executor.id,
+            status: updatedRun.status,
+            error: updatedRun.error,
+          },
+        });
+      }
       await audit(
         `executor:${executor.id}`,
         nextStatus === "completed" ? "executor_complete_task_run" : "executor_fail_task_run",
@@ -9629,22 +11086,24 @@ export async function createApp(
         updatedRun.id,
         {
           executorId: executor.id,
-          status: nextStatus,
+          status: updatedRun.status,
           taskId: updatedRun.taskId,
         },
       );
-      await sendTaskRunStatusUpdate({
-        task: updatedRun.taskId ? await state.repository.getTask(updatedRun.taskId) : null,
-        taskRun: updatedRun,
-        status: nextStatus === "completed" ? "completed" : "failed",
-      });
+      if (updatedRun.status !== "waiting_retry") {
+        await sendTaskRunStatusUpdate({
+          task,
+          taskRun: updatedRun,
+          status: updatedRun.status === "completed" ? "completed" : "failed",
+        });
+      }
       logInternalEvent("executor_run_updated", {
         executorId: executor.id,
         taskRunId: updatedRun.id,
         taskId: updatedRun.taskId,
-        status: nextStatus,
+        status: updatedRun.status,
         error: updatedRun.error,
-      }, nextStatus === "completed" ? "info" : "warn");
+      }, updatedRun.status === "completed" ? "info" : "warn");
     }
 
     const queuedRuns = await state.repository.listTaskRuns({
@@ -9663,27 +11122,36 @@ export async function createApp(
       ) {
         const browserReady = browserExecutorReady(next);
         if (!browserReady.ready) {
-          const waitingRun = TaskRunSchema.parse({
+          let waitingRun = TaskRunSchema.parse({
             ...taskRun,
             status: "waiting_retry",
             error: browserReady.message ?? "Chrome extension executor is not ready.",
             updatedAt: timestamp,
           });
           await state.repository.saveTaskRun(waitingRun);
-          await appendSessionEvent({
-            sessionId: taskRun.sessionId,
-            eventType: "task_run_waiting_retry",
-            payload: {
-              taskRunId: taskRun.id,
-              executorId: executor.id,
-              error: waitingRun.error,
-            },
-          });
-          await sendTaskRunStatusUpdate({
+          waitingRun = await scheduleTaskRunRetry({
             task,
             taskRun: waitingRun,
-            status: "waiting_retry",
-          });
+            reason: "executor_unavailable",
+            error: waitingRun.error ?? "Chrome extension executor is not ready.",
+            baseTimeMs: Date.now(),
+          }) ?? waitingRun;
+          if (waitingRun.status !== "waiting_retry" || !waitingRun.nextRetryAt) {
+            await appendSessionEvent({
+              sessionId: taskRun.sessionId,
+              eventType: "task_run_waiting_retry",
+              payload: {
+                taskRunId: taskRun.id,
+                executorId: executor.id,
+                error: waitingRun.error,
+              },
+            });
+            await sendTaskRunStatusUpdate({
+              task,
+              taskRun: waitingRun,
+              status: "waiting_retry",
+            });
+          }
           continue;
         }
       }
@@ -10177,11 +11645,25 @@ export async function createApp(
 
   app.get("/api/memory/status", { preHandler: requireOwner }, async () => {
     const workspace = await state.repository.getWorkspace();
-    const documents = await state.repository.listMemoryDocuments();
+    const documents = workspace
+      ? await state.repository.listMemoryDocumentsByWorkspace(workspace.id)
+      : await state.repository.listMemoryDocuments();
     const chunks = await state.repository.listMemoryChunks();
     const pendingJobs = await state.repository.listJobs({ status: "pending" });
-    const longterm = documents.find((item) => item.kind === "longterm");
-    const daily = documents.filter((item) => item.kind === "daily").slice(-2);
+    const longterm = workspace
+      ? (await state.repository.listMemoryDocumentsByKind({
+        workspaceId: workspace.id,
+        kind: "longterm",
+        limit: 1,
+      }))[0] ?? null
+      : documents.find((item) => item.kind === "longterm") ?? null;
+    const daily = workspace
+      ? await state.repository.listMemoryDocumentsByKind({
+        workspaceId: workspace.id,
+        kind: "daily",
+        limit: 2,
+      })
+      : documents.filter((item) => item.kind === "daily").slice(0, 2);
     return {
       workspace,
       hasCloudflare: Boolean(state.cloudflare),
@@ -10275,8 +11757,8 @@ export async function createApp(
     "/api/documents/:id",
     { preHandler: requireOwner },
     async (request, reply) => {
-      const document = (await state.repository.listDocuments()).find(
-        (item) => item.id === (request.params as { id: string }).id,
+      const document = await state.repository.getDocument(
+        (request.params as { id: string }).id,
       );
       if (!document) {
         return reply.code(404).send({ error: "Document not found" });
@@ -10376,14 +11858,14 @@ export async function createApp(
     { preHandler: requireOwner },
     async (request) => {
       const query = request.query as {
-        status?: "pending" | "running" | "failed" | "completed";
+        status?: "pending" | "running" | "failed" | "completed" | "cancelled";
         kind?: string;
       };
-      const jobs = await state.repository.listJobs({
+      return state.repository.listJobs({
         ...(query.status ? { status: query.status } : {}),
         ...(query.kind ? { kind: query.kind as never } : {}),
+        orderByCreatedAt: "desc",
       });
-      return jobs.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     },
   );
 
@@ -10403,6 +11885,8 @@ export async function createApp(
         lockedAt: null,
         lockedBy: null,
         completedAt: null,
+        cancelledAt: null,
+        cancelReason: null,
         updatedAt: nowIso(),
       });
       return { ok: true };
@@ -10542,7 +12026,6 @@ export async function createApp(
 
   const buildSystemLogsSnapshot = async () => {
     const servers = await state.repository.listMcpServers();
-    const documents = await state.repository.listDocuments();
     const taskRuns = await state.repository.listTaskRuns({ limit: 30 });
     const approvals = await state.repository.listApprovalRequests({ limit: 20 });
     const executors = await state.repository.listExecutorNodes();
@@ -10551,9 +12034,10 @@ export async function createApp(
       importExportRuns: await state.repository.listImportExportRuns(20),
       recentAudit: await state.repository.listAuditEvents(20),
       recentProviderTests: await state.repository.listProviderTestRuns({ limit: 20 }),
-      recentJobs: (await state.repository.listJobs())
-        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-        .slice(0, 30),
+      recentJobs: await state.repository.listJobs({
+        limit: 30,
+        orderByCreatedAt: "desc",
+      }),
       recentMcpLogs: await Promise.all(
         servers.slice(0, 10).map(async (server) => ({
           serverId: server.id,
@@ -10563,10 +12047,7 @@ export async function createApp(
           logs: await mcpSupervisor.readServerLogs(server.id, { tailLines: 40 }),
         })),
       ),
-      recentDocumentFailures: documents
-        .filter((document) => document.extractionStatus === "failed" || document.lastExtractionError)
-        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-        .slice(0, 20),
+      recentDocumentFailures: await state.repository.listRecentDocumentFailures(20),
       recentTaskRuns: taskRuns,
       pendingApprovals: approvals.filter((approval) => approval.status === "pending"),
       executors,
@@ -10687,22 +12168,30 @@ export async function createApp(
   );
 
   const buildSystemHealthSnapshot = async (request: FastifyRequest) => {
-    const jobs = await state.repository.listJobs();
+    const workspace = await state.repository.getWorkspace();
+    const jobCounts = await state.repository.countJobsByStatus(
+      workspace?.id
+        ? {
+            workspaceId: workspace.id,
+          }
+        : undefined,
+    );
     const providerTests = await state.repository.listProviderTestRuns({ limit: 20 });
     const mcpProviders = await state.repository.listMcpProviders();
     const mcpServers = await state.repository.listMcpServers();
-    const documents = await state.repository.listDocuments();
-    const tasks = await state.repository.listTasks();
-    const taskRuns = await state.repository.listTaskRuns({ limit: 200 });
-    const approvals = await state.repository.listApprovalRequests({ limit: 200 });
+    const documentCounts = await state.repository.countDocumentsByExtractionStatus();
+    const recentDocumentFailures = await state.repository.listRecentDocumentFailures(5);
+    const taskCounts = await state.repository.countTasksByStatus();
+    const taskRunCounts = await state.repository.countTaskRunsByStatus();
+    const approvalCounts = await state.repository.countApprovalRequestsByStatus();
     const executors = await state.repository.listExecutorNodes();
-    const workspace = await state.repository.getWorkspace();
     const providerProfiles = await state.repository.listProviderProfiles();
     const agentProfiles = await state.repository.listAgentProfiles();
-    const allTurns = await state.repository.listConversationTurns({ limit: 200 });
-    const runningTurns = allTurns.filter((turn) => turn.status === "running");
-    const failedTurns = allTurns
-      .filter((turn) => turn.status === "failed")
+    const runningTurnSummary = await state.repository.summarizeRunningConversationTurns(nowIso());
+    const failedTurns = (await state.repository.listConversationTurns({
+      status: "failed",
+      limit: 20,
+    }))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .slice(0, 5);
     const expectedWebhookUrl = resolveExpectedTelegramWebhookUrl(state.env, request);
@@ -10809,9 +12298,9 @@ export async function createApp(
       activeTurnLocks: await state.listActiveConversationLocks(),
       graph: {
         enabled: true,
-        runningTurns: runningTurns.length,
-        resumableTurns: runningTurns.filter((turn) => turn.resumeEligible).length,
-        stuckTurns: runningTurns.filter((turn) => !isIsoInFuture(turn.lockExpiresAt)).length,
+        runningTurns: runningTurnSummary.running,
+        resumableTurns: runningTurnSummary.resumable,
+        stuckTurns: runningTurnSummary.stuck,
         recentTurnFailures: failedTurns.map((turn) => ({
           turnId: turn.id,
           conversationId: turn.conversationId,
@@ -10821,22 +12310,22 @@ export async function createApp(
         })),
       },
       jobs: {
-        pending: jobs.filter((job) => job.status === "pending").length,
-        running: jobs.filter((job) => job.status === "running").length,
-        failed: jobs.filter((job) => job.status === "failed").length,
-        completed: jobs.filter((job) => job.status === "completed").length,
+        pending: jobCounts.pending,
+        running: jobCounts.running,
+        failed: jobCounts.failed,
+        completed: jobCounts.completed,
       },
       documents: {
-        total: documents.length,
-        pending: documents.filter((document) => document.extractionStatus === "pending").length,
-        processing: documents.filter((document) => document.extractionStatus === "processing").length,
-        failed: documents.filter((document) => document.extractionStatus === "failed").length,
-        completed: documents.filter((document) => document.extractionStatus === "completed").length,
-        recentFailures: documents
-          .filter((document) => document.extractionStatus === "failed" || document.lastExtractionError)
-          .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-          .slice(0, 5)
-          .map((document) => ({
+        total:
+          documentCounts.pending +
+          documentCounts.processing +
+          documentCounts.failed +
+          documentCounts.completed,
+        pending: documentCounts.pending,
+        processing: documentCounts.processing,
+        failed: documentCounts.failed,
+        completed: documentCounts.completed,
+        recentFailures: recentDocumentFailures.map((document) => ({
             id: document.id,
             title: document.title,
             extractionStatus: document.extractionStatus,
@@ -10846,25 +12335,29 @@ export async function createApp(
           })),
       },
       tasks: {
-        total: tasks.length,
-        draft: tasks.filter((task) => task.status === "draft").length,
-        active: tasks.filter((task) => task.status === "active").length,
-        paused: tasks.filter((task) => task.status === "paused").length,
-        archived: tasks.filter((task) => task.status === "archived").length,
+        total:
+          taskCounts.draft +
+          taskCounts.active +
+          taskCounts.paused +
+          taskCounts.archived,
+        draft: taskCounts.draft,
+        active: taskCounts.active,
+        paused: taskCounts.paused,
+        archived: taskCounts.archived,
       },
       taskRuns: {
-        queued: taskRuns.filter((taskRun) => taskRun.status === "queued").length,
-        running: taskRuns.filter((taskRun) => taskRun.status === "running").length,
-        waitingApproval: taskRuns.filter((taskRun) => taskRun.status === "waiting_approval").length,
-        waitingRetry: taskRuns.filter((taskRun) => taskRun.status === "waiting_retry").length,
-        completed: taskRuns.filter((taskRun) => taskRun.status === "completed").length,
-        failed: taskRuns.filter((taskRun) => taskRun.status === "failed").length,
+        queued: taskRunCounts.queued,
+        running: taskRunCounts.running,
+        waitingApproval: taskRunCounts.waiting_approval,
+        waitingRetry: taskRunCounts.waiting_retry,
+        completed: taskRunCounts.completed,
+        failed: taskRunCounts.failed,
       },
       approvals: {
-        pending: approvals.filter((approval) => approval.status === "pending").length,
-        approved: approvals.filter((approval) => approval.status === "approved").length,
-        rejected: approvals.filter((approval) => approval.status === "rejected").length,
-        cancelled: approvals.filter((approval) => approval.status === "cancelled").length,
+        pending: approvalCounts.pending,
+        approved: approvalCounts.approved,
+        rejected: approvalCounts.rejected,
+        cancelled: approvalCounts.cancelled,
       },
       executors: executors.map((executor) => ({
         id: executor.id,

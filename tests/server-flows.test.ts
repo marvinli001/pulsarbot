@@ -2845,7 +2845,7 @@ describe("server flows", () => {
     );
 
     await appState.app.close();
-  });
+  }, 15_000);
 
   it("exposes graph turn state and events through system diagnostics APIs", async () => {
     const dataDir = await createTempDataDir();
@@ -4191,6 +4191,387 @@ describe("server flows", () => {
     expect(overwriteMissing.json()).toMatchObject({
       error: "Memory document object is unavailable in R2",
     });
+
+    await appState.app.close();
+  });
+
+  it("creates and updates automations through Telegram conversation", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+
+    const created = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        update_id: 3001,
+        chatId: 1,
+        userId: 42,
+        username: "owner",
+        messageId: 101,
+        text: "帮我每天早上8点监控 https://example.com/news 并推送给我",
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json<Record<string, any>>().response).toContain("已创建自动化");
+
+    const tasksResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/tasks",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(tasksResponse.statusCode).toBe(200);
+    const tasks = tasksResponse.json<Array<Record<string, any>>>();
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({
+      templateKind: "web_watch_report",
+      status: "active",
+    });
+    expect(tasks[0]?.config?.url).toBe("https://example.com/news");
+
+    const triggersResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/triggers",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(triggersResponse.statusCode).toBe(200);
+    const triggers = triggersResponse.json<Array<Record<string, any>>>();
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0]).toMatchObject({
+      kind: "schedule",
+      taskId: tasks[0]?.id,
+    });
+    expect(triggers[0]?.config?.schedule).toMatchObject({
+      mode: "daily",
+      time: "08:00",
+      timezone: "UTC",
+    });
+
+    const updated = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        update_id: 3002,
+        chatId: 1,
+        userId: 42,
+        username: "owner",
+        messageId: 102,
+        text: "把这个自动化改成每周一和周五 09:30",
+      },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json<Record<string, any>>().response).toContain("已更新自动化");
+
+    const updatedTriggersResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/triggers",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const updatedTriggers = updatedTriggersResponse.json<Array<Record<string, any>>>();
+    expect(updatedTriggers).toHaveLength(1);
+    expect(updatedTriggers[0]?.config?.schedule).toMatchObject({
+      mode: "weekly",
+      time: "09:30",
+      timezone: "UTC",
+      weekdays: [1, 5],
+    });
+
+    await appState.app.close();
+  });
+
+  it("uses the LLM planner to compile cron-based automations when a provider is configured", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const llmAutomationInvoker = vi.fn(async (args: {
+      profile: ProviderProfile;
+      apiKey: string;
+      input: ProviderInvocationInput;
+    }): Promise<ProviderInvocationResult> => {
+      const system = args.input.messages.find((message) => message.role === "system")?.content ?? "";
+      if (system.includes("compile Telegram automation requests")) {
+        return {
+          text: JSON.stringify({
+            action: "create_task",
+            confidence: 0.96,
+            explanation: "Create a cron-based workday automation",
+            task: {
+              title: "工作日运营巡检",
+              goal: "工作日上午检查运营页面并推送结果",
+              description: "工作日上午 8 点执行",
+              templateKind: "web_watch_report",
+              status: "active",
+              config: {
+                url: "https://example.com/ops",
+                telegramTarget: {
+                  chatId: "1",
+                },
+              },
+              memoryPolicy: "task_context",
+            },
+            trigger: {
+              kind: "schedule",
+              label: "工作日 08:00",
+              config: {
+                schedule: {
+                  mode: "cron",
+                  cron: "0 8 * * 1-5",
+                  timezone: "UTC",
+                },
+              },
+              sessionTarget: {
+                kind: "telegram_chat",
+                telegramChatId: "1",
+                telegramThreadId: null,
+              },
+              retryPolicy: {
+                enabled: true,
+                maxAttempts: 3,
+                backoffSeconds: [60, 300, 900],
+                retryOn: ["executor_unavailable", "task_failed"],
+              },
+            },
+          }),
+          raw: {},
+        };
+      }
+      return fakeProviderInvoker(args);
+    });
+
+    const appState = await bootstrapApp(dataDir, {
+      providerInvoker: llmAutomationInvoker,
+    });
+    await upsertPrimaryProviderApiKey(appState.app, appState.cookie);
+
+    const created = await appState.app.inject({
+      method: "POST",
+      url: "/telegram/webhook",
+      payload: {
+        update_id: 3101,
+        chatId: 1,
+        userId: 42,
+        username: "owner",
+        messageId: 111,
+        text: "帮我做一个工作日上午八点的运营巡检自动化，监控 https://example.com/ops",
+      },
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json<Record<string, any>>().response).toContain("已创建自动化");
+
+    const triggersResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/triggers",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const triggers = triggersResponse.json<Array<Record<string, any>>>();
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0]?.config?.schedule).toMatchObject({
+      mode: "cron",
+      cron: "0 8 * * 1-5",
+      timezone: "UTC",
+    });
+    expect(triggers[0]?.sessionTarget).toMatchObject({
+      kind: "telegram_chat",
+      telegramChatId: "1",
+    });
+    expect(triggers[0]?.retryPolicy).toMatchObject({
+      enabled: true,
+      maxAttempts: 3,
+      backoffSeconds: [60, 300, 900],
+    });
+
+    await appState.app.close();
+  });
+
+  it("writes task run status into an isolated automation session conversation", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+
+    const taskCreated = await appState.app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        title: "Isolated Watch",
+        goal: "Watch example.com",
+        templateKind: "web_watch_report",
+        status: "active",
+        config: {
+          url: "https://example.com/status",
+        },
+      },
+    });
+    expect(taskCreated.statusCode).toBe(200);
+    const task = taskCreated.json<Record<string, any>>();
+
+    const triggerCreated = await appState.app.inject({
+      method: "POST",
+      url: "/api/triggers",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        taskId: task.id,
+        label: "Isolated Trigger",
+        kind: "schedule",
+        sessionTarget: {
+          kind: "isolated_automation_session",
+          automationSessionKey: "task:isolated-watch",
+        },
+        config: {
+          schedule: {
+            mode: "cron",
+            cron: "0 8 * * *",
+            timezone: "UTC",
+          },
+        },
+      },
+    });
+    expect(triggerCreated.statusCode).toBe(200);
+    const trigger = triggerCreated.json<Record<string, any>>();
+
+    const runCreated = await appState.app.inject({
+      method: "POST",
+      url: "/api/task-runs",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        taskId: task.id,
+        triggerType: "schedule",
+        triggerId: trigger.id,
+      },
+    });
+    expect(runCreated.statusCode).toBe(200);
+    expect(runCreated.json<Record<string, any>>().taskRun.status).toBe("waiting_retry");
+
+    const retryJobsResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/jobs?kind=task_run_retry",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(retryJobsResponse.statusCode).toBe(200);
+    const retryJobs = retryJobsResponse.json<Array<Record<string, any>>>();
+    expect(retryJobs).toHaveLength(1);
+    expect(retryJobs[0]?.payload?.taskRunId).toBe(runCreated.json<Record<string, any>>().taskRun.id);
+
+    const appInternal = appState.app as typeof appState.app & {
+      __pulsarbot?: {
+        state: {
+          repository: {
+            getConversation: (id: string) => Promise<Record<string, unknown> | null>;
+            listConversationMessages: (id: string) => Promise<Array<Record<string, unknown>>>;
+          };
+        };
+      };
+    };
+    const conversationId = "automation:task:isolated-watch";
+    const conversation = await appInternal.__pulsarbot?.state.repository.getConversation(conversationId);
+    const messages = await appInternal.__pulsarbot?.state.repository.listConversationMessages(conversationId);
+
+    expect(conversation).toBeTruthy();
+    expect(messages?.some((message) => String(message.content ?? "").includes("Status: Waiting Retry"))).toBe(true);
+
+    await appState.app.close();
+  });
+
+  it("cancels the previous pending retry job when the same task run is retried manually", async () => {
+    const dataDir = await createTempDataDir();
+    createdDirs.push(dataDir);
+
+    const appState = await bootstrapApp(dataDir);
+
+    const taskCreated = await appState.app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        title: "Retry Queue Task",
+        goal: "Force a retryable run",
+        templateKind: "web_watch_report",
+        status: "active",
+        config: {
+          url: "https://example.com/retry",
+        },
+      },
+    });
+    const task = taskCreated.json<Record<string, any>>();
+
+    const triggerCreated = await appState.app.inject({
+      method: "POST",
+      url: "/api/triggers",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        taskId: task.id,
+        label: "Retry Trigger",
+        kind: "schedule",
+        config: {
+          schedule: {
+            mode: "cron",
+            cron: "0 8 * * *",
+            timezone: "UTC",
+          },
+        },
+      },
+    });
+    const trigger = triggerCreated.json<Record<string, any>>();
+
+    const runCreated = await appState.app.inject({
+      method: "POST",
+      url: "/api/task-runs",
+      headers: {
+        cookie: appState.cookie,
+      },
+      payload: {
+        taskId: task.id,
+        triggerType: "schedule",
+        triggerId: trigger.id,
+      },
+    });
+    const taskRun = runCreated.json<Record<string, any>>().taskRun as Record<string, any>;
+    expect(taskRun.status).toBe("waiting_retry");
+
+    const manualRetry = await appState.app.inject({
+      method: "POST",
+      url: `/api/task-runs/${String(taskRun.id)}/retry`,
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    expect(manualRetry.statusCode).toBe(200);
+
+    const retryJobsResponse = await appState.app.inject({
+      method: "GET",
+      url: "/api/jobs?kind=task_run_retry",
+      headers: {
+        cookie: appState.cookie,
+      },
+    });
+    const retryJobs = retryJobsResponse.json<Array<Record<string, any>>>();
+    const sameRunJobs = retryJobs.filter((job) => job.payload?.taskRunId === taskRun.id);
+
+    expect(sameRunJobs.filter((job) => job.status === "pending")).toHaveLength(1);
+    expect(sameRunJobs.filter((job) => job.status === "cancelled")).toHaveLength(1);
+    expect(sameRunJobs.every((job) => job.dedupeKey === `task_run_retry:${String(taskRun.id)}`)).toBe(true);
 
     await appState.app.close();
   });

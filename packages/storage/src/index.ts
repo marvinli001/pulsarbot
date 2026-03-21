@@ -209,6 +209,14 @@ const createTableStatements = [
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS job_dedupe_index (
+    scope TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS audit_event (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
@@ -250,14 +258,36 @@ const createIndexStatements = [
   "CREATE INDEX IF NOT EXISTS idx_memory_chunk_document_id ON memory_chunk(json_extract(data, '$.documentId'))",
   "CREATE INDEX IF NOT EXISTS idx_job_status_kind ON job(json_extract(data, '$.status'), json_extract(data, '$.kind'))",
   "CREATE INDEX IF NOT EXISTS idx_task_status ON task(json_extract(data, '$.status'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_title ON task(json_extract(data, '$.title'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_updated_at ON task(json_extract(data, '$.updatedAt'))",
   "CREATE INDEX IF NOT EXISTS idx_task_run_status ON task_run(json_extract(data, '$.status'))",
   "CREATE INDEX IF NOT EXISTS idx_task_run_task_id ON task_run(json_extract(data, '$.taskId'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_run_executor_id ON task_run(json_extract(data, '$.executorId'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_run_created_at ON task_run(json_extract(data, '$.createdAt'))",
   "CREATE INDEX IF NOT EXISTS idx_task_trigger_task_id ON task_trigger(json_extract(data, '$.taskId'))",
   "CREATE INDEX IF NOT EXISTS idx_task_trigger_kind ON task_trigger(json_extract(data, '$.kind'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_trigger_enabled ON task_trigger(json_extract(data, '$.enabled'))",
+  "CREATE INDEX IF NOT EXISTS idx_task_trigger_updated_at ON task_trigger(json_extract(data, '$.updatedAt'))",
   "CREATE INDEX IF NOT EXISTS idx_approval_request_status ON approval_request(json_extract(data, '$.status'))",
+  "CREATE INDEX IF NOT EXISTS idx_approval_request_task_run_id ON approval_request(json_extract(data, '$.taskRunId'))",
+  "CREATE INDEX IF NOT EXISTS idx_approval_request_created_at ON approval_request(json_extract(data, '$.createdAt'))",
   "CREATE INDEX IF NOT EXISTS idx_executor_node_status ON executor_node(json_extract(data, '$.status'))",
   "CREATE INDEX IF NOT EXISTS idx_telegram_update_receipt_status ON telegram_update_receipt(status, updated_at)",
   "CREATE INDEX IF NOT EXISTS idx_conversation_turn_lock_expires_at ON conversation_turn_lock(lock_expires_at)",
+  "CREATE INDEX IF NOT EXISTS idx_conversation_turn_conversation_started_at ON conversation_turn(json_extract(data, '$.conversationId'), json_extract(data, '$.startedAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_conversation_turn_status ON conversation_turn(json_extract(data, '$.status'))",
+  "CREATE INDEX IF NOT EXISTS idx_tool_run_conversation_id ON tool_run(json_extract(data, '$.conversationId'))",
+  "CREATE INDEX IF NOT EXISTS idx_audit_event_created_at ON audit_event(json_extract(data, '$.createdAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_import_export_run_created_at ON import_export_run(json_extract(data, '$.createdAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_provider_test_run_provider_id ON provider_test_run(json_extract(data, '$.providerId'))",
+  "CREATE INDEX IF NOT EXISTS idx_provider_test_run_created_at ON provider_test_run(json_extract(data, '$.createdAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_document_metadata_updated_at ON document_metadata(json_extract(data, '$.updatedAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_document_metadata_extraction_status ON document_metadata(json_extract(data, '$.extractionStatus'))",
+  "CREATE INDEX IF NOT EXISTS idx_memory_document_workspace_id ON memory_document(json_extract(data, '$.workspaceId'))",
+  "CREATE INDEX IF NOT EXISTS idx_memory_document_kind ON memory_document(json_extract(data, '$.kind'))",
+  "CREATE INDEX IF NOT EXISTS idx_memory_document_path ON memory_document(json_extract(data, '$.path'))",
+  "CREATE INDEX IF NOT EXISTS idx_memory_document_updated_at ON memory_document(json_extract(data, '$.updatedAt'))",
+  "CREATE INDEX IF NOT EXISTS idx_conversation_active_turn_lock ON conversation(json_extract(data, '$.activeTurnLock'))",
   "CREATE INDEX IF NOT EXISTS idx_turn_event_turn_seq ON turn_event(json_extract(data, '$.turnId'), json_extract(data, '$.seq'))",
   "CREATE INDEX IF NOT EXISTS idx_turn_event_occurred_at ON turn_event(json_extract(data, '$.occurredAt'))",
   "CREATE INDEX IF NOT EXISTS idx_turn_state_turn_id ON turn_state_snapshot(json_extract(data, '$.turnId'))",
@@ -280,6 +310,20 @@ const migrationHistoryBootstrapStatement = `CREATE TABLE IF NOT EXISTS migration
 interface MigrationDefinition {
   id: string;
   statement: string;
+}
+
+const ACTIVE_JOB_STATUSES: JobRecord["status"][] = ["pending", "running"];
+
+function isActiveJobStatus(status: JobRecord["status"]): boolean {
+  return ACTIVE_JOB_STATUSES.includes(status);
+}
+
+function buildJobDedupeScope(args: {
+  workspaceId: string;
+  kind: JobRecord["kind"];
+  dedupeKey: string;
+}): string {
+  return `${args.workspaceId}:${args.kind}:${args.dedupeKey}`;
 }
 
 function tableMigrationId(statement: string): string {
@@ -483,6 +527,12 @@ export interface AppRepository {
   getSearchSettings(): Promise<SearchSettings>;
   saveSearchSettings(settings: SearchSettings): Promise<void>;
   listTasks(): Promise<Task[]>;
+  listTasksByStatus(args: {
+    statuses: Task["status"][];
+    limit?: number;
+  }): Promise<Task[]>;
+  getTaskByTitle(title: string): Promise<Task | null>;
+  countTasksByStatus(): Promise<Record<Task["status"], number>>;
   getTask(id: string): Promise<Task | null>;
   saveTask(task: Task): Promise<void>;
   listTaskRuns(args?: {
@@ -491,6 +541,7 @@ export interface AppRepository {
     executorId?: string;
     limit?: number;
   }): Promise<TaskRun[]>;
+  countTaskRunsByStatus(): Promise<Record<TaskRun["status"], number>>;
   getTaskRun(id: string): Promise<TaskRun | null>;
   saveTaskRun(taskRun: TaskRun): Promise<void>;
   listTriggers(args?: {
@@ -505,6 +556,7 @@ export interface AppRepository {
     status?: ApprovalRequest["status"];
     limit?: number;
   }): Promise<ApprovalRequest[]>;
+  countApprovalRequestsByStatus(): Promise<Record<ApprovalRequest["status"], number>>;
   getApprovalRequest(id: string): Promise<ApprovalRequest | null>;
   saveApprovalRequest(approval: ApprovalRequest): Promise<void>;
   listExecutorNodes(): Promise<ExecutorNode[]>;
@@ -521,8 +573,22 @@ export interface AppRepository {
   saveSecret(secret: SecretEnvelope): Promise<void>;
   clearWorkspaceForImport(workspaceId: string): Promise<void>;
   listDocuments(): Promise<DocumentMetadata[]>;
+  getDocument(id: string): Promise<DocumentMetadata | null>;
+  listRecentDocumentFailures(limit: number): Promise<DocumentMetadata[]>;
+  countDocumentsByExtractionStatus(): Promise<Record<DocumentMetadata["extractionStatus"], number>>;
   saveDocument(document: DocumentMetadata): Promise<void>;
   listMemoryDocuments(): Promise<MemoryDocument[]>;
+  listMemoryDocumentsByWorkspace(workspaceId: string): Promise<MemoryDocument[]>;
+  listMemoryDocumentsByKind(args: {
+    kind: MemoryDocument["kind"];
+    workspaceId?: string;
+    limit?: number;
+  }): Promise<MemoryDocument[]>;
+  getMemoryDocument(id: string): Promise<MemoryDocument | null>;
+  findMemoryDocumentByPath(args: {
+    workspaceId: string;
+    path: string;
+  }): Promise<MemoryDocument | null>;
   saveMemoryDocument(document: MemoryDocument): Promise<void>;
   listMemoryChunks(args?: { documentId?: string; workspaceId?: string }): Promise<MemoryChunk[]>;
   saveMemoryChunk(chunk: MemoryChunk): Promise<void>;
@@ -534,15 +600,38 @@ export interface AppRepository {
     status?: ConversationTurn["status"];
     limit?: number;
   }): Promise<ConversationTurn[]>;
+  countConversationTurnsByStatus(): Promise<Record<ConversationTurn["status"], number>>;
+  summarizeRunningConversationTurns(nowIso: string): Promise<{
+    running: number;
+    resumable: number;
+    stuck: number;
+  }>;
   getConversationTurn(id: string): Promise<ConversationTurn | null>;
   saveConversationTurn(turn: ConversationTurn): Promise<void>;
   listToolRuns(conversationId?: string): Promise<ToolRunRecord[]>;
   saveToolRun(record: ToolRunRecord): Promise<void>;
-  listJobs(args?: { status?: JobRecord["status"]; kind?: JobRecord["kind"] }): Promise<JobRecord[]>;
+  listJobs(args?: {
+    status?: JobRecord["status"];
+    kind?: JobRecord["kind"];
+    workspaceId?: string;
+    runAfterLte?: string;
+    lockedState?: "locked" | "unlocked";
+    limit?: number;
+    orderByCreatedAt?: "asc" | "desc";
+  }): Promise<JobRecord[]>;
+  countJobsByStatus(args?: {
+    workspaceId?: string;
+  }): Promise<Record<JobRecord["status"], number>>;
   getJob(id: string): Promise<JobRecord | null>;
+  getActiveJobByDedupeKey(args: {
+    workspaceId: string;
+    kind: JobRecord["kind"];
+    dedupeKey: string;
+  }): Promise<JobRecord | null>;
   saveJob(job: JobRecord): Promise<void>;
   getConversation(id: string): Promise<ConversationRecord | null>;
   listConversations(): Promise<ConversationRecord[]>;
+  listConversationsWithActiveTurnLock(): Promise<ConversationRecord[]>;
   saveConversation(conversation: ConversationRecord): Promise<void>;
   claimConversationTurnLock(args: {
     conversationId: string;
@@ -908,9 +997,65 @@ export class D1AppRepository implements AppRepository {
     return this.listJsonTable("task", TaskSchema);
   }
 
+  public async listTasksByStatus(args: {
+    statuses: Task["status"][];
+    limit?: number;
+  }): Promise<Task[]> {
+    const statuses = [...new Set(args.statuses)];
+    if (statuses.length === 0) {
+      return [];
+    }
+    const placeholders = statuses.map(() => "?").join(", ");
+    const limitClause = typeof args.limit === "number" ? " LIMIT ?" : "";
+    const params: unknown[] = [...statuses];
+    if (typeof args.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM task
+      WHERE json_extract(data, '$.status') IN (${placeholders})
+      ORDER BY json_extract(data, '$.updatedAt') DESC${limitClause}`,
+      params,
+    );
+    return rows.map((row) => TaskSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async getTaskByTitle(title: string): Promise<Task | null> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM task
+      WHERE LOWER(json_extract(data, '$.title')) = ?
+      LIMIT 1`,
+      [title.trim().toLowerCase()],
+    );
+    const row = rows[0];
+    return row ? TaskSchema.parse(JSON.parse(row.data)) : null;
+  }
+
+  public async countTasksByStatus(): Promise<Record<Task["status"], number>> {
+    const rows = await this.client.queryD1<{
+      status: Task["status"];
+      count: number;
+    }>(
+      this.databaseId,
+      `SELECT json_extract(data, '$.status') AS status, COUNT(*) AS count
+      FROM task
+      GROUP BY json_extract(data, '$.status')`,
+    );
+    return {
+      draft: 0,
+      active: 0,
+      paused: 0,
+      archived: 0,
+      ...Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])),
+    } as Record<Task["status"], number>;
+  }
+
   public async getTask(id: string): Promise<Task | null> {
-    const tasks = await this.listTasks();
-    return tasks.find((task) => task.id === id) ?? null;
+    return this.getJsonRow("task", id, TaskSchema);
   }
 
   public async saveTask(task: Task): Promise<void> {
@@ -926,26 +1071,59 @@ export class D1AppRepository implements AppRepository {
     executorId?: string;
     limit?: number;
   }): Promise<TaskRun[]> {
-    let rows = await this.listJsonTable("task_run", TaskRunSchema);
-    rows = rows.filter((taskRun) => {
-      if (args?.taskId && taskRun.taskId !== args.taskId) {
-        return false;
-      }
-      if (args?.status && taskRun.status !== args.status) {
-        return false;
-      }
-      if (args?.executorId && taskRun.executorId !== args.executorId) {
-        return false;
-      }
-      return true;
-    });
-    rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.taskId) {
+      predicates.push("json_extract(data, '$.taskId') = ?");
+      params.push(args.taskId);
+    }
+    if (args?.status) {
+      predicates.push("json_extract(data, '$.status') = ?");
+      params.push(args.status);
+    }
+    if (args?.executorId) {
+      predicates.push("json_extract(data, '$.executorId') = ?");
+      params.push(args.executorId);
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const limitClause = typeof args?.limit === "number" ? " LIMIT ?" : "";
+    if (typeof args?.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM task_run${whereClause}
+      ORDER BY json_extract(data, '$.createdAt') DESC${limitClause}`,
+      params,
+    );
+    return rows.map((row) => TaskRunSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async countTaskRunsByStatus(): Promise<Record<TaskRun["status"], number>> {
+    const rows = await this.client.queryD1<{
+      status: TaskRun["status"];
+      count: number;
+    }>(
+      this.databaseId,
+      `SELECT json_extract(data, '$.status') AS status, COUNT(*) AS count
+      FROM task_run
+      GROUP BY json_extract(data, '$.status')`,
+    );
+    return {
+      queued: 0,
+      running: 0,
+      waiting_approval: 0,
+      waiting_retry: 0,
+      completed: 0,
+      failed: 0,
+      aborted: 0,
+      ...Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])),
+    } as Record<TaskRun["status"], number>;
   }
 
   public async getTaskRun(id: string): Promise<TaskRun | null> {
-    const rows = await this.listTaskRuns();
-    return rows.find((taskRun) => taskRun.id === id) ?? null;
+    return this.getJsonRow("task_run", id, TaskRunSchema);
   }
 
   public async saveTaskRun(taskRun: TaskRun): Promise<void> {
@@ -960,26 +1138,33 @@ export class D1AppRepository implements AppRepository {
     kind?: Trigger["kind"];
     enabled?: boolean;
   }): Promise<Trigger[]> {
-    let rows = await this.listJsonTable("task_trigger", TriggerSchema);
-    rows = rows.filter((trigger) => {
-      if (args?.taskId && trigger.taskId !== args.taskId) {
-        return false;
-      }
-      if (args?.kind && trigger.kind !== args.kind) {
-        return false;
-      }
-      if (typeof args?.enabled === "boolean" && trigger.enabled !== args.enabled) {
-        return false;
-      }
-      return true;
-    });
-    rows.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    return rows;
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.taskId) {
+      predicates.push("json_extract(data, '$.taskId') = ?");
+      params.push(args.taskId);
+    }
+    if (args?.kind) {
+      predicates.push("json_extract(data, '$.kind') = ?");
+      params.push(args.kind);
+    }
+    if (typeof args?.enabled === "boolean") {
+      predicates.push("json_extract(data, '$.enabled') = ?");
+      params.push(args.enabled ? 1 : 0);
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM task_trigger${whereClause}
+      ORDER BY json_extract(data, '$.updatedAt') DESC`,
+      params,
+    );
+    return rows.map((row) => TriggerSchema.parse(JSON.parse(row.data)));
   }
 
   public async getTrigger(id: string): Promise<Trigger | null> {
-    const rows = await this.listTriggers();
-    return rows.find((trigger) => trigger.id === id) ?? null;
+    return this.getJsonRow("task_trigger", id, TriggerSchema);
   }
 
   public async saveTrigger(trigger: Trigger): Promise<void> {
@@ -994,23 +1179,53 @@ export class D1AppRepository implements AppRepository {
     status?: ApprovalRequest["status"];
     limit?: number;
   }): Promise<ApprovalRequest[]> {
-    let rows = await this.listJsonTable("approval_request", ApprovalRequestSchema);
-    rows = rows.filter((approval) => {
-      if (args?.taskRunId && approval.taskRunId !== args.taskRunId) {
-        return false;
-      }
-      if (args?.status && approval.status !== args.status) {
-        return false;
-      }
-      return true;
-    });
-    rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.taskRunId) {
+      predicates.push("json_extract(data, '$.taskRunId') = ?");
+      params.push(args.taskRunId);
+    }
+    if (args?.status) {
+      predicates.push("json_extract(data, '$.status') = ?");
+      params.push(args.status);
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const limitClause = typeof args?.limit === "number" ? " LIMIT ?" : "";
+    if (typeof args?.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM approval_request${whereClause}
+      ORDER BY json_extract(data, '$.createdAt') DESC${limitClause}`,
+      params,
+    );
+    return rows.map((row) => ApprovalRequestSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async countApprovalRequestsByStatus(): Promise<Record<ApprovalRequest["status"], number>> {
+    const rows = await this.client.queryD1<{
+      status: ApprovalRequest["status"];
+      count: number;
+    }>(
+      this.databaseId,
+      `SELECT json_extract(data, '$.status') AS status, COUNT(*) AS count
+      FROM approval_request
+      GROUP BY json_extract(data, '$.status')`,
+    );
+    return {
+      pending: 0,
+      approved: 0,
+      rejected: 0,
+      expired: 0,
+      cancelled: 0,
+      ...Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])),
+    } as Record<ApprovalRequest["status"], number>;
   }
 
   public async getApprovalRequest(id: string): Promise<ApprovalRequest | null> {
-    const rows = await this.listApprovalRequests();
-    return rows.find((approval) => approval.id === id) ?? null;
+    return this.getJsonRow("approval_request", id, ApprovalRequestSchema);
   }
 
   public async saveApprovalRequest(approval: ApprovalRequest): Promise<void> {
@@ -1025,8 +1240,7 @@ export class D1AppRepository implements AppRepository {
   }
 
   public async getExecutorNode(id: string): Promise<ExecutorNode | null> {
-    const rows = await this.listExecutorNodes();
-    return rows.find((executor) => executor.id === id) ?? null;
+    return this.getJsonRow("executor_node", id, ExecutorNodeSchema);
   }
 
   public async saveExecutorNode(executor: ExecutorNode): Promise<void> {
@@ -1169,6 +1383,7 @@ export class D1AppRepository implements AppRepository {
       { sql: "DELETE FROM conversation_summary" },
       { sql: "DELETE FROM message" },
       { sql: "DELETE FROM conversation" },
+      { sql: "DELETE FROM job_dedupe_index" },
       { sql: "DELETE FROM job" },
       { sql: "DELETE FROM provider_test_run" },
       { sql: "DELETE FROM audit_event" },
@@ -1205,6 +1420,43 @@ export class D1AppRepository implements AppRepository {
     return this.listJsonTable("document_metadata", DocumentMetadataSchema);
   }
 
+  public async getDocument(id: string): Promise<DocumentMetadata | null> {
+    return this.getJsonRow("document_metadata", id, DocumentMetadataSchema);
+  }
+
+  public async listRecentDocumentFailures(limit: number): Promise<DocumentMetadata[]> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM document_metadata
+      WHERE json_extract(data, '$.extractionStatus') = 'failed'
+         OR json_extract(data, '$.lastExtractionError') IS NOT NULL
+      ORDER BY json_extract(data, '$.updatedAt') DESC
+      LIMIT ?`,
+      [limit],
+    );
+    return rows.map((row) => DocumentMetadataSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async countDocumentsByExtractionStatus(): Promise<Record<DocumentMetadata["extractionStatus"], number>> {
+    const rows = await this.client.queryD1<{
+      status: DocumentMetadata["extractionStatus"];
+      count: number;
+    }>(
+      this.databaseId,
+      `SELECT json_extract(data, '$.extractionStatus') AS status, COUNT(*) AS count
+      FROM document_metadata
+      GROUP BY json_extract(data, '$.extractionStatus')`,
+    );
+    return {
+      pending: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+      ...Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])),
+    } as Record<DocumentMetadata["extractionStatus"], number>;
+  }
+
   public async saveDocument(document: DocumentMetadata): Promise<void> {
     await this.saveJsonRow("document_metadata", {
       id: document.id,
@@ -1214,6 +1466,65 @@ export class D1AppRepository implements AppRepository {
 
   public async listMemoryDocuments(): Promise<MemoryDocument[]> {
     return this.listJsonTable("memory_document", MemoryDocumentSchema);
+  }
+
+  public async listMemoryDocumentsByWorkspace(workspaceId: string): Promise<MemoryDocument[]> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM memory_document
+      WHERE json_extract(data, '$.workspaceId') = ?
+      ORDER BY json_extract(data, '$.updatedAt') DESC`,
+      [workspaceId],
+    );
+    return rows.map((row) => MemoryDocumentSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async listMemoryDocumentsByKind(args: {
+    kind: MemoryDocument["kind"];
+    workspaceId?: string;
+    limit?: number;
+  }): Promise<MemoryDocument[]> {
+    const predicates = ["json_extract(data, '$.kind') = ?"];
+    const params: unknown[] = [args.kind];
+    if (args.workspaceId) {
+      predicates.push("json_extract(data, '$.workspaceId') = ?");
+      params.push(args.workspaceId);
+    }
+    const limitClause = typeof args.limit === "number" ? " LIMIT ?" : "";
+    if (typeof args.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM memory_document
+      WHERE ${predicates.join(" AND ")}
+      ORDER BY json_extract(data, '$.updatedAt') DESC${limitClause}`,
+      params,
+    );
+    return rows.map((row) => MemoryDocumentSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async getMemoryDocument(id: string): Promise<MemoryDocument | null> {
+    return this.getJsonRow("memory_document", id, MemoryDocumentSchema);
+  }
+
+  public async findMemoryDocumentByPath(args: {
+    workspaceId: string;
+    path: string;
+  }): Promise<MemoryDocument | null> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM memory_document
+      WHERE json_extract(data, '$.workspaceId') = ?
+        AND json_extract(data, '$.path') = ?
+      LIMIT 1`,
+      [args.workspaceId, args.path],
+    );
+    const row = rows[0];
+    return row ? MemoryDocumentSchema.parse(JSON.parse(row.data)) : null;
   }
 
   public async saveMemoryDocument(document: MemoryDocument): Promise<void> {
@@ -1282,23 +1593,86 @@ export class D1AppRepository implements AppRepository {
     status?: ConversationTurn["status"];
     limit?: number;
   }): Promise<ConversationTurn[]> {
-    let rows = await this.listJsonTable("conversation_turn", ConversationTurnSchema);
-    rows = rows.filter((row) => {
-      if (args?.conversationId && row.conversationId !== args.conversationId) {
-        return false;
-      }
-      if (args?.status && row.status !== args.status) {
-        return false;
-      }
-      return true;
-    });
-    rows.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
-    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.conversationId) {
+      predicates.push("json_extract(data, '$.conversationId') = ?");
+      params.push(args.conversationId);
+    }
+    if (args?.status) {
+      predicates.push("json_extract(data, '$.status') = ?");
+      params.push(args.status);
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const limitClause = typeof args?.limit === "number" ? " LIMIT ?" : "";
+    if (typeof args?.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM conversation_turn${whereClause}
+      ORDER BY json_extract(data, '$.startedAt') DESC${limitClause}`,
+      params,
+    );
+    return rows.map((row) => ConversationTurnSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async countConversationTurnsByStatus(): Promise<Record<ConversationTurn["status"], number>> {
+    const rows = await this.client.queryD1<{
+      status: ConversationTurn["status"];
+      count: number;
+    }>(
+      this.databaseId,
+      `SELECT json_extract(data, '$.status') AS status, COUNT(*) AS count
+      FROM conversation_turn
+      GROUP BY json_extract(data, '$.status')`,
+    );
+    return {
+      running: 0,
+      completed: 0,
+      failed: 0,
+      aborted: 0,
+      ...Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])),
+    } as Record<ConversationTurn["status"], number>;
+  }
+
+  public async summarizeRunningConversationTurns(nowIso: string): Promise<{
+    running: number;
+    resumable: number;
+    stuck: number;
+  }> {
+    const rows = await this.client.queryD1<{
+      running: number;
+      resumable: number;
+      stuck: number;
+    }>(
+      this.databaseId,
+      `SELECT
+        COUNT(*) AS running,
+        SUM(CASE WHEN json_extract(data, '$.resumeEligible') = 1 THEN 1 ELSE 0 END) AS resumable,
+        SUM(
+          CASE
+            WHEN json_extract(data, '$.lockExpiresAt') IS NULL
+              OR json_extract(data, '$.lockExpiresAt') <= ?
+            THEN 1
+            ELSE 0
+          END
+        ) AS stuck
+      FROM conversation_turn
+      WHERE json_extract(data, '$.status') = 'running'`,
+      [nowIso],
+    );
+    const row = rows[0];
+    return {
+      running: Number(row?.running ?? 0),
+      resumable: Number(row?.resumable ?? 0),
+      stuck: Number(row?.stuck ?? 0),
+    };
   }
 
   public async getConversationTurn(id: string): Promise<ConversationTurn | null> {
-    const rows = await this.listJsonTable("conversation_turn", ConversationTurnSchema);
-    return rows.find((row) => row.id === id) ?? null;
+    return this.getJsonRow("conversation_turn", id, ConversationTurnSchema);
   }
 
   public async saveConversationTurn(turn: ConversationTurn): Promise<void> {
@@ -1309,10 +1683,15 @@ export class D1AppRepository implements AppRepository {
   }
 
   public async listToolRuns(conversationId?: string): Promise<ToolRunRecord[]> {
-    const rows = await this.listJsonTable("tool_run", ToolRunRecordSchema);
-    return conversationId
-      ? rows.filter((row) => row.conversationId === conversationId)
-      : rows;
+    const whereClause = conversationId
+      ? " WHERE json_extract(data, '$.conversationId') = ?"
+      : "";
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data FROM tool_run${whereClause}`,
+      conversationId ? [conversationId] : [],
+    );
+    return rows.map((row) => ToolRunRecordSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveToolRun(record: ToolRunRecord): Promise<void> {
@@ -1325,38 +1704,181 @@ export class D1AppRepository implements AppRepository {
   public async listJobs(args?: {
     status?: JobRecord["status"];
     kind?: JobRecord["kind"];
+    workspaceId?: string;
+    runAfterLte?: string;
+    lockedState?: "locked" | "unlocked";
+    limit?: number;
+    orderByCreatedAt?: "asc" | "desc";
   }): Promise<JobRecord[]> {
-    const rows = await this.listJsonTable("job", JobRecordSchema);
-    return rows.filter((row) => {
-      if (args?.status && row.status !== args.status) {
-        return false;
-      }
-      if (args?.kind && row.kind !== args.kind) {
-        return false;
-      }
-      return true;
-    });
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.status) {
+      predicates.push("json_extract(data, '$.status') = ?");
+      params.push(args.status);
+    }
+    if (args?.kind) {
+      predicates.push("json_extract(data, '$.kind') = ?");
+      params.push(args.kind);
+    }
+    if (args?.workspaceId) {
+      predicates.push("json_extract(data, '$.workspaceId') = ?");
+      params.push(args.workspaceId);
+    }
+    if (args?.runAfterLte) {
+      predicates.push("(json_extract(data, '$.runAfter') IS NULL OR json_extract(data, '$.runAfter') <= ?)");
+      params.push(args.runAfterLte);
+    }
+    if (args?.lockedState === "unlocked") {
+      predicates.push("json_extract(data, '$.lockedAt') IS NULL");
+    }
+    if (args?.lockedState === "locked") {
+      predicates.push("json_extract(data, '$.lockedAt') IS NOT NULL");
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const orderClause = args?.orderByCreatedAt
+      ? ` ORDER BY json_extract(data, '$.createdAt') ${args.orderByCreatedAt.toUpperCase()}`
+      : "";
+    const limitClause = typeof args?.limit === "number" ? " LIMIT ?" : "";
+    if (typeof args?.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data FROM job${whereClause}${orderClause}${limitClause}`,
+      params,
+    );
+    return rows.map((row) => JobRecordSchema.parse(JSON.parse(row.data)));
+  }
+
+  public async countJobsByStatus(args?: {
+    workspaceId?: string;
+  }): Promise<Record<JobRecord["status"], number>> {
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (args?.workspaceId) {
+      predicates.push("json_extract(data, '$.workspaceId') = ?");
+      params.push(args.workspaceId);
+    }
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const rows = await this.client.queryD1<{
+      status: JobRecord["status"];
+      count: number;
+    }>(
+      this.databaseId,
+      `SELECT json_extract(data, '$.status') AS status, COUNT(*) AS count
+      FROM job${whereClause}
+      GROUP BY json_extract(data, '$.status')`,
+      params,
+    );
+    return {
+      pending: 0,
+      running: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      ...Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])),
+    } as Record<JobRecord["status"], number>;
   }
 
   public async getJob(id: string): Promise<JobRecord | null> {
-    const rows = await this.listJsonTable("job", JobRecordSchema);
-    return rows.find((row) => row.id === id) ?? null;
+    return this.getJsonRow("job", id, JobRecordSchema);
+  }
+
+  public async getActiveJobByDedupeKey(args: {
+    workspaceId: string;
+    kind: JobRecord["kind"];
+    dedupeKey: string;
+  }): Promise<JobRecord | null> {
+    const dedupeKey = args.dedupeKey.trim();
+    if (!dedupeKey) {
+      return null;
+    }
+    const scope = buildJobDedupeScope({
+      workspaceId: args.workspaceId,
+      kind: args.kind,
+      dedupeKey,
+    });
+    const indexRows = await this.client.queryD1<{ job_id: string }>(
+      this.databaseId,
+      `SELECT job_id
+      FROM job_dedupe_index
+      WHERE scope = ?
+      LIMIT 1`,
+      [scope],
+    );
+    const indexedJobId = indexRows[0]?.job_id;
+    if (indexedJobId) {
+      const indexedJob = await this.getJob(indexedJobId);
+      if (
+        indexedJob &&
+        indexedJob.workspaceId === args.workspaceId &&
+        indexedJob.kind === args.kind &&
+        indexedJob.dedupeKey === dedupeKey &&
+        isActiveJobStatus(indexedJob.status)
+      ) {
+        return indexedJob;
+      }
+      await this.client.executeD1(
+        this.databaseId,
+        "DELETE FROM job_dedupe_index WHERE scope = ?",
+        [scope],
+      );
+    }
+
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM job
+      WHERE json_extract(data, '$.workspaceId') = ?
+        AND json_extract(data, '$.kind') = ?
+        AND json_extract(data, '$.dedupeKey') = ?
+        AND json_extract(data, '$.status') IN (?, ?)
+      ORDER BY json_extract(data, '$.createdAt') DESC
+      LIMIT 1`,
+      [args.workspaceId, args.kind, dedupeKey, ...ACTIVE_JOB_STATUSES],
+    );
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+    const job = JobRecordSchema.parse(JSON.parse(row.data));
+    await this.upsertJobDedupeIndex(job);
+    return job;
   }
 
   public async saveJob(job: JobRecord): Promise<void> {
+    const parsed = JobRecordSchema.parse(job);
+    const existing = await this.getJob(parsed.id);
+    if (existing?.dedupeKey) {
+      await this.deleteJobDedupeIndex(existing);
+    }
     await this.saveJsonRow("job", {
       id: job.id,
-      data: JobRecordSchema.parse(job),
+      data: parsed,
     });
+    if (parsed.dedupeKey && isActiveJobStatus(parsed.status)) {
+      await this.upsertJobDedupeIndex(parsed);
+    } else if (parsed.dedupeKey) {
+      await this.deleteJobDedupeIndex(parsed);
+    }
   }
 
   public async getConversation(id: string): Promise<ConversationRecord | null> {
-    const rows = await this.listJsonTable("conversation", ConversationRecordSchema);
-    return rows.find((row) => row.id === id) ?? null;
+    return this.getJsonRow("conversation", id, ConversationRecordSchema);
   }
 
   public async listConversations(): Promise<ConversationRecord[]> {
     return this.listJsonTable("conversation", ConversationRecordSchema);
+  }
+
+  public async listConversationsWithActiveTurnLock(): Promise<ConversationRecord[]> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM conversation
+      WHERE json_extract(data, '$.activeTurnLock') = 1`,
+    );
+    return rows.map((row) => ConversationRecordSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveConversation(conversation: ConversationRecord): Promise<void> {
@@ -1670,10 +2192,15 @@ export class D1AppRepository implements AppRepository {
   }
 
   public async listAuditEvents(limit = 50): Promise<AuditEvent[]> {
-    const rows = await this.listJsonTable("audit_event", AuditEventSchema);
-    return rows
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .slice(0, limit);
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM audit_event
+      ORDER BY json_extract(data, '$.createdAt') DESC
+      LIMIT ?`,
+      [limit],
+    );
+    return rows.map((row) => AuditEventSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveAuditEvent(event: AuditEvent): Promise<void> {
@@ -1684,10 +2211,15 @@ export class D1AppRepository implements AppRepository {
   }
 
   public async listImportExportRuns(limit = 50): Promise<ImportExportRun[]> {
-    const rows = await this.listJsonTable("import_export_run", ImportExportRunSchema);
-    return rows
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .slice(0, limit);
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM import_export_run
+      ORDER BY json_extract(data, '$.createdAt') DESC
+      LIMIT ?`,
+      [limit],
+    );
+    return rows.map((row) => ImportExportRunSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveImportExportRun(run: ImportExportRun): Promise<void> {
@@ -1701,12 +2233,25 @@ export class D1AppRepository implements AppRepository {
     providerId?: string;
     limit?: number;
   }): Promise<ProviderTestRun[]> {
-    let rows = await this.listJsonTable("provider_test_run", ProviderTestRunSchema);
+    const predicates: string[] = [];
+    const params: unknown[] = [];
     if (args?.providerId) {
-      rows = rows.filter((row) => row.providerId === args.providerId);
+      predicates.push("json_extract(data, '$.providerId') = ?");
+      params.push(args.providerId);
     }
-    rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+    const whereClause = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+    const limitClause = typeof args?.limit === "number" ? " LIMIT ?" : "";
+    if (typeof args?.limit === "number") {
+      params.push(args.limit);
+    }
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data
+      FROM provider_test_run${whereClause}
+      ORDER BY json_extract(data, '$.createdAt') DESC${limitClause}`,
+      params,
+    );
+    return rows.map((row) => ProviderTestRunSchema.parse(JSON.parse(row.data)));
   }
 
   public async saveProviderTestRun(run: ProviderTestRun): Promise<void> {
@@ -1727,6 +2272,20 @@ export class D1AppRepository implements AppRepository {
     return rows.map((row) => schema.parse(JSON.parse(row.data)));
   }
 
+  private async getJsonRow<T>(
+    table: string,
+    id: string,
+    schema: { parse(value: unknown): T },
+  ): Promise<T | null> {
+    const rows = await this.client.queryD1<{ data: string }>(
+      this.databaseId,
+      `SELECT data FROM ${table} WHERE id = ? LIMIT 1`,
+      [id],
+    );
+    const row = rows[0];
+    return row ? schema.parse(JSON.parse(row.data)) : null;
+  }
+
   private async saveJsonRow<T extends { id: string; data: unknown }>(
     table: string,
     value: T,
@@ -1744,6 +2303,46 @@ export class D1AppRepository implements AppRepository {
       this.databaseId,
       `DELETE FROM ${table} WHERE id = ?`,
       [id],
+    );
+  }
+
+  private async upsertJobDedupeIndex(job: JobRecord): Promise<void> {
+    if (!job.dedupeKey || !isActiveJobStatus(job.status)) {
+      return;
+    }
+    const scope = buildJobDedupeScope({
+      workspaceId: job.workspaceId,
+      kind: job.kind,
+      dedupeKey: job.dedupeKey,
+    });
+    await this.client.executeD1(
+      this.databaseId,
+      `INSERT INTO job_dedupe_index (
+        scope, workspace_id, kind, dedupe_key, job_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(scope) DO UPDATE SET
+        workspace_id = excluded.workspace_id,
+        kind = excluded.kind,
+        dedupe_key = excluded.dedupe_key,
+        job_id = excluded.job_id,
+        updated_at = excluded.updated_at`,
+      [scope, job.workspaceId, job.kind, job.dedupeKey, job.id, job.updatedAt],
+    );
+  }
+
+  private async deleteJobDedupeIndex(job: JobRecord): Promise<void> {
+    if (!job.dedupeKey) {
+      return;
+    }
+    const scope = buildJobDedupeScope({
+      workspaceId: job.workspaceId,
+      kind: job.kind,
+      dedupeKey: job.dedupeKey,
+    });
+    await this.client.executeD1(
+      this.databaseId,
+      "DELETE FROM job_dedupe_index WHERE scope = ? AND job_id = ?",
+      [scope, job.id],
     );
   }
 }
@@ -1779,6 +2378,7 @@ export class InMemoryAppRepository implements AppRepository {
   private conversationTurns = new Map<string, ConversationTurn>();
   private toolRuns = new Map<string, ToolRunRecord>();
   private jobs = new Map<string, JobRecord>();
+  private jobDedupeIndex = new Map<string, string>();
   private conversations = new Map<string, ConversationRecord>();
   private conversationTurnLocks = new Map<string, {
     turnId: string;
@@ -1954,6 +2554,35 @@ export class InMemoryAppRepository implements AppRepository {
     return [...this.tasks.values()];
   }
 
+  public async listTasksByStatus(args: {
+    statuses: Task["status"][];
+    limit?: number;
+  }): Promise<Task[]> {
+    const statusSet = new Set(args.statuses);
+    let rows = [...this.tasks.values()]
+      .filter((task) => statusSet.has(task.status))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return typeof args.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async getTaskByTitle(title: string): Promise<Task | null> {
+    const normalized = title.trim().toLowerCase();
+    return [...this.tasks.values()].find((task) => task.title.trim().toLowerCase() === normalized) ?? null;
+  }
+
+  public async countTasksByStatus(): Promise<Record<Task["status"], number>> {
+    const counts: Record<Task["status"], number> = {
+      draft: 0,
+      active: 0,
+      paused: 0,
+      archived: 0,
+    };
+    for (const task of this.tasks.values()) {
+      counts[task.status] += 1;
+    }
+    return counts;
+  }
+
   public async getTask(id: string): Promise<Task | null> {
     return this.tasks.get(id) ?? null;
   }
@@ -1983,6 +2612,22 @@ export class InMemoryAppRepository implements AppRepository {
     });
     rows = rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async countTaskRunsByStatus(): Promise<Record<TaskRun["status"], number>> {
+    const counts: Record<TaskRun["status"], number> = {
+      queued: 0,
+      running: 0,
+      waiting_approval: 0,
+      waiting_retry: 0,
+      completed: 0,
+      failed: 0,
+      aborted: 0,
+    };
+    for (const taskRun of this.taskRuns.values()) {
+      counts[taskRun.status] += 1;
+    }
+    return counts;
   }
 
   public async getTaskRun(id: string): Promise<TaskRun | null> {
@@ -2040,6 +2685,20 @@ export class InMemoryAppRepository implements AppRepository {
     });
     rows = rows.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async countApprovalRequestsByStatus(): Promise<Record<ApprovalRequest["status"], number>> {
+    const counts: Record<ApprovalRequest["status"], number> = {
+      pending: 0,
+      approved: 0,
+      rejected: 0,
+      expired: 0,
+      cancelled: 0,
+    };
+    for (const approval of this.approvalRequests.values()) {
+      counts[approval.status] += 1;
+    }
+    return counts;
   }
 
   public async getApprovalRequest(id: string): Promise<ApprovalRequest | null> {
@@ -2140,6 +2799,7 @@ export class InMemoryAppRepository implements AppRepository {
     this.conversationTurns.clear();
     this.toolRuns.clear();
     this.jobs.clear();
+    this.jobDedupeIndex.clear();
     this.conversations.clear();
     this.conversationTurnLocks.clear();
     this.messages.clear();
@@ -2156,6 +2816,30 @@ export class InMemoryAppRepository implements AppRepository {
     return [...this.documents.values()];
   }
 
+  public async getDocument(id: string): Promise<DocumentMetadata | null> {
+    return this.documents.get(id) ?? null;
+  }
+
+  public async listRecentDocumentFailures(limit: number): Promise<DocumentMetadata[]> {
+    return [...this.documents.values()]
+      .filter((document) => document.extractionStatus === "failed" || Boolean(document.lastExtractionError))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, limit);
+  }
+
+  public async countDocumentsByExtractionStatus(): Promise<Record<DocumentMetadata["extractionStatus"], number>> {
+    const counts: Record<DocumentMetadata["extractionStatus"], number> = {
+      pending: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+    };
+    for (const document of this.documents.values()) {
+      counts[document.extractionStatus] += 1;
+    }
+    return counts;
+  }
+
   public async saveDocument(document: DocumentMetadata): Promise<void> {
     const parsed = DocumentMetadataSchema.parse(document);
     this.documents.set(parsed.id, parsed);
@@ -2163,6 +2847,44 @@ export class InMemoryAppRepository implements AppRepository {
 
   public async listMemoryDocuments(): Promise<MemoryDocument[]> {
     return [...this.memoryDocuments.values()];
+  }
+
+  public async listMemoryDocumentsByWorkspace(workspaceId: string): Promise<MemoryDocument[]> {
+    return [...this.memoryDocuments.values()]
+      .filter((document) => document.workspaceId === workspaceId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  public async listMemoryDocumentsByKind(args: {
+    kind: MemoryDocument["kind"];
+    workspaceId?: string;
+    limit?: number;
+  }): Promise<MemoryDocument[]> {
+    let rows = [...this.memoryDocuments.values()]
+      .filter((document) => {
+        if (document.kind !== args.kind) {
+          return false;
+        }
+        if (args.workspaceId && document.workspaceId !== args.workspaceId) {
+          return false;
+        }
+        return true;
+      })
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return typeof args.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async getMemoryDocument(id: string): Promise<MemoryDocument | null> {
+    return this.memoryDocuments.get(id) ?? null;
+  }
+
+  public async findMemoryDocumentByPath(args: {
+    workspaceId: string;
+    path: string;
+  }): Promise<MemoryDocument | null> {
+    return [...this.memoryDocuments.values()].find((document) =>
+      document.workspaceId === args.workspaceId && document.path === args.path
+    ) ?? null;
   }
 
   public async saveMemoryDocument(document: MemoryDocument): Promise<void> {
@@ -2229,6 +2951,46 @@ export class InMemoryAppRepository implements AppRepository {
     return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
   }
 
+  public async countConversationTurnsByStatus(): Promise<Record<ConversationTurn["status"], number>> {
+    const counts: Record<ConversationTurn["status"], number> = {
+      running: 0,
+      completed: 0,
+      failed: 0,
+      aborted: 0,
+    };
+    for (const turn of this.conversationTurns.values()) {
+      counts[turn.status] += 1;
+    }
+    return counts;
+  }
+
+  public async summarizeRunningConversationTurns(nowIso: string): Promise<{
+    running: number;
+    resumable: number;
+    stuck: number;
+  }> {
+    let running = 0;
+    let resumable = 0;
+    let stuck = 0;
+    for (const turn of this.conversationTurns.values()) {
+      if (turn.status !== "running") {
+        continue;
+      }
+      running += 1;
+      if (turn.resumeEligible) {
+        resumable += 1;
+      }
+      if (!turn.lockExpiresAt || turn.lockExpiresAt <= nowIso) {
+        stuck += 1;
+      }
+    }
+    return {
+      running,
+      resumable,
+      stuck,
+    };
+  }
+
   public async getConversationTurn(id: string): Promise<ConversationTurn | null> {
     return this.conversationTurns.get(id) ?? null;
   }
@@ -2253,25 +3015,121 @@ export class InMemoryAppRepository implements AppRepository {
   public async listJobs(args?: {
     status?: JobRecord["status"];
     kind?: JobRecord["kind"];
+    workspaceId?: string;
+    runAfterLte?: string;
+    lockedState?: "locked" | "unlocked";
+    limit?: number;
+    orderByCreatedAt?: "asc" | "desc";
   }): Promise<JobRecord[]> {
-    return [...this.jobs.values()].filter((job) => {
+    let rows = [...this.jobs.values()].filter((job) => {
       if (args?.status && job.status !== args.status) {
         return false;
       }
       if (args?.kind && job.kind !== args.kind) {
         return false;
       }
+      if (args?.workspaceId && job.workspaceId !== args.workspaceId) {
+        return false;
+      }
+      if (
+        args?.runAfterLte &&
+        job.runAfter &&
+        job.runAfter > args.runAfterLte
+      ) {
+        return false;
+      }
+      if (args?.lockedState === "unlocked" && job.lockedAt) {
+        return false;
+      }
+      if (args?.lockedState === "locked" && !job.lockedAt) {
+        return false;
+      }
       return true;
     });
+    if (args?.orderByCreatedAt) {
+      rows = rows.sort((left, right) =>
+        args.orderByCreatedAt === "asc"
+          ? left.createdAt.localeCompare(right.createdAt)
+          : right.createdAt.localeCompare(left.createdAt)
+      );
+    }
+    return typeof args?.limit === "number" ? rows.slice(0, args.limit) : rows;
+  }
+
+  public async countJobsByStatus(args?: {
+    workspaceId?: string;
+  }): Promise<Record<JobRecord["status"], number>> {
+    const counts: Record<JobRecord["status"], number> = {
+      pending: 0,
+      running: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+    };
+    for (const job of this.jobs.values()) {
+      if (args?.workspaceId && job.workspaceId !== args.workspaceId) {
+        continue;
+      }
+      counts[job.status] += 1;
+    }
+    return counts;
   }
 
   public async getJob(id: string): Promise<JobRecord | null> {
     return this.jobs.get(id) ?? null;
   }
 
+  public async getActiveJobByDedupeKey(args: {
+    workspaceId: string;
+    kind: JobRecord["kind"];
+    dedupeKey: string;
+  }): Promise<JobRecord | null> {
+    const dedupeKey = args.dedupeKey.trim();
+    if (!dedupeKey) {
+      return null;
+    }
+    const scope = buildJobDedupeScope({
+      workspaceId: args.workspaceId,
+      kind: args.kind,
+      dedupeKey,
+    });
+    const indexedJobId = this.jobDedupeIndex.get(scope);
+    if (indexedJobId) {
+      const indexedJob = this.jobs.get(indexedJobId) ?? null;
+      if (
+        indexedJob &&
+        indexedJob.workspaceId === args.workspaceId &&
+        indexedJob.kind === args.kind &&
+        indexedJob.dedupeKey === dedupeKey &&
+        isActiveJobStatus(indexedJob.status)
+      ) {
+        return indexedJob;
+      }
+      this.jobDedupeIndex.delete(scope);
+    }
+
+    const fallback = [...this.jobs.values()]
+      .filter((job) =>
+        job.workspaceId === args.workspaceId &&
+        job.kind === args.kind &&
+        job.dedupeKey === dedupeKey &&
+        isActiveJobStatus(job.status)
+      )
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null;
+    if (fallback) {
+      this.jobDedupeIndex.set(scope, fallback.id);
+    }
+    return fallback;
+  }
+
   public async saveJob(job: JobRecord): Promise<void> {
     const parsed = JobRecordSchema.parse(job);
+    const existing = this.jobs.get(parsed.id);
+    if (existing) {
+      this.clearJobDedupeIndex(existing);
+    }
     this.jobs.set(parsed.id, parsed);
+    this.syncJobDedupeIndex(parsed);
   }
 
   public async getConversation(id: string): Promise<ConversationRecord | null> {
@@ -2282,9 +3140,45 @@ export class InMemoryAppRepository implements AppRepository {
     return [...this.conversations.values()];
   }
 
+  public async listConversationsWithActiveTurnLock(): Promise<ConversationRecord[]> {
+    return [...this.conversations.values()].filter((conversation) => conversation.activeTurnLock);
+  }
+
   public async saveConversation(conversation: ConversationRecord): Promise<void> {
     const parsed = ConversationRecordSchema.parse(conversation);
     this.conversations.set(parsed.id, parsed);
+  }
+
+  private syncJobDedupeIndex(job: JobRecord): void {
+    if (!job.dedupeKey) {
+      return;
+    }
+    const scope = buildJobDedupeScope({
+      workspaceId: job.workspaceId,
+      kind: job.kind,
+      dedupeKey: job.dedupeKey,
+    });
+    if (isActiveJobStatus(job.status)) {
+      this.jobDedupeIndex.set(scope, job.id);
+      return;
+    }
+    if (this.jobDedupeIndex.get(scope) === job.id) {
+      this.jobDedupeIndex.delete(scope);
+    }
+  }
+
+  private clearJobDedupeIndex(job: JobRecord): void {
+    if (!job.dedupeKey) {
+      return;
+    }
+    const scope = buildJobDedupeScope({
+      workspaceId: job.workspaceId,
+      kind: job.kind,
+      dedupeKey: job.dedupeKey,
+    });
+    if (this.jobDedupeIndex.get(scope) === job.id) {
+      this.jobDedupeIndex.delete(scope);
+    }
   }
 
   public async claimConversationTurnLock(args: {

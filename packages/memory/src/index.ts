@@ -390,6 +390,7 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
       workspaceId: this.args.workspaceId,
       kind: "memory_reindex_all",
       status: "pending",
+      dedupeKey: null,
       payload: {},
       result: {},
       attempts: 0,
@@ -397,6 +398,8 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
       lockedAt: null,
       lockedBy: null,
       completedAt: null,
+      cancelledAt: null,
+      cancelReason: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     });
@@ -429,10 +432,10 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
         }
 
         if (job.kind === "memory_reindex_all") {
-          const documents = await this.args.repository.listMemoryDocuments();
-          for (const document of documents.filter(
-            (item) => item.workspaceId === this.args.workspaceId,
-          )) {
+          const documents = await this.args.repository.listMemoryDocumentsByWorkspace(
+            this.args.workspaceId,
+          );
+          for (const document of documents) {
             await this.reindexDocument(document.id);
           }
         }
@@ -499,10 +502,10 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
       body: args.content,
     });
 
-    const existing = (await this.args.repository.listMemoryDocuments()).find(
-      (document) =>
-        document.workspaceId === this.args.workspaceId && document.path === args.path,
-    );
+    const existing = await this.args.repository.findMemoryDocumentByPath({
+      workspaceId: this.args.workspaceId,
+      path: args.path,
+    });
 
     const document = {
       id: existing?.id ?? createId("memorydoc"),
@@ -523,6 +526,7 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
         workspaceId: this.args.workspaceId,
         kind: "memory_reindex_document",
         status: "pending",
+        dedupeKey: null,
         payload: {
           documentId: document.id,
         },
@@ -532,6 +536,8 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
         lockedAt: null,
         lockedBy: null,
         completedAt: null,
+        cancelledAt: null,
+        cancelReason: null,
         createdAt: nowIso(),
         updatedAt: nowIso(),
       });
@@ -551,10 +557,11 @@ export class CloudflareMemoryStore implements MemoryStoreLike {
       return;
     }
 
-    const document = (await this.args.repository.listMemoryDocuments()).find(
-      (item) => item.id === documentId && item.workspaceId === this.args.workspaceId,
-    );
+    const document = await this.args.repository.getMemoryDocument(documentId);
     if (!document) {
+      return;
+    }
+    if (document.workspaceId !== this.args.workspaceId) {
       return;
     }
 

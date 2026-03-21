@@ -257,6 +257,26 @@ export const WorkflowBudgetSchema = z.object({
   timeoutMs: z.number().int().positive().default(60_000),
 });
 
+export const AutomationSessionTargetSchema = z.object({
+  kind: z.enum(["owner_chat", "telegram_chat", "isolated_automation_session"]),
+  telegramChatId: z.string().nullable().default(null),
+  telegramThreadId: z.number().int().nullable().default(null),
+  conversationId: z.string().nullable().default(null),
+  automationSessionKey: z.string().nullable().default(null),
+});
+
+export const TaskRetryConditionSchema = z.enum([
+  "executor_unavailable",
+  "task_failed",
+]);
+
+export const TaskRetryPolicySchema = z.object({
+  enabled: z.boolean().default(false),
+  maxAttempts: z.number().int().positive().default(1),
+  backoffSeconds: z.array(z.number().int().positive()).default([]),
+  retryOn: z.array(TaskRetryConditionSchema).default(["executor_unavailable"]),
+});
+
 export const AgentProfileSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
@@ -454,6 +474,13 @@ export const TriggerSchema = z.object({
   kind: TaskTriggerKindSchema,
   enabled: z.boolean().default(true),
   config: LooseRecordSchema.default({}),
+  sessionTarget: AutomationSessionTargetSchema.nullable().default(null),
+  retryPolicy: TaskRetryPolicySchema.default({
+    enabled: false,
+    maxAttempts: 1,
+    backoffSeconds: [],
+    retryOn: ["executor_unavailable"],
+  }),
   webhookPath: z.string().nullable().default(null),
   webhookSecret: z.string().nullable().default(null),
   webhookSecretRef: z.string().nullable().default(null),
@@ -931,6 +958,17 @@ export const TaskRunSchema = z.object({
   approvalId: z.string().nullable().default(null),
   sourceTurnId: z.string().nullable().default(null),
   sessionId: z.string().min(1),
+  sessionTarget: AutomationSessionTargetSchema.nullable().default(null),
+  retryPolicy: TaskRetryPolicySchema.default({
+    enabled: false,
+    maxAttempts: 1,
+    backoffSeconds: [],
+    retryOn: ["executor_unavailable"],
+  }),
+  attemptCount: z.number().int().positive().default(1),
+  retryCount: z.number().int().nonnegative().default(0),
+  nextRetryAt: z.string().nullable().default(null),
+  lastRetryAt: z.string().nullable().default(null),
   inputSnapshot: LooseRecordSchema.default({}),
   executionPlan: LooseRecordSchema.default({}),
   outputSummary: z.string().nullable().default(null),
@@ -1042,9 +1080,11 @@ export const JobRecordSchema = z.object({
     "telegram_voice_transcribe",
     "telegram_image_describe",
     "mcp_healthcheck",
+    "task_run_retry",
     "export_bundle_build",
   ]),
-  status: z.enum(["pending", "running", "completed", "failed"]),
+  status: z.enum(["pending", "running", "completed", "failed", "cancelled"]),
+  dedupeKey: z.string().nullable().default(null),
   payload: LooseRecordSchema.default({}),
   result: LooseRecordSchema.default({}),
   error: z.string().optional(),
@@ -1053,6 +1093,8 @@ export const JobRecordSchema = z.object({
   lockedAt: z.string().nullable().default(null),
   lockedBy: z.string().nullable().default(null),
   completedAt: z.string().nullable().default(null),
+  cancelledAt: z.string().nullable().default(null),
+  cancelReason: z.string().nullable().default(null),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
 });
@@ -1199,6 +1241,9 @@ export type McpProviderCatalogServer = z.infer<typeof McpProviderCatalogServerSc
 export type McpProviderConfig = z.infer<typeof McpProviderConfigSchema>;
 export type SearchSettings = z.infer<typeof SearchSettingsSchema>;
 export type WorkflowBudget = z.infer<typeof WorkflowBudgetSchema>;
+export type AutomationSessionTarget = z.infer<typeof AutomationSessionTargetSchema>;
+export type TaskRetryCondition = z.infer<typeof TaskRetryConditionSchema>;
+export type TaskRetryPolicy = z.infer<typeof TaskRetryPolicySchema>;
 export type ExecutorScope = z.infer<typeof ExecutorScopeSchema>;
 export type BrowserAttachment = z.infer<typeof BrowserAttachmentSchema>;
 export type ExecutorNode = z.infer<typeof ExecutorNodeSchema>;
